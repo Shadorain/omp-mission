@@ -1,0 +1,26 @@
+{
+  "name": "omp-mission",
+  "owner": {
+    "name": "Shadorain"
+  },
+  "metadata": {
+    "description": "Coordinate a ticket or task through verification and review",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "mission",
+      "description": "Plan and run a ticket or task through verification and review.",
+      "version": "1.0.0",
+      "license": "MIT",
+      "homepage": "https://github.com/Shadorain/omp-mission",
+      "repository": "https://github.com/Shadorain/omp-mission",
+      "category": "productivity",
+      "keywords": ["omp", "omp-extension", "mission", "beads", "linear"],
+      "author": {
+        "name": "Shadorain"
+      },
+      "source": "./"
+    }
+  ]
+}
