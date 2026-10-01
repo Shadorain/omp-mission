@@ -261,3 +261,12 @@ export function assertSourceCheckout(source: Source, workspace: Workspace): void
     throw new Error(`This checkout belongs to ${current.join(", ")}; not ${source.id}`);
   }
 }
+
+export function checkoutMatchesSource(source: Source, workspace: Workspace): boolean {
+  if (source.kind === "linear") {
+    const expected = source.id.replace(/^linear:/i, "").toUpperCase();
+    return linearIdentifiers([workspace.branch ?? "", workspace.cwd]).includes(expected);
+  }
+  if (source.kind === "github") return githubBranchTokens(workspace.branch ?? "").some((item) => item.number === String(source.number));
+  return false;
+}
