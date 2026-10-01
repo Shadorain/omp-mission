@@ -39,11 +39,13 @@ Both go through the same enforcement. Add an operation once, in `control()`.
 
 ## Coordinator context budget
 
-Cost drivers, in order: saved mission JSON (source plus worker assignments), bead descriptions, repeated protocol text. Rules that follow:
+Every tool result and message stays in context for the rest of the session, and anything that changes the prompt prefix forces the whole conversation to be re-cached. Rules:
 
-- Tool results use `statusView` (`brief` after a control call).
-- The source reaches the coordinator once, in the recovery JSON of the first message.
-- Late-phase instructions are per-step guides returned with `mission_status`, not part of the first prompt.
-- The coordinator never polls; the extension wakes it on state change.
-- With `autoDispatch` on, `wakeCoordinator` runs `dispatch` itself when `autoDispatchAllowed` says so, so a plain wave costs no model turn. A failure hands the same wake to the model once.
-- Model-chosen work (verify, deliver, review, repairs) stays with the coordinator. Deterministic work belongs in code.
+- **Results carry decisions only.** `briefView` (control results) and `statusView` (`mission_status`) in `src/status.ts` drop source text, worker assignments, bead descriptions, timestamps, and the lock nonce. Add a field only if the model acts on it.
+- **The wake message is the status call.** It names the next step, its ids, and the guide for it, so the coordinator rarely needs `mission_status`. A guide is sent once per step: with the wake or with the first result that reaches that step.
+- **The system prompt never changes mid-session.** The extension does not use `before_agent_start`. Phase, mode, and next-step text are volatile; putting them in the system prompt turned every state change into a cache miss on the whole history.
+- **The ticket reaches the coordinator once**, in the recovery JSON of the first message, and reaches workers as a file they read on demand.
+- **The coordinator never polls**; the extension wakes it on state change.
+- **autoDispatch** runs `dispatch` in `wakeCoordinator` when `autoDispatchAllowed` says so, so a plain wave costs no model turn. A failure hands the same wake to the model once.
+- **Model-chosen work** (verify, deliver, review, repairs) stays with the coordinator. Deterministic work belongs in code.
+- Operator output sent with `sendMessage` enters context. Keep it short (`/mission history` shows 12 events).

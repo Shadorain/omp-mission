@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import { CLAIM_STALL_MS, nextAction } from '../src/controller';
-import { missionView, snapshotView, statusView } from '../src/status';
+import { briefView, statusView } from '../src/status';
 import { createWorkerDriver } from '../src/workers';
 import type { Bead, Mission, PolicyContext, Snapshot, Worker } from '../src/types';
 
@@ -36,23 +36,27 @@ test('recover replaces only a missing worker on an unclaimed bead and redispatch
   expect(m.workers[0]!.state).toBe('closed');
 });
 
-test('coordinator status omits source text, worker assignments and bead descriptions but keeps decision state', () => {
-  const m = mission([worker({ assignment: 'x'.repeat(30_000) })]);
+test('status and control views drop source text, assignments, descriptions and bookkeeping but keep decision state', () => {
+  const m = mission([worker({ assignment: 'x'.repeat(30_000) }), worker({ beadId: 'old', state: 'closed' })]);
   m.source.body = 'y'.repeat(30_000);
-  const snap = snapshot([bead('a', 'ready', { description: 'z'.repeat(5000) })]);
-  const text = JSON.stringify(statusView({ mission: m, snapshot: snap, resumeHold: false }));
-  expect(text.length).toBeLessThan(3000);
-  expect(missionView(m).source.bodyChars).toBe(30_000);
-  expect(missionView(m).workers[0]).toMatchObject({ beadId: 'a', state: 'awaiting-claim', handle: 'term_x' });
-  expect(snapshotView(snap).leaves).toEqual(['a']);
-  expect(snapshotView(snap).ready).toEqual(['a']);
+  m.controllerNonce = 'nonce-secret';
+  const snap = snapshot([bead('a', 'ready', { description: 'z'.repeat(5000) }), bead('b', 'closed')]);
+  const input = { mission: m, snapshot: snap, resumeHold: false, next: { kind: 'dispatch' as const, detail: 'Start workers: a', ids: ['a'] } };
+  const status = JSON.stringify(statusView(input));
+  const brief = JSON.stringify(briefView(input));
+  expect(status.length).toBeLessThan(1500);
+  expect(brief.length).toBeLessThan(700);
+  for (const text of [status, brief]) {
+    expect(text).not.toContain('nonce-secret');
+    expect(text).not.toContain('xxxx');
+    expect(text).not.toContain('zzzz');
+    expect(text).not.toContain('yyyy');
+  }
+  expect(JSON.parse(brief)).toMatchObject({ phase: 'execute', next: { kind: 'dispatch', ids: ['a'] }, workers: [{ beadId: 'a', state: 'awaiting-claim', handle: 'term_x' }], outstanding: ['a:ready'] });
+  expect(brief).not.toContain('old');
+  expect(JSON.parse(status).beads).toEqual(['a ready a', 'b closed b']);
 });
 
-test('control results are brief: no bead list, scopes, source or review bodies', () => {
-  const m = mission([worker()]);
-  const brief = JSON.stringify(statusView({ mission: m, snapshot: snapshot([bead('a', 'ready'), bead('b', 'closed')]), resumeHold: false }, true));
-  expect(brief).not.toContain('"scopes"');
-  expect(brief).not.toContain('"title"');
-  expect(brief).toContain('a:ready');
-  expect(brief).not.toContain('b:closed');
+test('a pending mission is described by id only until it starts', () => {
+  expect(briefView({ pending: mission([]), resumeHold: true })).toEqual({ pending: 'm', next: undefined });
 });

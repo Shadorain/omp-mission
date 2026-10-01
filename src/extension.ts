@@ -16,7 +16,7 @@ import { approveGate, autoDispatchAllowed, consumeGate, effectiveGraph, enforceG
 import { captureRevision, Reviewer, roleModelString } from './review';
 import { coordinatorPrompt, guide, workerPrompt } from './prompts';
 import { createMissionWidget, createMissionInspector } from './ui';
-import { statusView } from './status';
+import { briefView, statusView, type NextView } from './status';
 import { missionArgumentCompletions, type MissionCompletionState } from './completions';
 import { discoverBeadsDir, isolateCheckout } from './isolate';
 import { noteSubagentSpawn, noteSubagentToolEnd, noteSubagentToolStart, noteSubagentTurnEnd } from './subagents';
@@ -66,7 +66,10 @@ export default async function missionExtension(pi: ExtensionAPI) {
  async function persist(value:Mission){if(value!==mission||!path||!ownership)throw new Error('No current controller ownership');await ownership.assertOwned();value.controllerNonce=ownership.nonce;value.updatedAt=new Date().toISOString();await saveMission(path,value);}
  const driver=createWorkerDriver(run,{persist:async value=>{if(value!==mission)throw new Error('Session changed during worker operation');if(ownership&&!resumeHold)await persist(value);},prompt:(mission,worker)=>workerPrompt(mission,worker,config.frontend),agentDir,model:()=>roleModelString(config.workerRole),frontend:()=>config.frontend,customCommand:()=>config.customCommand});
  function policy(context:ExtensionContext){return {resumeHold,owned:!!ownership&&!ownershipError,nativePlan:nativePlan(context),fresh:!!snapshot&&!snapshot.error&&Date.now()-snapshot.fetchedAt<35000,maxWorkers:config.maxWorkers};}
- function status(context:ExtensionContext,brief=false){const next=mission?nextAction(mission,snapshot,policy(context)):undefined;return statusView({mission,pending,snapshot,resumeHold,ownershipError,next:next&&{...next,guide:brief?undefined:guide(next.kind)}},brief);}
+ // A guide is sent once per step: with the wake message, or with the first result that reaches that step.
+ let guided='';
+ function withGuide(next:Action|undefined,always:boolean):NextView|undefined{if(!next)return undefined;const text=guide(next.kind);if(!text||(!always&&guided===next.kind))return next;guided=next.kind;return {...next,guide:text};}
+ function status(context:ExtensionContext,brief=false){const next=withGuide(mission?nextAction(mission,snapshot,policy(context)):undefined,!brief);return (brief?briefView:statusView)({mission,pending,snapshot,resumeHold,ownershipError,next});}
  function bindTerminalInput(context:ExtensionContext){
   terminalInputDispose?.();
   terminalInputDispose=undefined;
@@ -102,7 +105,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
  }
  async function acquire(){if(!mission||!path)throw new Error('No saved mission');if(ownership){await ownership.assertOwned();return;}ownershipError=undefined;ownership=await acquireOwnership(path,mission,error=>{ownershipError=`Controller lost: ${error.message}`;resumeHold=true;lastWake='';void reviewer.dispose();void render();});mission=ownership.mission;mission.controllerNonce=ownership.nonce;}
  async function release(){const current=ownership;ownership=undefined;await current?.release();}
- async function detach(context?:ExtensionContext){generation++;lifetime.abort();lifetime=new AbortController();terminalInputDispose?.();terminalInputDispose=undefined;overlayAbort?.abort();overlayAbort=undefined;if(timer&&ctx)ctx.clearTimer(timer);timer=undefined;await reviewer.dispose();await release();ctx?.ui.setWidget('mission',undefined);ctx=context;mission=undefined;pending=undefined;path=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;lastWake='';selected=undefined;history=undefined;lastPoll=0;outlineOffset=0;inspectionIntent={};subagents=[];}
+ async function detach(context?:ExtensionContext){generation++;lifetime.abort();lifetime=new AbortController();terminalInputDispose?.();terminalInputDispose=undefined;overlayAbort?.abort();overlayAbort=undefined;if(timer&&ctx)ctx.clearTimer(timer);timer=undefined;await reviewer.dispose();await release();ctx?.ui.setWidget('mission',undefined);ctx=context;mission=undefined;pending=undefined;path=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;lastWake='';guided='';selected=undefined;history=undefined;lastPoll=0;outlineOffset=0;inspectionIntent={};subagents=[];}
  async function attach(file:string,context:ExtensionContext){await release();mission=await loadMission(file);path=file;pending=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;ctx=context;await refresh(false);await render();}
  async function restore(context:ExtensionContext){
   if(!eligible(context))return;
@@ -162,7 +165,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
   try{await control({operation:'dispatch'},context);context.ui.notify(`Auto-dispatched ${action.ids?.join(', ')}`,'info');return true;}
   catch(error){autoBlocked=signature;context.ui.notify(`Auto-dispatch held, handing to the coordinator: ${error instanceof Error?error.message:String(error)}`,'warning');return false;}
  }
- async function wakeCoordinator(){if(!ctx||!mission||operation||!eligible(ctx)||!ctx.isIdle()||ctx.hasPendingMessages())return;const action=nextAction(mission,snapshot,policy(ctx));if(action.gate){mission.gate=action.gate;if(ownership&&!resumeHold)await persist(mission);await render();return;}if(action.kind==='hold')return;if(await autoDispatch(ctx,action))return;const signature=JSON.stringify([mission.id,mission.round,action.kind,action.ids,mission.evidence.verify?.revision,mission.reviews.length]);if(signature===lastWake)return;lastWake=signature;pi.sendUserMessage(`Mission state changed: ${action.detail}. Consult mission_status and use mission_control for ${action.kind}. Do not bypass Pause, ownership, resume hold, or native approvals.`,{deliverAs:'followUp',attribution:'agent'});}
+ async function wakeCoordinator(){if(!ctx||!mission||operation||!eligible(ctx)||!ctx.isIdle()||ctx.hasPendingMessages())return;const action=nextAction(mission,snapshot,policy(ctx));if(action.gate){mission.gate=action.gate;if(ownership&&!resumeHold)await persist(mission);await render();return;}if(action.kind==='hold')return;if(await autoDispatch(ctx,action))return;const signature=JSON.stringify([mission.id,mission.round,action.kind,action.ids,mission.evidence.verify?.revision,mission.reviews.length]);if(signature===lastWake)return;lastWake=signature;const view=withGuide(action,true)!;pi.sendUserMessage(`Mission: ${action.detail}${action.ids?.length?` [${action.ids.join(', ')}]`:''}. Next: ${action.kind}. ${view.guide??''}`.trim(),{deliverAs:'followUp',attribution:'agent'});}
  async function request(context:ExtensionContext,op:string,extra:Record<string,unknown>={}){
   if(!eligible(context))throw new Error('Mission coordinator only');
   await control({operation:op,...extra},context);
@@ -259,7 +262,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
      if(!mission||!arg)throw new Error('Usage: /mission history <bead-id>');requireBeadsGraph(mission);
      if(!snapshot?.beads.some(b=>b.id===arg))throw new Error('Bead is outside mission');
      selected=arg;history=await readHistory(run,mission.workspace.cwd,arg,{BEADS_DIR:mission.workspace.beadsDir??''});
-     await pi.sendMessage({customType:'mission:history',content:history.map(event=>`${event.timestamp} ${event.actor} ${event.event}: ${event.summary}`).join('\n'),display:true},{triggerTurn:false});
+     await pi.sendMessage({customType:'mission:history',content:history.slice(0,12).map(event=>`${event.timestamp} ${event.actor} ${event.event}: ${event.summary}`).join('\n'),display:true},{triggerTurn:false});
      await render();return;
     }
     if(verb==='focus'){
@@ -437,7 +440,6 @@ export default async function missionExtension(pi: ExtensionAPI) {
  pi.on('tool_execution_start',(event)=>{subagents=noteSubagentToolStart(subagents,event);void render();});
  pi.on('tool_execution_end',(event)=>{subagents=noteSubagentToolEnd(subagents,event);void render();});
  pi.on('agent_end',()=>{subagents=noteSubagentTurnEnd(subagents);void render();});
- pi.on('before_agent_start',(event,context)=>{if(!eligible(context)||!mission)return;const action=nextAction(mission,snapshot,policy(context));return {systemPrompt:[...(Array.isArray(event.systemPrompt)?event.systemPrompt:[event.systemPrompt]),`Mission ${mission.source.id}; phase ${mission.phase}; graph ${effectiveGraph(mission)}; epic ${mission.epicId??'unbound'}; mode ${mission.mode}; ${action.detail}. Coordinator never claims implementation beads or dispatches raw Orca. Use mission_status/mission_control.`]};});
  pi.events.on('mission:query',(request:unknown)=>{
   if(!isRecord(request)||typeof request.cwd!=='string'||typeof request.reply!=='function'||!ctx||!eligible(ctx)||!mission||request.cwd!==ctx.cwd)return;
   request.reply({workspace:mission.workspace.cwd,beadsDir:mission.workspace.beadsDir,epicId:mission.epicId,graph:effectiveGraph(mission),mode:mission.mode,hold:nativePlan(ctx)?'Native plan mode':resumeHold?'Resume hold':ownershipError??(!ownership?'Controller ownership required':false),projection:snapshot?{ready:snapshot.ready,closed:snapshot.closed,total:snapshot.leaves.length,error:snapshot.error}:undefined});
