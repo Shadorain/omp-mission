@@ -46,7 +46,7 @@ export function validateFinding(value: unknown): Finding {
   if (severity !== "critical" && severity !== "high" && severity !== "medium" && severity !== "low") invalid("finding.severity is unsupported");
   const line = row.line;
   if (!isPositiveSafeInteger(line)) invalid("finding.line must be a positive integer");
-  return { id: text(row.id, "finding.id", 1000), severity, path: text(row.path, "finding.path", 4000), line, title: text(row.title, "finding.title", 10_000), body: text(row.body, "finding.body", 50_000), ...(row.rejection === undefined ? {} : { rejection: text(row.rejection, "finding.rejection", 10_000) }) };
+  return { id: text(row.id, "finding.id", 1000), severity, path: text(row.path, "finding.path", 4000), line, title: text(row.title, "finding.title", 10_000), body: text(row.body, "finding.body", 50_000), ...(row.rejection === undefined ? {} : { rejection: text(row.rejection, "finding.rejection", 10_000) }), ...(row.beadId === undefined ? {} : { beadId: text(row.beadId, "finding.beadId", 1000) }) };
 }
 
 function validSource(value: unknown): Source {

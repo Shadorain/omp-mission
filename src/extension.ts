@@ -380,7 +380,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
      if(!(action.kind==='review'||action.kind==='hold'&&action.gate?.kind==='review')||!mission.reviewRequested||mission.evidence.verify?.outcome!=='passed'||mission.evidence.deliver?.outcome!=='passed')throw new Error(action.detail);
      const revision=(await captureRevision(mission,run)).revision;if(revision!==mission.evidence.verify.revision)throw new Error('Revision changed since verification');
      enforceGate(mission,revisionGate(mission,'review',revision));mission.phase='review';mission.evidence.review={outcome:'active',detail:'Independent reviewer running',revision,at:new Date().toISOString()};await persist(mission);reviewStarted=true;
-     const result=await reviewer.run(mission,context,run,config.modelRole,await contextFilesFor(config.reviewContext,mission.workspace.cwd,agentDir));if(epoch!==generation)throw new Error('Session changed during review');
+     const reviewFiles=await contextFilesFor(config.reviewContext,mission.workspace.cwd,agentDir);const targets=config.frontend==='subagent'&&mission.graph==='beads'&&snapshot?snapshot.leaves.filter(b=>mission!.scopes[b.id]?.length).map(b=>({id:b.id,title:b.title,text:beadTask(b)??b.title,files:mission!.scopes[b.id]!})):[];const result=targets.length>1?await reviewer.runPerBead(mission,context,run,config.modelRole,reviewFiles,targets):await reviewer.run(mission,context,run,config.modelRole,reviewFiles);if(epoch!==generation)throw new Error('Session changed during review');
      consumeGate(mission);
      mission.reviews.push(result);
      mission.evidence.review = {outcome:'passed',detail:result.summary,revision:result.revision,at:result.at};
