@@ -14,7 +14,7 @@ import { readClaimActor, readGraph, readHistory } from './beads';
 import { createWorkerDriver } from './workers';
 import { approveGate, autoDispatchAllowed, consumeGate, effectiveGraph, enforceGate, enforceMutation, nextAction, requireBeadsGraph, revisionGate, setMode, waveGate } from './controller';
 import { captureRevision, Reviewer, roleModelString } from './review';
-import { coordinatorPrompt, guide, workerPrompt } from './prompts';
+import { beadTask, coordinatorPrompt, guide, workerPrompt } from './prompts';
 import { createMissionWidget, createMissionInspector } from './ui';
 import { briefView, statusView, type NextView } from './status';
 import { missionArgumentCompletions, type MissionCompletionState } from './completions';
@@ -65,7 +65,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
  function syncCompletions(){completionState={sources:completionState.sources,beads:(snapshot?.beads??[]).map(bead=>({id:bead.id,title:bead.title,category:bead.category})),workers:(mission?.workers??[]).map(worker=>({beadId:worker.beadId,state:worker.state,handle:!!worker.handle}))};}
  async function refreshCompletionSources(){try{const saved=await listMissions(agentDir);completionState.sources=saved.map(item=>({id:item.mission.source.id,title:item.mission.source.title}));}catch{/* keep the previous source list */}}
  async function persist(value:Mission){if(value!==mission||!path||!ownership)throw new Error('No current controller ownership');await ownership.assertOwned();value.controllerNonce=ownership.nonce;value.updatedAt=new Date().toISOString();await saveMission(path,value);}
- const driver=createWorkerDriver(run,{persist:async value=>{if(value!==mission)throw new Error('Session changed during worker operation');if(ownership&&!resumeHold)await persist(value);},prompt:(mission,worker)=>workerPrompt(mission,worker,config.frontend),agentDir,model:()=>roleModelString(config.workerRole),frontend:()=>config.frontend,customCommand:()=>config.customCommand});
+ const driver=createWorkerDriver(run,{persist:async value=>{if(value!==mission)throw new Error('Session changed during worker operation');if(ownership&&!resumeHold)await persist(value);},prompt:(mission,worker,task)=>workerPrompt(mission,worker,config.frontend,task),agentDir,model:()=>roleModelString(config.workerRole),frontend:()=>config.frontend,customCommand:()=>config.customCommand});
  function policy(context:ExtensionContext){return {resumeHold,owned:!!ownership&&!ownershipError,nativePlan:nativePlan(context),fresh:!!snapshot&&!snapshot.error&&Date.now()-snapshot.fetchedAt<35000,maxWorkers:config.maxWorkers};}
  // A guide is sent once per step: with the wake message, or with the first result that reaches that step.
  let guided='';
@@ -341,7 +341,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
     }else if(params.operation==='dispatch'){
      requireBeadsGraph(mission);await refresh(false);const action=nextAction(mission,snapshot,policy(context));if(action.gate){mission.gate=action.gate;await persist(mission);throw new Error(`Approval required: ${action.detail}`);}if(action.kind!=='dispatch'||!action.ids||!snapshot)throw new Error(action.detail);
      enforceGate(mission,waveGate(mission,action.ids,snapshot));
-     await driver.dispatch(mission,action.ids.map(id=>({beadId:id,cwd:mission!.workspace.cwd,files:mission!.scopes[id]!})));
+     await driver.dispatch(mission,action.ids.map(id=>({beadId:id,cwd:mission!.workspace.cwd,files:mission!.scopes[id]!,task:beadTask(snapshot?.beads.find(b=>b.id===id))})));
      consumeGate(mission);mission.phase=mission.repairLinks[action.ids[0]!]?'repair':'execute';
     }else if(params.operation==='record_verification'){
      if (effectiveGraph(mission) !== 'local') {

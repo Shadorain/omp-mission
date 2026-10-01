@@ -125,7 +125,7 @@ export async function readGraph(run: Run, cwd: string, epicId: string, env?: Rec
       const category: Bead['category'] = group ? 'group' : closed ? 'closed' : deferred ? 'deferred' : activeClaim ? 'active' : explicitlyBlocked ? 'blocked' : ready ? 'ready' : 'waiting';
       beads.push({
         id, title: text(row, 'title', 'name') ?? id, status,
-        assignee: text(row, 'assignee', 'assignee_name'), description: text(row, 'description', 'desc'),
+        assignee: text(row, 'assignee', 'assignee_name'), description: text(row, 'description', 'desc'), acceptance: text(row, 'acceptance_criteria', 'acceptance'),
         issue_type: issueType || undefined, children, parent: text(row, 'parent_id', 'parent'), ready,
         category,
       });

@@ -1,8 +1,8 @@
 import type { Bead, Frontend, Mission, Run, Terminal, Worker } from './types.ts';
 import { spawnBackground, spawnCustom, spawnHerdr, writePromptFile, writeSourceFile } from './hosts.ts';
 
-export interface WorkerAssignment { beadId: string; cwd: string; files: string[]; assignment?: string }
-export interface WorkerHooks { persist(mission: Mission): Promise<void>; prompt?(mission: Mission, worker: Worker): string; agentDir?: string; model?: () => string | undefined; frontend?: Frontend | (() => Frontend); customCommand?: string | (() => string | undefined) }
+export interface WorkerAssignment { beadId: string; cwd: string; files: string[]; assignment?: string; task?: string }
+export interface WorkerHooks { persist(mission: Mission): Promise<void>; prompt?(mission: Mission, worker: Worker, task?: string): string; agentDir?: string; model?: () => string | undefined; frontend?: Frontend | (() => Frontend); customCommand?: string | (() => string | undefined) }
 export interface WorkerDriver {
   dispatch(mission: Mission, assignments: WorkerAssignment[] | string[]): Promise<Worker[]>;
   reconcile(mission: Mission, beadStates: Map<string, Bead>): Promise<Worker[]>;
@@ -183,7 +183,7 @@ export function createWorkerDriver(run: Run, hooks: WorkerHooks): WorkerDriver {
     worker.frontend = frontend();
     await persist(mission);
     const kind = worker.frontend;
-    worker.assignment = hooks.prompt?.(mission, worker) || worker.assignment;
+    if (!worker.assignment) worker.assignment = hooks.prompt?.(mission, worker) ?? '';
     if (!worker.assignment) throw new Error(`worker prompt missing for ${worker.beadId}`);
     await writeSourceFile(mission);
     if (kind !== 'orca') {
@@ -233,7 +233,7 @@ export function createWorkerDriver(run: Run, hooks: WorkerHooks): WorkerDriver {
           beadId: assignment.beadId, attempt: crypto.randomUUID(), cwd: assignment.cwd,
           files: [...assignment.files], state: 'reserved' as const, assignment: assignment.assignment ?? '',
         };
-        worker.assignment ||= hooks.prompt?.(mission, worker) ?? '';
+        worker.assignment ||= hooks.prompt?.(mission, worker, assignment.task) ?? '';
         if (!worker.assignment) throw new Error(`worker prompt missing for ${worker.beadId}`);
         return worker;
       });
