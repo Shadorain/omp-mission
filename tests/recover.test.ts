@@ -48,11 +48,12 @@ test('status and control views drop source text, assignments, descriptions and b
   expect(brief.length).toBeLessThan(700);
   for (const text of [status, brief]) {
     expect(text).not.toContain('nonce-secret');
+    expect(text).not.toContain('term_x');
     expect(text).not.toContain('xxxx');
     expect(text).not.toContain('zzzz');
     expect(text).not.toContain('yyyy');
   }
-  expect(JSON.parse(brief)).toMatchObject({ phase: 'execute', next: { kind: 'dispatch', ids: ['a'] }, workers: [{ beadId: 'a', state: 'awaiting-claim', handle: 'term_x' }], outstanding: ['a:ready'] });
+  expect(JSON.parse(brief)).toMatchObject({ phase: 'execute', next: { kind: 'dispatch', ids: ['a'] }, workers: ['a:awaiting-claim'], outstanding: { ready: 1 } });
   expect(brief).not.toContain('old');
   expect(JSON.parse(status).beads).toEqual(['a ready a', 'b closed b']);
 });

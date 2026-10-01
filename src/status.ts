@@ -9,12 +9,16 @@ const clip = (text: string, max: number): string => text.length > max ? `${text.
 export type NextView = Action & { guide?: string };
 interface Input { mission?: Mission; pending?: Mission; snapshot?: Snapshot; resumeHold: boolean; ownershipError?: string; next?: NextView }
 
-function openWorkers(mission: Mission) {
-	return mission.workers.filter(worker => worker.state !== 'closed').map(({ beadId, state, handle, error }) => ({ beadId, state, ...(handle ? { handle } : {}), ...(error ? { error: clip(error, 160) } : {}) }));
+// Terminal handles are UUIDs (many tokens) and the model addresses workers by bead id.
+function openWorkers(mission: Mission): string[] {
+	return mission.workers.filter(worker => worker.state !== 'closed').map(({ beadId, state, error }) => `${beadId}:${state}${error ? ` (${clip(error, 120)})` : ''}`);
 }
 
-function outstanding(snapshot: Snapshot | undefined): string[] | undefined {
-	return snapshot?.leaves.filter(bead => bead.category !== 'closed').map(bead => `${bead.id}:${bead.category}`);
+function outstanding(snapshot: Snapshot | undefined): Record<string, number> | undefined {
+	if (!snapshot) return undefined;
+	const counts: Record<string, number> = {};
+	for (const bead of snapshot.leaves) if (bead.category !== 'closed') counts[bead.category] = (counts[bead.category] ?? 0) + 1;
+	return counts;
 }
 
 /** Result of a control call: the new position and what to do next. */
