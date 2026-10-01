@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { setMode, nextAction, enforceMutation, enforceGate, approveGate, waveGate, revisionGate } from "../src/controller";
+import { setMode, nextAction, enforceMutation, enforceGate, consumeGate, approveGate, waveGate, revisionGate } from "../src/controller";
 import { captureRevision, parseReview } from "../src/review";
 import type { Mission, Snapshot, PolicyContext, Bead, Worker, Finding } from "../src/types";
 import { mkdtemp, rm, writeFile, symlink, unlink, chmod } from "node:fs/promises";
@@ -79,7 +79,7 @@ test("pause wave gate: hold, approve once, dispatch, invalidate on status change
   expect(after.gate?.token).not.toBe(m.gate!.token);
 });
 
-test("enforceGate consumes the approved gate before the mutation runs; a failed dispatch loses the approval", () => {
+test("an approved gate survives a failed mutation and is spent only by consumeGate", () => {
   const m = createMockMission();
   const s = createBaseSnapshot();
   s.beads.push({ id: "b-1", title: "t", status: "todo", children: [], ready: true, category: "ready" });
@@ -90,8 +90,13 @@ test("enforceGate consumes the approved gate before the mutation runs; a failed 
   const action = nextAction(m, s, basePolicy);
   expect(() => enforceGate(m, action.gate!)).toThrow();
   approveGate(m, m.gate!.token);
-  enforceGate(m, m.gate!); // consumed here, before driver.dispatch runs in extension.ts
-  expect(m.gate).toBeDefined();
+  const approved = m.gate!.token;
+  enforceGate(m, m.gate!); // passes; the mutation then fails, so nothing consumes the approval
+  expect(m.gate?.approved).toBe(true);
+  enforceGate(m, m.gate!); // the retry needs no second approval
+  consumeGate(m); // the mutation succeeded
+  expect(m.gate).toBeUndefined();
+  expect(() => enforceGate(m, { ...action.gate!, token: approved })).toThrow(/Approval required/);
 });
 
 test("gate tokens are kind-bound: wave/review/repairs never share a token", () => {

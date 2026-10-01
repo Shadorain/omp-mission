@@ -12,7 +12,7 @@ import { acquireOwnership, listMissions, loadMission, missionId, missionPath, sa
 import type { Ownership } from './store';
 import { readClaimActor, readGraph, readHistory } from './beads';
 import { createWorkerDriver } from './workers';
-import { approveGate, autoDispatchAllowed, effectiveGraph, enforceGate, enforceMutation, nextAction, requireBeadsGraph, revisionGate, setMode, waveGate } from './controller';
+import { approveGate, autoDispatchAllowed, consumeGate, effectiveGraph, enforceGate, enforceMutation, nextAction, requireBeadsGraph, revisionGate, setMode, waveGate } from './controller';
 import { captureRevision, Reviewer } from './review';
 import { coordinatorPrompt, guide, workerPrompt } from './prompts';
 import { createMissionWidget, createMissionInspector } from './ui';
@@ -335,7 +335,10 @@ export default async function missionExtension(pi: ExtensionAPI) {
      if(params.operation==='bind_graph'&&graph.leaves.some(b=>!params.scopes![b.id]))throw new Error('Every implementation leaf requires scope');if(params.operation==='bind_repairs'){if(mission.phase!=='repair'||mission.evidence.repair?.outcome!=='active')throw new Error('Accept findings before binding repairs');if(!params.repairLinks)throw new Error('Finding links required');const findingIds=mission.reviews.at(-1)!.findings.filter(f=>!f.rejection).map(f=>f.id);for(const id of Object.keys(params.scopes)){const links=params.repairLinks[id];if(!links?.length||links.some(link=>!findingIds.includes(link)))throw new Error(`Invalid finding links: ${id}`);}if(findingIds.some(id=>!Object.values(params.repairLinks!).some(links=>links.includes(id))))throw new Error('Every actionable finding needs a repair bead');Object.assign(mission.repairLinks,params.repairLinks);mission.round++;delete mission.evidence.verify;delete mission.evidence.deliver;delete mission.gate;}
      mission.epicId=epic;Object.assign(mission.scopes,params.scopes);snapshot=graph;mission.phase=params.operation==='bind_repairs'?'repair':'execute';mission.evidence.graph={outcome:'passed',detail:`Epic ${epic}; scoped leaves ${Object.keys(mission.scopes).join(', ')}`,at:new Date().toISOString()};
     }else if(params.operation==='dispatch'){
-     requireBeadsGraph(mission);await refresh(false);const action=nextAction(mission,snapshot,policy(context));if(action.gate){mission.gate=action.gate;await persist(mission);throw new Error(`Approval required: ${action.detail}`);}if(action.kind!=='dispatch'||!action.ids||!snapshot)throw new Error(action.detail);enforceGate(mission,waveGate(mission,action.ids,snapshot));await driver.dispatch(mission,action.ids.map(id=>({beadId:id,cwd:mission!.workspace.cwd,files:mission!.scopes[id]!})));mission.phase=mission.repairLinks[action.ids[0]!]?'repair':'execute';
+     requireBeadsGraph(mission);await refresh(false);const action=nextAction(mission,snapshot,policy(context));if(action.gate){mission.gate=action.gate;await persist(mission);throw new Error(`Approval required: ${action.detail}`);}if(action.kind!=='dispatch'||!action.ids||!snapshot)throw new Error(action.detail);
+     enforceGate(mission,waveGate(mission,action.ids,snapshot));
+     await driver.dispatch(mission,action.ids.map(id=>({beadId:id,cwd:mission!.workspace.cwd,files:mission!.scopes[id]!})));
+     consumeGate(mission);mission.phase=mission.repairLinks[action.ids[0]!]?'repair':'execute';
     }else if(params.operation==='record_verification'){
      if (effectiveGraph(mission) !== 'local') {
       await refresh(false);
@@ -369,6 +372,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
      const revision=(await captureRevision(mission,run)).revision;if(revision!==mission.evidence.verify.revision)throw new Error('Revision changed since verification');
      enforceGate(mission,revisionGate(mission,'review',revision));mission.phase='review';mission.evidence.review={outcome:'active',detail:'Independent reviewer running',revision,at:new Date().toISOString()};await persist(mission);reviewStarted=true;
      const result=await reviewer.run(mission,context,run,config.modelRole);if(epoch!==generation)throw new Error('Session changed during review');
+     consumeGate(mission);
      mission.reviews.push(result);
      mission.evidence.review = {outcome:'passed',detail:result.summary,revision:result.revision,at:result.at};
      if (!result.findings.length) {
@@ -394,6 +398,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
       revision: review.revision,
       at: new Date().toISOString(),
      };
+     consumeGate(mission);
     }else if(params.operation==='reject_finding'){
      const review = mission.reviews.at(-1);
      const finding = review?.findings.find(finding => finding.id === params.findingId);

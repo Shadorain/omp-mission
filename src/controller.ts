@@ -15,11 +15,13 @@ export function enforceMutation(m: Mission, p: PolicyContext): void {
  if(!p.owned)throw new Error('Controller ownership required');
  if(m.blocker)throw new Error(m.blocker);
 }
+// Checks an approved gate without spending it. The caller spends it with consumeGate
+// once the mutation has succeeded, so a failed dispatch or review keeps its approval.
 export function enforceGate(m: Mission, gate: Gate): void {
  if(m.mode!=='pause')return;
  if(m.gate?.token!==gate.token || !m.gate.approved){m.gate=gate;throw new Error(`Approval required: ${gate.detail}`);}
- delete m.gate;
 }
+export function consumeGate(m: Mission): void { delete m.gate; }
 export function effectiveGraph(m: Pick<Mission, 'graph' | 'epicId'>): Graph {
  if (m.graph === 'local' || m.graph === 'beads') return m.graph;
  return 'beads';
