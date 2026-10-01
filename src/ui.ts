@@ -3,6 +3,7 @@ import { replaceTabs, truncateToWidth, wrapTextWithAnsi, visibleWidth } from "@o
 import type { KeybindingsManager, Theme, ThemeColor } from "@oh-my-pi/pi-coding-agent";
 import { phases, type Bead, type Evidence, type Mission, type Mode, type Phase, type Projection, type SubagentRow } from "./types.ts";
 import { effectiveGraph } from "./controller.ts";
+import { displaySourceId } from "./sources.ts";
 
 export interface MissionInspectorCallbacks { close(): void; select(beadId: string): void | Promise<void>; actions?: () => void | Promise<void> }
 export type MissionView = "outline" | "history" | "evidence";
@@ -33,7 +34,7 @@ function modeChip(theme: Theme, mode: Mode): string {
 function alertChip(projection: Projection, theme: Theme): string {
 	if (projection.ownershipError) return paint(theme, "error", `${glyph(theme, "status.error", "✘")} lock`);
 	if (projection.resumeHold) return paint(theme, "warning", `${glyph(theme, "status.warning", "!")} resume`);
-	if (projection.nativePlan) return paint(theme, "warning", `${glyph(theme, "status.warning", "!")} plan`);
+	if (projection.nativePlan && projection.mission.phase !== "plan") return paint(theme, "warning", `${glyph(theme, "status.warning", "!")} plan`);
 	if (projection.mission.gate && !projection.mission.gate.approved) return paint(theme, "warning", `${glyph(theme, "status.warning", "!")} approve`);
 	if (projection.snapshot?.error) return paint(theme, "error", `${glyph(theme, "status.error", "✘")} stale`);
 	return "";
@@ -54,19 +55,16 @@ function fitLine(projection: Projection, theme: Theme, width: number): string {
 	const { mission } = projection;
 	const snapshot = projection.snapshot;
 	const required = [
-		paint(theme, "accent", mission.source.id),
+		paint(theme, "accent", displaySourceId(mission.source)),
 		paint(theme, "text", phaseLabel(mission.phase)),
 		modeChip(theme, mission.mode),
 	];
 	const runningSubagents = projection.subagents?.filter((row) => row.state === "running").length ?? 0;
 	const optional = [
-		projection.frontend ? paint(theme, "dim", projection.frontend) : "",
-		paint(theme, "dim", effectiveGraph(projection.mission)),
 		alertChip(projection, theme),
 		snapshot ? paint(theme, "dim", `${snapshot.closed}/${snapshot.leaves.length}`) : "",
 		countChip(projection, theme),
 		runningSubagents ? paint(theme, "dim", `task ${runningSubagents}`) : "",
-		projection.expandKey ? paint(theme, "dim", projection.expandKey) : "",
 	].filter(Boolean);
 	const rail = paint(theme, "accent", glyph(theme, "advisor.rail", "▎"));
 	const build = (parts: string[]) => `${rail} ${parts.join(dot(theme))}`;
@@ -77,6 +75,18 @@ function fitLine(projection: Projection, theme: Theme, width: number): string {
 		line = build(parts);
 	}
 	return clip(line, width);
+}
+
+function detailLine(projection: Projection, theme: Theme, width: number): string {
+	const sourceNames = {linear: "Linear", github: "GitHub", freeform: "Freeform"} as const;
+	const details = [
+		`Source: ${sourceNames[projection.mission.source.kind]}`,
+		`Frontend: ${projection.frontend ?? "none"}`,
+		`Graph: ${effectiveGraph(projection.mission)}`,
+		projection.nativePlan ? "Read-only plan" : "",
+		projection.expandKey ? `Expand: ${projection.expandKey}` : "",
+	].filter(Boolean);
+	return clip(paint(theme, "dim", `  ${details.join(" · ")}`), width);
 }
 
 function phaseTrack(mission: Mission, theme: Theme, width: number): string {
@@ -125,7 +135,7 @@ export function displayBeads(projection: Projection): Bead[] {
 }
 
 function beadLine(bead: Bead, mission: Mission, theme: Theme, width: number): string {
-	const worker = mission.workers.find((item) => item.beadId === bead.id);
+	const worker = mission.workers.findLast((item) => item.beadId === bead.id);
 	const tail = worker?.error ? paint(theme, "error", " error") : "";
 	return clip(`  ${beadMark(bead, theme)} ${paint(theme, "dim", bead.id)}  ${paint(theme, beadTone(bead), bead.status)}  ${bead.title}${tail}`, width);
 }
@@ -138,6 +148,7 @@ export function missionWidgetLines(projection: Projection, width: number, expand
 	const lines = [summary];
 	const title = projection.mission.source.title.replace(/\s+/g, " ").trim();
 	if (title && lines.length < cap) lines.push(clip(paint(theme, "dim", `  ${title}`), width));
+	if (lines.length < cap) lines.push(detailLine(projection, theme, width));
 	if (lines.length < cap) lines.push(phaseTrack(projection.mission, theme, width));
 	const beads = displayBeads(projection);
 	const room = cap - lines.length;
@@ -264,6 +275,7 @@ export class MissionInspector implements Component {
 		const budget = Math.max(1, fullHeight - 1);
 		const header = [
 			fitLine(projection, this.theme, width),
+			detailLine(projection, this.theme, width),
 			phaseTrack(projection.mission, this.theme, width),
 			paint(this.theme, "dim", `${this.view}  j/k  tab  esc${this.callbacks.actions ? "  a" : ""}`),
 		].map((line) => clip(line, width));

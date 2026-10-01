@@ -8,6 +8,12 @@ const COMMENTS_COUNT = 8;
 const LINEAR_ID = /^[A-Za-z]{2,5}-\d{1,5}$/i;
 const GH_TOKEN = /^(?:([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#(\d+)|#(\d+)|(\d+)|https?:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/(?:issues|pull)\/(\d+)\/?)$/i;
 
+export function displaySourceId(source: Source): string {
+	const prefix = `${source.kind}:`;
+	if (source.id.startsWith(prefix)) return source.id.slice(prefix.length);
+	return source.id;
+}
+
 export function parseMissionInput(args: string): ParsedInput {
   const tokens = args.trim().split(/\s+/).filter(Boolean);
   const result: ParsedInput = { force: false, pause: false, keep: false, extra: "" };
