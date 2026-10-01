@@ -15,10 +15,9 @@ const phaseStatus = (mission: Mission, phase: Phase) => {
 const clip = (value: string, width: number) => truncateToWidth(replaceTabs(value), Math.max(1, width));
 const paint = (theme: Theme, tone: ThemeColor, value: string) => theme.fg(tone, value);
 
-function glyph(theme: Theme, key: string, fallback: string): string {
-	const symbol = (theme as { symbol?: (key: string) => string }).symbol;
-	if (typeof symbol !== "function") return fallback;
-	return symbol.call(theme, key) || fallback;
+function glyph(theme: Theme, key: Parameters<Theme["symbol"]>[0], fallback: string): string {
+	if (!("symbol" in theme) || typeof theme.symbol !== "function") return fallback;
+	return theme.symbol(key) || fallback;
 }
 
 function dot(theme: Theme): string {

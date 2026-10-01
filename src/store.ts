@@ -2,7 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { chmod, mkdir, open, readFile, readdir, realpath, rename, rm, stat } from "node:fs/promises";
 import { basename, dirname, resolve, join } from "node:path";
 import { lock } from "proper-lockfile";
-import { isRecord } from "./guards";
+import { isRecord, isNonNegativeSafeInteger, isPositiveSafeInteger } from "./guards";
 import type { Evidence, Finding, Frontend, Mission, Mode, Phase, Source, Workspace } from "./types";
 
 const MAX_STATE_BYTES = 5_000_000;
@@ -35,6 +35,20 @@ function content(value: unknown, label: string, max = 1_000_000): string {
   if (typeof value !== "string" || value.length > max) invalid(`${label} must be text up to ${max} characters`);
   return value;
 }
+
+export function validateReviewSummary(value: unknown): string {
+  return text(value, "review.summary", 50_000);
+}
+
+export function validateFinding(value: unknown): Finding {
+  const row = object(value, "finding");
+  const severity = row.severity;
+  if (severity !== "critical" && severity !== "high" && severity !== "medium" && severity !== "low") invalid("finding.severity is unsupported");
+  const line = row.line;
+  if (!isPositiveSafeInteger(line)) invalid("finding.line must be a positive integer");
+  return { id: text(row.id, "finding.id", 1000), severity, path: text(row.path, "finding.path", 4000), line, title: text(row.title, "finding.title", 10_000), body: text(row.body, "finding.body", 50_000), ...(row.rejection === undefined ? {} : { rejection: text(row.rejection, "finding.rejection", 10_000) }) };
+}
+
 function validSource(value: unknown): Source {
   const row = object(value, "source");
   if (row.kind !== "linear" && row.kind !== "github" && row.kind !== "freeform") invalid("source.kind is unsupported");
@@ -44,8 +58,9 @@ function validSource(value: unknown): Source {
   if (url !== undefined) source.url = url;
   if (repo !== undefined) source.repo = repo;
   if (row.number !== undefined) {
-    if (typeof row.number !== "number" || !Number.isSafeInteger(row.number) || row.number < 1) invalid("source.number must be a positive integer");
-    source.number = row.number;
+    const num = row.number;
+    if (!isPositiveSafeInteger(num)) invalid("source.number must be a positive integer");
+    source.number = num;
   }
   if (source.kind === "github" && (!source.repo || source.number === undefined)) invalid("GitHub source requires repo and number");
   return source;
@@ -61,12 +76,6 @@ function validWorkspace(value: unknown): Workspace {
     if (item !== undefined) workspace[field] = item;
   }
   return workspace;
-}
-function validFinding(value: unknown): Finding {
-  const row = object(value, "finding");
-  if (!["critical", "high", "medium", "low"].includes(String(row.severity))) invalid("finding.severity is unsupported");
-  if (typeof row.line !== "number" || !Number.isSafeInteger(row.line) || row.line < 1) invalid("finding.line must be a positive integer");
-  return { id: text(row.id, "finding.id", 1000), severity: row.severity as Finding["severity"], path: text(row.path, "finding.path", 4000), line: row.line, title: text(row.title, "finding.title", 10_000), body: text(row.body, "finding.body", 50_000), ...(row.rejection === undefined ? {} : { rejection: text(row.rejection, "finding.rejection", 10_000) }) };
 }
 export function validateMission(value: unknown): Mission {
   const row = object(value, "root");
@@ -93,8 +102,9 @@ export function validateMission(value: unknown): Mission {
   });
   const reviews: Mission["reviews"] = row.reviews.map((raw, index) => {
     const item = object(raw, `reviews[${index}]`);
-    if (typeof item.round !== "number" || !Number.isSafeInteger(item.round) || item.round < 1 || !Array.isArray(item.findings)) invalid(`reviews[${index}] is invalid`);
-    return { round: item.round, revision: text(item.revision, "review.revision", 1000), model: text(item.model, "review.model", 1000), summary: text(item.summary, "review.summary", 50_000), findings: item.findings.map(validFinding), at: text(item.at, "review.at", 100), ...(item.invalidated === undefined ? {} : { invalidated: text(item.invalidated, "review.invalidated", 10_000) }) };
+    const round = item.round;
+    if (!isPositiveSafeInteger(round) || !Array.isArray(item.findings)) invalid(`reviews[${index}] is invalid`);
+    return { round, revision: text(item.revision, "review.revision", 1000), model: text(item.model, "review.model", 1000), summary: text(item.summary, "review.summary", 50_000), findings: item.findings.map(validateFinding), at: text(item.at, "review.at", 100), ...(item.invalidated === undefined ? {} : { invalidated: text(item.invalidated, "review.invalidated", 10_000) }) };
   });
   const repairLinksRow = object(row.repairLinks, "repairLinks");
   const repairLinks: Record<string, string[]> = {};
@@ -105,10 +115,11 @@ export function validateMission(value: unknown): Mission {
     if (!["wave", "review", "repairs"].includes(String(item.kind)) || typeof item.approved !== "boolean") invalid("gate is invalid");
     gate = { kind: item.kind as NonNullable<Mission["gate"]>["kind"], token: text(item.token, "gate.token", 1000), detail: text(item.detail, "gate.detail", 20_000), approved: item.approved };
   }
-  if (typeof row.round !== "number" || !Number.isSafeInteger(row.round) || row.round < 0) invalid("round must be a non-negative integer");
+  const round = row.round;
+  if (!isNonNegativeSafeInteger(round)) invalid("round must be a non-negative integer");
   const missionId = text(row.id, "id", 1000);
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(missionId)) invalid("id contains unsafe path characters");
-  const mission: Mission = { version: 1, id: missionId, source: validSource(row.source), workspace: validWorkspace(row.workspace), scopes, phase: row.phase as Phase, evidence, mode: row.mode as Mode, keep: row.keep, reviewRequested: row.reviewRequested, workers, reviews, repairLinks, round: row.round, createdAt: text(row.createdAt, "createdAt", 100), updatedAt: text(row.updatedAt, "updatedAt", 100) };
+  const mission: Mission = { version: 1, id: missionId, source: validSource(row.source), workspace: validWorkspace(row.workspace), scopes, phase: row.phase as Phase, evidence, mode: row.mode as Mode, keep: row.keep, reviewRequested: row.reviewRequested, workers, reviews, repairLinks, round, createdAt: text(row.createdAt, "createdAt", 100), updatedAt: text(row.updatedAt, "updatedAt", 100) };
   const epicId = optionalText(row.epicId, "epicId", 1000);
   const controllerNonce = optionalText(row.controllerNonce, "controllerNonce", 100);
   const blocker = optionalText(row.blocker, "blocker", 20_000);

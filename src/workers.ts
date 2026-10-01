@@ -109,7 +109,7 @@ export function createWorkerDriver(run: Run, hooks: WorkerHooks): WorkerDriver {
   async function requireLive(worker: Worker, mission: Mission): Promise<Terminal> {
     if (hostOf(worker) !== 'orca') {
       if (!worker.handle || !worker.incarnationId || !(await sessionAlive(worker))) throw new Error(`worker session identity missing or changed for ${worker.beadId}`);
-      return { handle: worker.handle, incarnationId: worker.incarnationId, worktreePath: worker.cwd, writable: true, connected: true } as Terminal;
+      return { handle: worker.handle, incarnationId: worker.incarnationId, worktreePath: worker.cwd, writable: true, connected: true };
     }
     const listing = await listTerminals(run, mission.workspace.cwd);
     if (listing.truncated) throw new Error('Orca terminal topology truncated; worker identity cannot be validated');

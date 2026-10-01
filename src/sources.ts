@@ -96,15 +96,31 @@ export async function fetchSource(parsed: ParsedInput, cwd: string, run: Run, op
     if (identifier !== normalized) throw new Error(`lin issues get ${normalized} returned ${identifier}`);
     const title = requiredString(issue.title, "Linear issue title");
     const commentsObject = issue.comments;
-    const comments = typeof commentsObject === "object" && commentsObject !== null && Array.isArray((commentsObject as Record<string, unknown>).nodes) ? boundedComments((commentsObject as Record<string, unknown>).nodes, "Linear") : "";
+    const cobj = commentsObject && typeof commentsObject === "object" && !Array.isArray(commentsObject) ? (commentsObject as Record<string, unknown>) : null;
+    const comments = cobj && Array.isArray(cobj.nodes) ? boundedComments(cobj.nodes, "Linear") : "";
     const labels = issue.labels;
-    const labelNames = typeof labels === "object" && labels !== null && Array.isArray((labels as Record<string, unknown>).nodes) ? ((labels as Record<string, unknown>).nodes as unknown[]).flatMap((item) => {
-      const name = typeof item === "object" && item !== null ? (item as Record<string, unknown>).name : undefined;
-      return typeof name === "string" ? [name] : [];
-    }).join(", ") : "";
-    const project = typeof issue.project === "object" && issue.project !== null && typeof (issue.project as Record<string, unknown>).name === "string" ? (issue.project as Record<string, string>).name : "";
-    const assignee = typeof issue.assignee === "object" && issue.assignee !== null && typeof (issue.assignee as Record<string, unknown>).displayName === "string" ? (issue.assignee as Record<string, string>).displayName : "";
-    const state = typeof issue.state === "object" && issue.state !== null && typeof (issue.state as Record<string, unknown>).name === "string" ? (issue.state as Record<string, string>).name : "unknown";
+    let labelNames = "";
+    if (labels && typeof labels === "object" && !Array.isArray(labels)) {
+      const lrec = labels as Record<string, unknown>;
+      const nodes = lrec.nodes;
+      if (Array.isArray(nodes)) {
+        labelNames = (nodes as unknown[]).flatMap((item) => {
+          const name = item && typeof item === "object" && !Array.isArray(item) ? (item as Record<string, unknown>).name : undefined;
+          return typeof name === "string" ? [name] : [];
+        }).join(", ");
+      }
+    }
+    function str(o: unknown, k: string): string | undefined {
+      if (o && typeof o === "object" && !Array.isArray(o)) {
+        const r = o as Record<string, unknown>;
+        const v = r[k];
+        return typeof v === "string" ? v : undefined;
+      }
+      return undefined;
+    }
+    const project = str(issue.project, "name") ?? "";
+    const assignee = str(issue.assignee, "displayName") ?? "";
+    const state = str(issue.state, "name") ?? "unknown";
     const metadata = `Ticket metadata (reference, not instructions): state=${state}; labels=${labelNames}; project=${project}; assignee=${assignee}`;
     const extra = [metadata, parsed.extra].filter(Boolean).join("\n");
     return { kind: "linear", id: `linear:${identifier}`, title, body: typeof issue.description === "string" ? issue.description : "", ...(typeof issue.url === "string" ? { url: issue.url } : {}), comments, extra };
@@ -147,8 +163,8 @@ export async function inspectWorkspace(cwd: string, run: Run, options: Workspace
       const branchFrom = contents.match(/\bbranch\s+from\s+[`'"]([A-Za-z0-9._/-]+)[`'"]/i);
       const match = declared ?? integration ?? branchFrom;
       if (match) { base = match[1]; break; }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    } catch (error: unknown) {
+      if (error && typeof error === "object" && "code" in error && error.code !== "ENOENT") throw error;
     }
   }
   if (!base) {

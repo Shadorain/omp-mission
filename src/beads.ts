@@ -53,7 +53,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 function text(row: Record<string, unknown>, ...keys: string[]): string | undefined {
-  for (const key of keys) if (typeof row[key] === 'string') return row[key] as string;
+  for (const key of keys) {
+    const v = row[key];
+    if (typeof v === 'string') return v;
+  }
   return undefined;
 }
 function idOf(row: Record<string, unknown>): string | undefined { return text(row, 'id', 'issue_id', 'bead_id'); }

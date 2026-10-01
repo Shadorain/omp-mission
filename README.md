@@ -57,6 +57,15 @@ Tab completes the next argument. `ctrl+shift+m` expands the row. `ctrl+shift+f` 
 
 `PI_CODING_AGENT_DIR` or `OMP_AGENT_DIR` replaces `~/.omp/agent`.
 
+## Review and repairs
+
+Independent review results must match the verified revision and persisted field limits. Invalid results are rejected before they enter mission history.
+
+Accepting local repairs advances the review round and clears earlier verification and delivery evidence. Passing verification requires changed output while actionable findings remain. Beads repairs advance the round when their finding-linked graph is bound; verification requires a nonempty graph whose implementation leaves are completed (`closed` or `done`).
+
+Repair evidence becomes passed or failed with verification, rather than staying active through delivery. Explicitly rejecting every accepted finding skips repair evidence and allows unchanged output to be reverified. Delivery and independent rereview remain required for changed output.
+
+
 ## Develop
 
 ```bash

@@ -15,6 +15,13 @@ export const DEFAULT_MISSION_CONFIG: MissionConfig = {
 
 const FRONTENDS = new Set<Frontend>(["none", "orca", "herdr", "custom"]);
 const GRAPHS = new Set<Graph>(["local", "beads"]);
+function isFrontend(v: unknown): v is Frontend {
+	return typeof v === "string" && FRONTENDS.has(v as Frontend);
+}
+function isGraph(v: unknown): v is Graph {
+	return typeof v === "string" && GRAPHS.has(v as Graph);
+}
+
 export function resolveAgentDir(
   env: NodeJS.ProcessEnv = process.env,
   home = homedir(),
@@ -40,7 +47,7 @@ export function validateMissionConfig(value: unknown, path = "mission.json"): Mi
   if (typeof maxWorkers !== "number" || !Number.isInteger(maxWorkers) || maxWorkers < 1 || maxWorkers > 8) return fail("maxWorkers must be an integer from 1 through 8");
   const keys = value.keys === undefined ? DEFAULT_MISSION_CONFIG.keys : value.keys;
   if (!isRecord(keys)) return fail("keys must be an object");
-  const normalized: Record<string, string | null> = {};
+  const normalized: Record<"expand" | "fullscreen" | "mode", string | null> = { expand: null, fullscreen: null, mode: null };
   for (const name of ["expand", "fullscreen", "mode"] as const) {
     const chord = keys[name] === undefined ? DEFAULT_MISSION_CONFIG.keys[name] : keys[name];
     if (chord !== null && !validChord(chord)) return fail(`keys.${name} must be a valid key chord or null`);
@@ -49,22 +56,22 @@ export function validateMissionConfig(value: unknown, path = "mission.json"): Mi
   const enabled = Object.values(normalized).filter((key): key is string => key !== null);
   if (new Set(enabled).size !== enabled.length) return fail("enabled shortcut chords must be distinct");
   const frontend = value.frontend === undefined ? "none" : value.frontend;
-  if (typeof frontend !== "string" || !FRONTENDS.has(frontend as Frontend)) return fail("frontend must be none, orca, herdr, or custom");
+  if (typeof frontend !== "string" || !isFrontend(frontend)) return fail("frontend must be none, orca, herdr, or custom");
   const graph = value.graph === undefined ? "local" : value.graph;
-  if (typeof graph !== "string" || !GRAPHS.has(graph as Graph)) return fail("graph must be local or beads");
+  if (typeof graph !== "string" || !isGraph(graph)) return fail("graph must be local or beads");
   const customCommand = typeof value.customCommand === "string" ? value.customCommand.trim() : undefined;
   if (value.customCommand !== undefined && !customCommand) return fail("customCommand must be a non-empty command");
   if (customCommand && (customCommand.length > 2000 || /[\0\n\r]/.test(customCommand))) return fail("customCommand must be one line under 2000 characters");
   if (frontend === "custom" && !customCommand) return fail("customCommand is required when frontend is custom");
-  return { version: 1, controls: value.controls ?? false, maxWorkers, frontend: frontend as Frontend, graph: graph as Graph, ...(customCommand ? { customCommand } : {}), keys: normalized as MissionConfig["keys"] };
+  return { version: 1, controls: value.controls ?? false, maxWorkers, frontend, graph, ...(customCommand ? { customCommand } : {}), keys: normalized };
 }
 
 export async function readMissionConfig(agentDir: string): Promise<MissionConfig> {
   const path = missionConfigFile(agentDir);
   let text: string;
   try { text = await readFile(path, "utf8"); }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return structuredClone(DEFAULT_MISSION_CONFIG);
+  catch (error: unknown) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return structuredClone(DEFAULT_MISSION_CONFIG);
     throw new Error(`Cannot read mission configuration at ${path}: ${String(error)}`);
   }
   let value: unknown;

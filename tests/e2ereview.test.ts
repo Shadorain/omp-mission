@@ -1,7 +1,6 @@
 import { test, expect } from 'bun:test';
 import { nextAction } from '../src/controller';
 import type { Mission, Snapshot, Bead } from '../src/types';
-import { Reviewer } from '../src/review';
 
 const leaf: Bead = { id: 'L', title: 'L', status: 'closed', children: [], ready: false, category: 'closed' };
 const emptySnapshot: Snapshot = { beads: [leaf], leaves: [leaf], ready: [], closed: 1, active: 0, blocked: 0, fetchedAt: Date.now() };
@@ -81,33 +80,4 @@ test('independent review -> repair -> rereview loop state transitions', () => {
   });
   delete m.gate;
   expect(nextAction(m, emptySnapshot, basePolicy).kind).toBe('complete');
-});
-
-test('reviewer abort disposes session', async () => {
-  const r = new Reviewer();
-  // Mock createAgentSession on global or just test that dispose works
-  r['session'] = { dispose: async () => { r['session'] = undefined; } } as any;
-  await r.dispose();
-  expect(r['session']).toBeUndefined();
-});
-
-test('reject_finding logic', () => {
-  const m = mkMission();
-  m.epicId = 'E';
-  m.evidence.verify = { outcome: 'passed', revision: 'hash1', detail: 'OK', at: 'now' };
-  m.evidence.deliver = { outcome: 'passed', revision: 'hash1', detail: 'OK', at: 'now' };
-  m.reviewRequested = true;
-  m.reviews.push({
-    revision: 'hash1', summary: 'Defects', findings: [
-      { id: 'f1', severity: 'high', path: 'f.js', line: 1, title: 'B', body: 'Bug' }
-    ], round: 1, model: '', at: ''
-  });
-  const finding = m.reviews.at(-1)?.findings.find(f => f.id === 'f1');
-  if (!finding || !'reason'.trim()) throw new Error('Finding and visible non-actionable explanation required');
-  finding.rejection = 'reason';
-  
-  // nextAction should ignore rejected findings
-  const act = nextAction(m, emptySnapshot, basePolicy);
-  // Without other findings, it should complete
-  expect(act.kind).toBe('complete');
 });

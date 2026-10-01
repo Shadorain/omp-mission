@@ -12,10 +12,12 @@ export function noteSubagentToolStart(rows: readonly SubagentRow[], event: { too
 	if (event.toolName !== "task") return [...rows];
 	const id = `subagent:${event.toolCallId}`;
 	if (rows.some((row) => row.id === id)) return [...rows];
-	const args = event.args && typeof event.args === "object" ? event.args as { name?: unknown; agent?: unknown; tasks?: unknown } : {};
-	const named = typeof args.name === "string" ? args.name : typeof args.agent === "string" ? args.agent : undefined;
-	const first = Array.isArray(args.tasks) ? args.tasks.find((item) => item && typeof item === "object" && typeof (item as { name?: unknown }).name === "string") as { name?: string } | undefined : undefined;
-	return [...rows, { id, name: named ?? first?.name ?? "task", kind: "task", state: "running" }];
+	const argRec = (event.args && typeof event.args === "object" && !Array.isArray(event.args)) ? (event.args as Record<string, unknown>) : {};
+	const named = typeof argRec.name === "string" ? argRec.name : typeof argRec.agent === "string" ? argRec.agent : undefined;
+	const tasksRaw = argRec.tasks;
+	const firstItem = Array.isArray(tasksRaw) ? tasksRaw.find((item): item is Record<string, unknown> => !!item && typeof item === "object" && !Array.isArray(item)) : undefined;
+	const firstName = firstItem && typeof firstItem.name === "string" ? firstItem.name : undefined;
+	return [...rows, { id, name: named ?? firstName ?? "task", kind: "task", state: "running" }];
 }
 
 export function noteSubagentToolEnd(rows: readonly SubagentRow[], event: { toolCallId: string; toolName: string; isError: boolean }): SubagentRow[] {
