@@ -1,5 +1,5 @@
 import type { Bead, Frontend, Mission, Run, Terminal, Worker } from './types.ts';
-import { spawnBackground, spawnCustom, spawnHerdr } from './hosts.ts';
+import { spawnBackground, spawnCustom, spawnHerdr, writePromptFile, writeSourceFile } from './hosts.ts';
 
 export interface WorkerAssignment { beadId: string; cwd: string; files: string[]; assignment?: string }
 export interface WorkerHooks { persist(mission: Mission): Promise<void>; prompt?(mission: Mission, worker: Worker): string; agentDir?: string; frontend?: Frontend | (() => Frontend); customCommand?: string | (() => string | undefined) }
@@ -9,6 +9,7 @@ export interface WorkerDriver {
   focus(worker: Worker): Promise<void>;
   reap(mission: Mission, beadId: string, bead: Bead): Promise<void>;
   resend(mission: Mission, beadId: string, bead: Bead): Promise<void>;
+  recover(mission: Mission, beadId: string, bead: Bead): Promise<void>;
 }
 
 export function assertNonOverlapping(assignments: WorkerAssignment[]): void {
@@ -154,9 +155,22 @@ export function createWorkerDriver(run: Run, hooks: WorkerHooks): WorkerDriver {
     }
     await waitIdle(worker, mission);
     await requireLive(worker, mission);
-    const result = await run('orca', ['terminal', 'send', '--terminal', worker.handle!, '--text', worker.assignment, '--enter', '--json'], mission.workspace.cwd);
-    const sent = decode(result).send;
-    if (typeof sent === 'object' && sent !== null && (sent as Record<string, unknown>).accepted === false) throw new Error(`Orca did not accept the assignment for ${worker.beadId}`);
+    await writeSourceFile(mission);
+    const promptFile = await writePromptFile(worker);
+    const notice = `Your full assignment for bead ${worker.beadId} is in the file ${promptFile} — read it and execute it exactly as written.`;
+    const sent = decode(await run('orca', ['terminal', 'send', '--terminal', worker.handle!, '--text', notice, '--enter', '--wait-submit', '120', '--json'], mission.workspace.cwd)).send;
+    if (typeof sent !== 'object' || sent === null || Array.isArray(sent)) throw new Error(`Orca send omitted result.send for ${worker.beadId}`);
+    const row = sent as Record<string, unknown>;
+    if (row.accepted !== true) throw new Error(`Orca did not accept the assignment for ${worker.beadId}`);
+    const prompt = row.prompt;
+    if (typeof prompt !== 'object' || prompt === null || Array.isArray(prompt)) throw new Error(`Orca send omitted the prompt receipt for ${worker.beadId}; submission unobservable`);
+    const pr = prompt as Record<string, unknown>;
+    if (pr.provider === 'old-host') throw new Error(`Orca host cannot observe prompt submission for ${worker.beadId} (old-host); refusing to treat input acceptance as delivery`);
+    if (pr.observation === 'rejected') throw new Error(`Orca rejected the assignment prompt for ${worker.beadId}`);
+    const stages = Array.isArray(pr.stages) ? pr.stages : [];
+    if (stages.includes('turn_started')) return;
+    if (pr.observation === 'observed') throw new Error(`Orca observed no turn start for the assignment of ${worker.beadId}; draft may sit unsubmitted in the composer`);
+    throw new Error(`Orca accepted the assignment for ${worker.beadId} but submission is unconfirmed (provider cannot report delivery); inspect the tab before retrying`);
   }
 
   async function start(mission: Mission, worker: Worker): Promise<void> {
@@ -164,9 +178,10 @@ export function createWorkerDriver(run: Run, hooks: WorkerHooks): WorkerDriver {
     worker.frontend = frontend();
     await persist(mission);
     const kind = worker.frontend;
+    worker.assignment = hooks.prompt?.(mission, worker) || worker.assignment;
+    if (!worker.assignment) throw new Error(`worker prompt missing for ${worker.beadId}`);
+    await writeSourceFile(mission);
     if (kind !== 'orca') {
-      worker.assignment = hooks.prompt?.(mission, worker) || worker.assignment;
-      if (!worker.assignment) throw new Error(`worker prompt missing for ${worker.beadId}`);
       if (kind === 'custom' && !customCommand()) throw new Error('customCommand is required when frontend is custom');
       const spawned = kind === 'herdr'
         ? await spawnHerdr(run, mission, worker, hooks.agentDir)
@@ -176,14 +191,16 @@ export function createWorkerDriver(run: Run, hooks: WorkerHooks): WorkerDriver {
       worker.handle = spawned.handle;
       worker.incarnationId = spawned.incarnationId;
       worker.state = 'awaiting-claim';
-      worker.assignment = hooks.prompt?.(mission, worker) || worker.assignment;
+      worker.launchedAt = new Date().toISOString();
       await persist(mission);
       await send(worker, mission);
       return;
     }
     if (!mission.workspace.beadsDir) throw new Error('canonical BEADS_DIR missing; refusing to start worker');
+    const promptFile = await writePromptFile(worker);
     const agentEnvironment = hooks.agentDir ? ` PI_CODING_AGENT_DIR=${quote(hooks.agentDir)}` : '';
-    const command = `env OMP_MISSION_WORKER=${quote('1')} BEADS_ACTOR=${quote(worker.beadId)} BEADS_DIR=${quote(mission.workspace.beadsDir)}${agentEnvironment} omp`;
+    const pRef = quote(promptFile);
+    const command = `env OMP_MISSION_WORKER=${quote('1')} BEADS_ACTOR=${quote(worker.beadId)} BEADS_DIR=${quote(mission.workspace.beadsDir)}${agentEnvironment} omp @${pRef}`;
     const result = await run('orca', ['terminal', 'create', '--worktree', `path:${worker.cwd}`, '--title', `mission-${worker.beadId}`, '--command', command, '--json'], mission.workspace.cwd);
     const payload = decode(result);
     const terminal = payload.terminal;
@@ -193,10 +210,9 @@ export function createWorkerDriver(run: Run, hooks: WorkerHooks): WorkerDriver {
     worker.handle = created.handle;
     worker.incarnationId = created.incarnationId;
     worker.state = 'awaiting-claim';
-    worker.assignment = hooks.prompt?.(mission, worker) || worker.assignment;
-    if (!worker.assignment) throw new Error(`worker prompt missing for ${worker.beadId}`);
+    worker.launchedAt = new Date().toISOString();
     await persist(mission);
-    await send(worker, mission);
+    // initial assignment delivered at launch via OMP @file CLI arg (avoids orca send paste/escaped-newline into composer); send path used only by resend
   }
 
   return {
@@ -229,8 +245,9 @@ export function createWorkerDriver(run: Run, hooks: WorkerHooks): WorkerDriver {
       for (const worker of mission.workers) {
         const bead = beadStates.get(worker.beadId);
         if (!bead) continue;
+        if (worker.state === 'closed') continue;
         if (bead.category === 'closed') {
-          if (worker.state !== 'closed') { worker.state = 'closed'; changed.push(worker); }
+          worker.state = 'closed'; changed.push(worker);
           continue;
         }
         if (!worker.handle || !worker.incarnationId) {
@@ -296,7 +313,7 @@ export function createWorkerDriver(run: Run, hooks: WorkerHooks): WorkerDriver {
     async reap(mission, beadId, bead) {
       if (mission.keep) throw new Error('mission keep policy forbids worker cleanup');
       if (bead.id !== beadId || bead.category !== 'closed') throw new Error('only the exact closed mission bead may be reaped');
-      const worker = mission.workers.find(item => item.beadId === beadId);
+      const worker = mission.workers.findLast(item => item.beadId === beadId);
       if (!worker?.handle || !worker.incarnationId) throw new Error('no recorded worker terminal to reap');
       await requireLive(worker, mission);
       const kind = hostOf(worker);
@@ -314,9 +331,17 @@ export function createWorkerDriver(run: Run, hooks: WorkerHooks): WorkerDriver {
       worker.state = 'closed';
       await persist(mission);
     },
+    async recover(mission, beadId, bead) {
+      if (bead.id !== beadId || bead.category !== 'ready' || bead.assignee || bead.claimActor) throw new Error('recover requires the exact ready, unclaimed mission bead');
+      const worker = mission.workers.find(item => item.beadId === beadId && item.state !== 'closed');
+      if (!worker || worker.state !== 'missing') throw new Error('recover requires a worker whose recorded terminal is gone; use resend while it is alive');
+      worker.state = 'closed';
+      worker.error = `replaced: ${worker.error ?? 'recorded worker terminal is gone'}`;
+      await persist(mission);
+    },
     async resend(mission, beadId, bead) {
       if (bead.id !== beadId || bead.category !== 'ready') throw new Error('resend requires the exact currently ready mission bead');
-      const worker = mission.workers.find(item => item.beadId === beadId);
+      const worker = mission.workers.findLast(item => item.beadId === beadId);
       if (!worker || worker.state !== 'awaiting-claim' || !worker.handle || !worker.incarnationId) throw new Error('no awaiting-claim worker to resend');
       if (bead.claimActor) throw new Error(`bead already claimed by ${bead.claimActor}; refusing duplicate assignment`);
       await requireLive(worker, mission);

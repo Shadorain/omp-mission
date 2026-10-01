@@ -10,6 +10,8 @@ export const DEFAULT_MISSION_CONFIG: MissionConfig = {
   maxWorkers: 2,
   frontend: "none",
   graph: "local",
+  modelRole: "smol",
+  autoDispatch: false,
   keys: { expand: "ctrl+shift+m", fullscreen: "ctrl+shift+f", mode: "ctrl+shift+o" },
 };
 
@@ -63,7 +65,10 @@ export function validateMissionConfig(value: unknown, path = "mission.json"): Mi
   if (value.customCommand !== undefined && !customCommand) return fail("customCommand must be a non-empty command");
   if (customCommand && (customCommand.length > 2000 || /[\0\n\r]/.test(customCommand))) return fail("customCommand must be one line under 2000 characters");
   if (frontend === "custom" && !customCommand) return fail("customCommand is required when frontend is custom");
-  return { version: 1, controls: value.controls ?? false, maxWorkers, frontend, graph, ...(customCommand ? { customCommand } : {}), keys: normalized };
+  const modelRole = value.modelRole === undefined ? DEFAULT_MISSION_CONFIG.modelRole : value.modelRole;
+  if (typeof modelRole !== "string" || !/^[A-Za-z][A-Za-z0-9_.-]{0,40}$/.test(modelRole)) return fail("modelRole must be a model role name such as smol, default, or slow");
+  if (value.autoDispatch !== undefined && typeof value.autoDispatch !== "boolean") return fail("autoDispatch must be boolean");
+  return { version: 1, controls: value.controls ?? false, maxWorkers, frontend, graph, modelRole, autoDispatch: value.autoDispatch ?? false, ...(customCommand ? { customCommand } : {}), keys: normalized };
 }
 
 export async function readMissionConfig(agentDir: string): Promise<MissionConfig> {
@@ -97,4 +102,25 @@ export function configNotice(path: string, saved: boolean, detail: string): stri
 export async function writeMissionConfig(agentDir: string, config: MissionConfig): Promise<void> {
   const path = missionConfigFile(agentDir);
   await writeFile(path, `${JSON.stringify(validateMissionConfig(config, path), null, 2)}\n`, { mode: 0o600 });
+}
+
+export function formatMissionConfig(config: MissionConfig, path: string, missionGraph?: Graph): string {
+	const lines = [
+		`Configuration at ${path}:`,
+		`  version: ${config.version}`,
+		`  controls: ${config.controls}`,
+		`  maxWorkers: ${config.maxWorkers}`,
+		`  frontend: ${config.frontend}`,
+		`  modelRole: ${config.modelRole}`,
+		`  autoDispatch: ${config.autoDispatch}`,
+	];
+	let g = `  graph: ${config.graph}`;
+	if (missionGraph !== undefined && missionGraph !== config.graph) g += ` (active: ${missionGraph})`;
+	lines.push(g);
+	if (config.customCommand) lines.push(`  customCommand: ${config.customCommand}`);
+	lines.push("  keys:");
+	for (const name of ["expand", "fullscreen", "mode"] as const) {
+		lines.push(`    ${name}: ${config.keys[name]}`);
+	}
+	return lines.join("\n");
 }

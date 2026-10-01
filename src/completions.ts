@@ -21,7 +21,7 @@ const VERBS: Array<{ name: string; description: string }> = [
 	{ name: "dispatch", description: "Dispatch the ready wave" },
 	{ name: "reap", description: "Close the worker session" },
 	{ name: "actions", description: "Open the action menu" },
-	{ name: "config", description: "Show or set the session frontend" },
+	{ name: "config", description: "Show or set graph, frontend, or config" },
 ];
 
 const FLAGS: Array<{ name: string; alias?: string; description: string }> = [
@@ -78,14 +78,14 @@ function beadItems(stem: string, beads: CompletionBead[], partial: string): Comp
 	return beads
 		.filter(bead => matches(bead.id, partial) || matches(bead.title, partial))
 		.slice(0, 40)
-		.map(bead => item(stem, bead.id, bead.title, bead.category));
+		.map(bead => item(stem, bead.id, bead.title));
 }
 
 function workerBeads(state: MissionCompletionState, predicate: (worker: CompletionWorker, bead?: CompletionBead) => boolean): CompletionBead[] {
 	const byId = new Map(state.beads.map(bead => [bead.id, bead]));
 	return state.workers.filter(worker => predicate(worker, byId.get(worker.beadId))).map(worker => {
 		const bead = byId.get(worker.beadId);
-		return { id: worker.beadId, title: bead?.title ?? worker.state, category: bead?.category ?? worker.state };
+		return { id: worker.beadId, title: bead?.title ?? worker.state };
 	});
 }
 
@@ -101,6 +101,8 @@ function completeVerb(verb: string, rest: string[], partial: string, state: Miss
 			const keys = [
 				{ name: "frontend", description: "Session host: none, orca, herdr, custom" },
 				{ name: "graph", description: "Work graph: local or beads" },
+				{ name: "modelRole", description: "Model role for independent review" },
+				{ name: "autoDispatch", description: "Start ready waves without a model turn" },
 			].filter((key) => matches(key.name, partial));
 			return keys.length ? keys.map((key) => item(verb, key.name, key.description)) : null;
 		}
@@ -110,6 +112,20 @@ function completeVerb(verb: string, rest: string[], partial: string, state: Miss
 		}
 		if (rest.length === 1 && rest[0] === "graph") {
 			const items = GRAPHS.filter(graph => matches(graph.name, partial)).map(graph => item(stem, graph.name, graph.description));
+			return items.length ? items : null;
+		}
+		if (rest.length === 1 && rest[0] === "modelRole") {
+			const roles = [
+				{ name: "smol", description: "Fast, cheap model (default)" },
+				{ name: "default", description: "Same model as the coordinator" },
+				{ name: "slow", description: "Strongest configured model" },
+			];
+			const items = roles.filter(role => matches(role.name, partial)).map(role => item(stem, role.name, role.description));
+			return items.length ? items : null;
+		}
+		if (rest.length === 1 && rest[0] === "autoDispatch") {
+			const flags = [{ name: "on", description: "Start ready waves directly" }, { name: "off", description: "Ask the coordinator each wave" }];
+			const items = flags.filter(flag => matches(flag.name, partial)).map(flag => item(stem, flag.name, flag.description));
 			return items.length ? items : null;
 		}
 		return null;
@@ -139,7 +155,7 @@ function firstToken(partial: string, state: MissionCompletionState): CompletionI
 		: [];
 	const sources = partial.startsWith("-")
 		? []
-		: state.sources.filter(source => matches(source.id, partial) || matches(source.title, partial)).slice(0, 12).map(source => item("", source.id, source.title, "saved"));
+		: state.sources.filter(source => matches(source.id, partial) || matches(source.title, partial)).slice(0, 12).map(source => item("", source.id.replace(/^(?:linear|github|freeform):/i, ""), source.title));
 	const items = [...verbs, ...flags, ...sources];
 	return items.length ? items : null;
 }

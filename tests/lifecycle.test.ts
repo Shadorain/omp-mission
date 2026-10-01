@@ -38,14 +38,17 @@ async function fixture(graph: Graph, leaves = true) {
   const path = missionPath(root, mission);
   await saveMission(path, mission);
   const tools = new Map<string, Execute>();
+  let commandHandler: ((args: string, context: ExtensionContext) => Promise<void>) | undefined;
+  const sent: string[] = [];
+  const notices: string[] = [];
   const events = new Map<string, EventHandler>();
   let active: string[] = [];
   // This fixture supplies only host services used by these operations. Storage,
   // revision capture, graph parsing, and mission transitions are real.
   const context = {
     agent: { kind: 'main' }, cwd, hasUI: false,
-    sessionManager: { getBranch: () => [{ type: 'custom', customType: 'mission:pointer', data: { path } }] },
-    ui: { notify: () => {}, setWidget: () => {} },
+    sessionManager: { getBranch: () => [{ type: 'custom', customType: 'mission:pointer', data: { path } }], getSessionName: () => undefined },
+    ui: { notify: (message: string) => { notices.push(message); }, setWidget: () => {} },
     isIdle: () => false, hasPendingMessages: () => false,
     setInterval: () => 1, clearTimer: () => {},
   } as unknown as ExtensionContext;
@@ -54,10 +57,10 @@ async function fixture(graph: Graph, leaves = true) {
       if (!isRecord(tool) || typeof tool.name !== 'string' || typeof tool.execute !== 'function') throw new Error('Invalid tool');
       tools.set(tool.name, tool.execute as Execute);
     },
-    registerCommand: () => {}, registerShortcut: () => {},
+    registerCommand: (_name: string, spec: { handler: (args: string, context: ExtensionContext) => Promise<void> }) => { commandHandler = spec.handler; }, registerShortcut: () => {},
     on: (name: string, handler: EventHandler) => events.set(name, handler), events: { on: () => {} },
     getActiveTools: () => active, setActiveTools: async (names: string[]) => { active = names; },
-    appendEntry: () => {}, sendUserMessage: () => {},
+    appendEntry: () => {}, sendUserMessage: (message: string) => { sent.push(message); },
     exec: async (command: string, args: string[]) => {
       const bdIndex = args.indexOf('bd');
       if (command === 'env' && bdIndex >= 0) args = args.slice(bdIndex + 1);
@@ -86,6 +89,7 @@ async function fixture(graph: Graph, leaves = true) {
   const execute = (params: Params) => control('test', params, undefined, undefined, context);
   await execute({ operation: 'continue' });
   return {
+    command: async (args: string) => { await commandHandler!(args, context); }, sent, notices,
     execute, cwd, state: () => loadMission(path),
     dispose: async () => { try { await shutdown({}, context); } finally { await rm(root, { recursive: true, force: true }); } },
   };
@@ -136,5 +140,15 @@ test('rejecting every accepted repair finalizes repair evidence without requirin
     await mission.execute({ operation: 'record_verification', passed: true, detail: 'Original output reverified' });
     expect((await mission.state()).phase).toBe('deliver');
     expect((await mission.state()).evidence.repair?.outcome).toBe('skipped');
+  } finally { await mission.dispose(); }
+});
+
+test('operator commands run the control operation directly instead of asking the model to', async () => {
+  const mission = await fixture('beads');
+  try {
+    await mission.command('continue');
+    expect(mission.sent).toEqual([]);
+    expect(mission.notices.some(message => message.startsWith('Mission continue done'))).toBe(true);
+    expect((await mission.state()).phase).toBe('execute');
   } finally { await mission.dispose(); }
 });

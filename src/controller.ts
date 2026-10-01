@@ -27,6 +27,13 @@ export function effectiveGraph(m: Pick<Mission, 'graph' | 'epicId'>): Graph {
 export function requireBeadsGraph(m: Mission): void {
  if (effectiveGraph(m) === 'local') throw new Error('Local graph has no bead epic or wave; implement in this pane');
 }
+export const CLAIM_STALL_MS = 3 * 60_000;
+// Dispatch needs no judgment once the wave is ready and unpaused, so with the opt-in
+// flag the extension runs it directly. Pause keeps its explicit gate, and a hold of any
+// kind (resume, plan mode, lost ownership) keeps the model and operator in charge.
+export function autoDispatchAllowed(m: Mission, action: Action, enabled: boolean, p: PolicyContext): boolean {
+ return enabled && action.kind === 'dispatch' && !action.gate && m.mode !== 'pause' && p.owned && !p.resumeHold && !p.nativePlan && !m.blocker;
+}
 export function nextAction(m: Mission, snapshot: Snapshot | undefined, policy: PolicyContext): Action {
  if (policy.nativePlan) return {kind: 'hold', detail: 'Native plan mode'};
  if (policy.resumeHold) return {kind: 'hold', detail: 'Resumed inspection; continue explicitly'};
@@ -42,6 +49,8 @@ export function nextAction(m: Mission, snapshot: Snapshot | undefined, policy: P
   if (!snapshot || !policy.fresh || snapshot.error) return {kind: 'hold', detail: snapshot?.error ?? 'Fresh graph required'};
   if (!snapshot.leaves.length) return {kind: 'hold', detail: 'Graph has no implementation leaves'};
   const workers = m.workers.filter(worker => worker.state !== 'closed');
+  const stalled = workers.filter(worker => worker.state === 'awaiting-claim' && !worker.error && worker.launchedAt && Date.now() - Date.parse(worker.launchedAt) > CLAIM_STALL_MS && snapshot.leaves.some(bead => bead.id === worker.beadId && bead.category === 'ready'));
+  if (stalled.length) return {kind: 'resend', detail: `No claim ${Math.round(CLAIM_STALL_MS / 60000)}+ min after launch: ${stalled.map(worker => worker.beadId).join(', ')}. Inspect the tab, then resend once`, ids: stalled.map(worker => worker.beadId).sort()};
   if (workers.some(worker => worker.state === 'missing' || worker.error)) return {kind: 'hold', detail: 'Worker identity or claim requires recovery'};
   const outstanding = snapshot.leaves.filter(bead => bead.category !== 'closed');
   if (outstanding.length) {

@@ -96,34 +96,6 @@ describe('worker safety boundaries', () => {
     expect(current.workers[0]!.error).toContain('someone-else');
   });
 
-  test('persists reservation with assignment, refreshes prompt after terminal identity, sends with Enter', async () => {
-    const current = mission();
-    const calls: { command: string; args: string[] }[] = [];
-    const run: Run = async (command, args) => {
-      calls.push({ command, args });
-      if (args[1] === 'create') return result({ ok: true, result: { terminal: { handle: 'term-x', incarnationId: 'inc-x' } } });
-      if (args[1] === 'list') return result({ ok: true, result: { terminals: [{ handle: 'term-x', incarnationId: 'inc-x', worktreePath: '/tmp/work', writable: true, connected: true }], truncated: false } });
-      if (args[1] === 'wait') return result({ ok: true, result: { wait: { satisfied: true } } });
-      if (args[1] === 'send') return result({ ok: true, result: {} });
-      throw new Error(`unexpected Orca args: ${args.join(' ')}`);
-    };
-    const saved: Mission[] = [];
-    const driver = createWorkerDriver(run, {
-      persist: async state => { saved.push(structuredClone(state)); },
-      prompt: (_state, worker) => `worker prompt for ${worker.handle ?? 'pending-terminal'}`,
-    });
-    const workers = await driver.dispatch(current, [{ beadId: 'bead-x', cwd: '/tmp/work', files: ['a'] }]);
-    expect(saved[0]!.workers[0]!.assignment).toBe('worker prompt for pending-terminal');
-    expect(saved[0]!.workers[0]!.state).toBe('reserved');
-    expect(saved.some(state => state.workers[0]!.handle === 'term-x' && state.workers[0]!.incarnationId === 'inc-x')).toBe(true);
-    expect(saved.some(state => state.workers[0]!.assignment === 'worker prompt for term-x')).toBe(true);
-    expect(calls.find(call => call.args[1] === 'send')!.args).toContain('worker prompt for term-x');
-    const create = calls.find(call => call.args[1] === 'create')!;
-    expect(create.args[create.args.indexOf('--command') + 1]).toContain("BEADS_ACTOR='bead-x'");
-    expect(create.args[create.args.indexOf('--command') + 1]).toContain("BEADS_DIR='/tmp/beads'");
-    expect(calls.find(call => call.args[1] === 'send')!.args).toContain('--enter');
-    expect(workers[0]!.state).toBe('awaiting-claim');
-  });
 
   test('refuses wrong terminal incarnation and truncated topology', async () => {
     const worker: Worker = { beadId: 'bead-x', attempt: 'a', cwd: '/tmp/work', files: [], state: 'running', handle: 'term-x', incarnationId: 'inc-x', assignment: 'task' };

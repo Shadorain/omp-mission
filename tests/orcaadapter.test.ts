@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { assertNonOverlapping, createWorkerDriver, validateTerminal } from '../src/workers.ts';
 import type { Bead, Mission, Run, Terminal, Worker } from '../src/types.ts';
 
-// Real envelopes captured from `orca` CLI on this host (runtimeId elided).
+// Orca CLI envelope fixtures; unsupported delivery matches the local host.
 // create:  orca terminal create --worktree path:<wt> --command <sh> --title t --json
 // list:    orca terminal list --json
 // wait:    orca terminal wait --terminal <h> --for tui-idle --timeout-ms N --json
@@ -87,6 +87,32 @@ const SEND_REJECTED = {
   },
   _meta: { runtimeId: 'rt' },
 };
+const SEND_SUBMITTED = {
+  id: 'req-4', ok: true,
+  result: {
+    send: {
+      handle: HANDLE, accepted: true, bytesWritten: 12,
+      prompt: { requestId: 'r', stages: ['input_accepted', 'turn_started'], provider: 'omp', observation: 'observed', processIncarnation: INC, generation: 1, baselineWorkingSequence: 0 },
+    },
+    mutation: { requestId: 'r', replayed: false },
+    warnings: [],
+  },
+  _meta: { runtimeId: 'rt' },
+};
+
+// Real receipt shape from the local host: OMP provider cannot report delivery.
+const SEND_UNSUPPORTED = {
+  id: 'req-4', ok: true,
+  result: {
+    send: {
+      handle: HANDLE, accepted: true, bytesWritten: 12,
+      prompt: { requestId: 'r', stages: ['input_accepted'], provider: 'unsupported', observation: 'unsupported', processIncarnation: INC, generation: 1, baselineWorkingSequence: 0 },
+    },
+    mutation: { requestId: 'r', replayed: false },
+    warnings: ['input accepted but provider cannot report delivery; inspect terminal before retrying'],
+  },
+  _meta: { runtimeId: 'rt' },
+};
 
 const CLOSE_TAB = {
   id: 'req-5', ok: true,
@@ -152,12 +178,11 @@ function subCalls(calls: RecordedCall[], sub: string) {
 }
 
 describe('worker driver against real Orca envelopes', () => {
-  test('parses create envelope, persists handle+incarnation, sends with --enter never --submit', async () => {
+  test('persists reservation and terminal identity without duplicate prompt delivery', async () => {
     const { run, calls } = router({
       create: CREATE_ENVELOPE,
       wait: WAIT_SATISFIED,
       list: listEnvelope([liveTerminal()]),
-      send: SEND_ACCEPTED,
     });
     const persisted: Mission[] = [];
     const driver = createWorkerDriver(run, { persist: async m => { persisted.push(structuredClone(m)); } });
@@ -166,18 +191,13 @@ describe('worker driver against real Orca envelopes', () => {
     expect(workers[0]!.handle).toBe(HANDLE);
     expect(workers[0]!.incarnationId).toBe(INC);
     expect(workers[0]!.state).toBe('awaiting-claim');
-    // handle+incarnation persisted BEFORE send
+    // handle+incarnation persisted
     const preSend = [...persisted].reverse().find(p => p.workers[0]?.handle === HANDLE);
-    expect(preSend).toBeDefined();
-    const sendCall = subCalls(calls, 'send')[0]!;
-    expect(sendCall.args).toContain('--enter');
-    expect(sendCall.args).not.toContain('--submit');
-    expect(sendCall.args).toContain('do the thing');
-    // reservation persisted before create
-    const firstCreate = calls.findIndex(c => c.args[1] === 'create');
+    expect(preSend?.workers[0]?.state).toBe('awaiting-claim');
+    const sendCalls = subCalls(calls, 'send');
+    expect(sendCalls).toHaveLength(0);
     const reservation = persisted[0]!;
     expect(reservation.workers[0]!.state).toBe('reserved');
-    expect(firstCreate).toBeGreaterThanOrEqual(0);
   });
 
   test('reserve persisted before create; failed reservation persist means zero terminals spawned', async () => {
@@ -249,12 +269,11 @@ describe('worker driver against real Orca envelopes', () => {
     expect(subCalls(trunc.calls, 'switch')).toHaveLength(0);
   });
 
-  test('resend only fires for awaiting-claim worker with validated terminal and unclaimed bead', async () => {
-    const { run, calls } = router({ wait: WAIT_SATISFIED, list: listEnvelope([liveTerminal()]), send: SEND_ACCEPTED });
+  test('resend accepts a started turn but refuses claimed, running, or different beads', async () => {
+    const { run, calls } = router({ wait: WAIT_SATISFIED, list: listEnvelope([liveTerminal()]), send: SEND_SUBMITTED });
     const driver = createWorkerDriver(run, { persist: async () => {} });
     const m = mission({ workers: [worker()] });
     await driver.resend(m, 'bead-1', bead('bead-1', 'ready'));
-    expect(subCalls(calls, 'send')).toHaveLength(1);
     // claimed bead refuses
     await expect(driver.resend(m, 'bead-1', bead('bead-1', 'ready', 'other'))).rejects.toThrow(/claimed/);
     // running worker refuses
@@ -263,6 +282,26 @@ describe('worker driver against real Orca envelopes', () => {
     // wrong bead id refuses
     await expect(driver.resend(m, 'bead-1', bead('bead-9', 'ready'))).rejects.toThrow(/exact/);
     expect(subCalls(calls, 'send')).toHaveLength(1);
+  });
+
+  test('input_accepted without turn_started fails explicitly instead of pretending delivery', async () => {
+    const { run, calls } = router({ wait: WAIT_SATISFIED, list: listEnvelope([liveTerminal()]), send: SEND_ACCEPTED });
+    const driver = createWorkerDriver(run, { persist: async () => {} });
+    const m = mission({ workers: [worker()] });
+    await expect(driver.resend(m, 'bead-1', bead('bead-1', 'ready'))).rejects.toThrow(/no turn start|unconfirmed/);
+    expect(subCalls(calls, 'send')).toHaveLength(1);
+  });
+
+  test('unsupported provider resend is an explicit accepted-but-unconfirmed error with no extra send or probe', async () => {
+    const { run, calls } = router({
+      wait: WAIT_SATISFIED,
+      list: listEnvelope([liveTerminal()]),
+      send: SEND_UNSUPPORTED,
+    });
+    const m = mission({ workers: [worker()] });
+    await expect(createWorkerDriver(run, { persist: async () => {} }).resend(m, 'bead-1', bead('bead-1', 'ready'))).rejects.toThrow(/unconfirmed/);
+    expect(subCalls(calls, 'send')).toHaveLength(1);
+    expect(subCalls(calls, 'wait')).toHaveLength(1);
   });
 
   test('reap closes only the exact recorded terminal of the closed bead', async () => {

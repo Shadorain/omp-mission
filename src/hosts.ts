@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Mission, Run, Worker } from "./types.ts";
+import type { Mission, Run, Source, Worker } from "./types.ts";
 
 export interface SpawnedSession { handle: string; incarnationId: string }
 
@@ -54,6 +54,39 @@ export function fillCommand(template: string, vars: Record<string, string>): str
 	});
 }
 
+export async function writePromptFile(worker: Worker): Promise<string> {
+	if (!worker.assignment) throw new Error(`worker prompt missing for ${worker.beadId}`);
+	const name = agentName(worker);
+	const dir = join(tmpdir(), "omp-mission-workers");
+	await mkdir(dir, { recursive: true, mode: 0o700 });
+	const promptFile = join(dir, `${name}.prompt`);
+	await writeFile(promptFile, worker.assignment, { mode: 0o600 });
+	return promptFile;
+}
+
+function renderSource(s: Source): string {
+	const lines = [`${s.id}: ${s.title}`];
+	if (s.url) lines.push(`URL: ${s.url}`);
+	if (s.body) lines.push(`Body:\n${s.body}`);
+	if (s.comments) lines.push(`Comments:\n${s.comments}`);
+	if (s.extra) lines.push(`Extra:\n${s.extra}`);
+	return lines.join("\n\n");
+}
+
+const WORKER_DIR = join(tmpdir(), "omp-mission-workers");
+
+export function sourceFilePath(mission: Pick<Mission, "id">): string {
+	return join(WORKER_DIR, `${mission.id}.source.md`);
+}
+
+// The ticket is identical for every worker of a mission, so it lives in one file
+// they read on demand instead of being pasted into every assignment.
+export async function writeSourceFile(mission: Pick<Mission, "id" | "source">): Promise<string> {
+	await mkdir(WORKER_DIR, { recursive: true, mode: 0o700 });
+	const file = sourceFilePath(mission);
+	await writeFile(file, renderSource(mission.source), { mode: 0o600 });
+	return file;
+}
 export async function spawnHerdr(run: Run, mission: Mission, worker: Worker, agentDir?: string): Promise<SpawnedSession> {
 	const name = agentName(worker);
 	const env = [
@@ -73,14 +106,10 @@ export async function spawnHerdr(run: Run, mission: Mission, worker: Worker, age
 	return { handle: name, incarnationId: ids.tabId };
 }
 
+
 export async function spawnBackground(run: Run, mission: Mission, worker: Worker, agentDir?: string): Promise<SpawnedSession> {
-	if (!worker.assignment) throw new Error(`worker prompt missing for ${worker.beadId}`);
-	const name = agentName(worker);
-	const dir = join(tmpdir(), "omp-mission-workers");
-	await mkdir(dir, { recursive: true, mode: 0o700 });
-	const promptFile = join(dir, `${name}.prompt`);
-	const logFile = join(dir, `${name}.log`);
-	await writeFile(promptFile, worker.assignment, { mode: 0o600 });
+	const promptFile = await writePromptFile(worker);
+	const logFile = join(join(tmpdir(), "omp-mission-workers"), `${agentName(worker)}.log`);
 	const script = [
 		"export OMP_MISSION_WORKER=1",
 		`export BEADS_ACTOR=${shellQuote(worker.beadId)}`,
@@ -94,6 +123,7 @@ export async function spawnBackground(run: Run, mission: Mission, worker: Worker
 	if (!/^\d+$/.test(pid)) throw new Error(`background omp did not print a pid: ${pid || result.stderr}`);
 	return { handle: pid, incarnationId: logFile };
 }
+
 
 export async function spawnCustom(run: Run, mission: Mission, worker: Worker, template: string, launch: string): Promise<SpawnedSession> {
 	const command = fillCommand(template, {
