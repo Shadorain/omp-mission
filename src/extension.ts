@@ -19,6 +19,8 @@ import { createMissionWidget, createMissionInspector } from './ui';
 import { briefView, statusView, type NextView } from './status';
 import { missionArgumentCompletions, type MissionCompletionState } from './completions';
 import { discoverBeadsDir, isolateCheckout } from './isolate';
+import { contextFilesFor } from './context';
+import { SubagentRunner, subagentPrompt } from './subagent';
 import { sourceFilePath, writeSourceFile } from './hosts';
 import { noteSubagentSpawn, noteSubagentToolEnd, noteSubagentToolStart, noteSubagentTurnEnd } from './subagents';
 
@@ -33,7 +35,7 @@ export function nativePlan(ctx: ExtensionContext): boolean {
 export default async function missionExtension(pi: ExtensionAPI) {
  if(process.env.OMP_MISSION_WORKER==='1')return;
  const agentDir=resolveAgentDir();let config:MissionConfig;let configError:string|undefined;
- try{config=await readMissionConfig(agentDir);}catch(error){configError=String(error);config={version:1,controls:false,maxWorkers:2,frontend:'none',graph:'local',modelRole:'default',workerRole:'default',autoDispatch:false,keys:{expand:null,fullscreen:null,mode:null}};}
+ try{config=await readMissionConfig(agentDir);}catch(error){configError=String(error);config={version:1,controls:false,maxWorkers:2,frontend:'none',graph:'local',modelRole:'default',workerRole:'default',workerContext:'project',reviewContext:'project',autoDispatch:false,keys:{expand:null,fullscreen:null,mode:null}};}
  let ctx:ExtensionContext|undefined;let mission:Mission|undefined;let path:string|undefined;let pending:Mission|undefined;
  let snapshot:Snapshot|undefined;let ownership:Ownership|undefined;let resumeHold=true;let ownershipError:string|undefined;
  let generation=0;let refreshing=false;let lastPoll=0;let lastWake='';let autoBlocked='';let quiet=false;let expanded=false;let outlineOffset=0;let selected:string|undefined;let history:Projection['history'];let timer:Timer|undefined;let overlayAbort:AbortController|undefined;let operation=false;let terminalInputDispose:(()=>void)|undefined;let subagents:SubagentRow[]=[];
@@ -65,7 +67,10 @@ export default async function missionExtension(pi: ExtensionAPI) {
  function syncCompletions(){completionState={sources:completionState.sources,beads:(snapshot?.beads??[]).map(bead=>({id:bead.id,title:bead.title,category:bead.category})),workers:(mission?.workers??[]).map(worker=>({beadId:worker.beadId,state:worker.state,handle:!!worker.handle}))};}
  async function refreshCompletionSources(){try{const saved=await listMissions(agentDir);completionState.sources=saved.map(item=>({id:item.mission.source.id,title:item.mission.source.title}));}catch{/* keep the previous source list */}}
  async function persist(value:Mission){if(value!==mission||!path||!ownership)throw new Error('No current controller ownership');await ownership.assertOwned();value.controllerNonce=ownership.nonce;value.updatedAt=new Date().toISOString();await saveMission(path,value);}
- const driver=createWorkerDriver(run,{persist:async value=>{if(value!==mission)throw new Error('Session changed during worker operation');if(ownership&&!resumeHold)await persist(value);},prompt:(mission,worker,task)=>workerPrompt(mission,worker,config.frontend,task),agentDir,model:()=>roleModelString(config.workerRole),frontend:()=>config.frontend,customCommand:()=>config.customCommand});
+ // In-process workers report back here: a clean result already closed the bead; a rejected one waits for the operator.
+ async function settleSubagent(beadId:string,outcome:{ok:true;summary:string}|{ok:false;error:string}){const m=mission;if(!m)return;const w=m.workers.findLast(x=>x.beadId===beadId&&x.state!=='closed');if(!w)return;if(outcome.ok){w.state='closed';w.error=undefined;}else w.error=outcome.error;try{if(ownership&&!resumeHold)await persist(m);}catch{/* ownership lost: the next resume reconciles from bd */}if(!outcome.ok&&ctx)ctx.ui.notify(`Worker ${beadId}: ${outcome.error}`,'warning');await refresh(true);}
+ const workerAgents=new SubagentRunner({run,agentDir,config:()=>config,context:()=>ctx,onSettled:(beadId,outcome)=>{void settleSubagent(beadId,outcome);}});
+ const driver=createWorkerDriver(run,{subagent:workerAgents,persist:async value=>{if(value!==mission)throw new Error('Session changed during worker operation');if(ownership&&!resumeHold)await persist(value);},prompt:(mission,worker,task)=>config.frontend==='subagent'?subagentPrompt(mission,worker,task):workerPrompt(mission,worker,config.frontend,task),agentDir,model:()=>roleModelString(config.workerRole),frontend:()=>config.frontend,customCommand:()=>config.customCommand});
  function policy(context:ExtensionContext){return {resumeHold,owned:!!ownership&&!ownershipError,nativePlan:nativePlan(context),fresh:!!snapshot&&!snapshot.error&&Date.now()-snapshot.fetchedAt<35000,maxWorkers:config.maxWorkers};}
  // A guide is sent once per step: with the wake message, or with the first result that reaches that step.
  let guided='';
@@ -106,7 +111,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
  }
  async function acquire(){if(!mission||!path)throw new Error('No saved mission');if(ownership){await ownership.assertOwned();return;}ownershipError=undefined;ownership=await acquireOwnership(path,mission,error=>{ownershipError=`Controller lost: ${error.message}`;resumeHold=true;lastWake='';void reviewer.dispose();void render();});mission=ownership.mission;mission.controllerNonce=ownership.nonce;}
  async function release(){const current=ownership;ownership=undefined;await current?.release();}
- async function detach(context?:ExtensionContext){generation++;lifetime.abort();lifetime=new AbortController();terminalInputDispose?.();terminalInputDispose=undefined;overlayAbort?.abort();overlayAbort=undefined;if(timer&&ctx)ctx.clearTimer(timer);timer=undefined;await reviewer.dispose();await release();ctx?.ui.setWidget('mission',undefined);ctx=context;mission=undefined;pending=undefined;path=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;lastWake='';guided='';selected=undefined;history=undefined;lastPoll=0;outlineOffset=0;inspectionIntent={};subagents=[];}
+ async function detach(context?:ExtensionContext){generation++;lifetime.abort();lifetime=new AbortController();terminalInputDispose?.();terminalInputDispose=undefined;overlayAbort?.abort();overlayAbort=undefined;if(timer&&ctx)ctx.clearTimer(timer);timer=undefined;await reviewer.dispose();await workerAgents.abortAll();await release();ctx?.ui.setWidget('mission',undefined);ctx=context;mission=undefined;pending=undefined;path=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;lastWake='';guided='';selected=undefined;history=undefined;lastPoll=0;outlineOffset=0;inspectionIntent={};subagents=[];}
  async function attach(file:string,context:ExtensionContext){await release();mission=await loadMission(file);path=file;pending=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;ctx=context;await refresh(false);await render();}
  async function restore(context:ExtensionContext){
   if(!eligible(context))return;
@@ -212,15 +217,15 @@ export default async function missionExtension(pi: ExtensionAPI) {
    context.ui.notify(configNotice(where,true,`graph ${config.graph}${stay}`),'info');
    return;
   }
-  if(key==='modelRole'||key==='workerRole'||key==='autoDispatch'){
+  if(key==='modelRole'||key==='workerRole'||key==='workerContext'||key==='reviewContext'||key==='autoDispatch'){
    const words=rest.split(/\s+/);const flags=['on','off','true','false'];
-   if(words.length!==2||!value||(key==='autoDispatch'&&!flags.includes(value)))throw new Error(key==='autoDispatch'?'Usage: /mission config autoDispatch on|off':`Usage: /mission config ${key} <role>  (default, task, smol, slow, ...)`);
+   if(words.length!==2||!value||(key==='autoDispatch'&&!flags.includes(value)))throw new Error(key==='autoDispatch'?'Usage: /mission config autoDispatch on|off':key==='workerContext'||key==='reviewContext'?`Usage: /mission config ${key} project|all|none`:`Usage: /mission config ${key} <role>  (default, task, smol, slow, ...)`);
    const written=validateMissionConfig({...config,...(key==='autoDispatch'?{autoDispatch:value==='on'||value==='true'}:{[key]:value})});await writeMissionConfig(agentDir,written);config=written;
    if(key==='autoDispatch'){autoBlocked='';await wakeCoordinator();}
    context.ui.notify(configNotice(where,true,key==='autoDispatch'?`autoDispatch ${config.autoDispatch?'on':'off'}`:`${key} ${config[key]}`),'info');
    return;
   }
-  if(key!=='frontend'||!value)throw new Error('Usage: /mission config [frontend none|orca|herdr|custom -- <command>] | [graph local|beads] | [modelRole <role>] | [workerRole <role>] | [autoDispatch on|off]');
+  if(key!=='frontend'||!value)throw new Error('Usage: /mission config [frontend none|orca|herdr|custom|subagent -- <command>] | [graph local|beads] | [modelRole <role>] | [workerRole <role>] | [workerContext project|all|none] | [reviewContext project|all|none] | [autoDispatch on|off]');
   const customCommand = value === 'custom' ? rest.slice(rest.indexOf(value) + value.length).trim().replace(/^--\s*/, '') : undefined;
   if (value === 'custom' && !customCommand) throw new Error('Usage: /mission config frontend custom -- <command>');
   const next = validateMissionConfig({...config, frontend: value, ...(customCommand ? {customCommand} : {})});
@@ -375,7 +380,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
      if(!(action.kind==='review'||action.kind==='hold'&&action.gate?.kind==='review')||!mission.reviewRequested||mission.evidence.verify?.outcome!=='passed'||mission.evidence.deliver?.outcome!=='passed')throw new Error(action.detail);
      const revision=(await captureRevision(mission,run)).revision;if(revision!==mission.evidence.verify.revision)throw new Error('Revision changed since verification');
      enforceGate(mission,revisionGate(mission,'review',revision));mission.phase='review';mission.evidence.review={outcome:'active',detail:'Independent reviewer running',revision,at:new Date().toISOString()};await persist(mission);reviewStarted=true;
-     const result=await reviewer.run(mission,context,run,config.modelRole);if(epoch!==generation)throw new Error('Session changed during review');
+     const result=await reviewer.run(mission,context,run,config.modelRole,await contextFilesFor(config.reviewContext,mission.workspace.cwd,agentDir));if(epoch!==generation)throw new Error('Session changed during review');
      consumeGate(mission);
      mission.reviews.push(result);
      mission.evidence.review = {outcome:'passed',detail:result.summary,revision:result.revision,at:result.at};

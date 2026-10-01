@@ -2,7 +2,17 @@ import type { Bead, Frontend, Mission, Run, Terminal, Worker } from './types.ts'
 import { spawnBackground, spawnCustom, spawnHerdr, writePromptFile, writeSourceFile } from './hosts.ts';
 
 export interface WorkerAssignment { beadId: string; cwd: string; files: string[]; assignment?: string; task?: string }
-export interface WorkerHooks { persist(mission: Mission): Promise<void>; prompt?(mission: Mission, worker: Worker, task?: string): string; agentDir?: string; model?: () => string | undefined; frontend?: Frontend | (() => Frontend); customCommand?: string | (() => string | undefined) }
+/** In-process subagent runner, as the driver sees it. */
+export interface SubagentPort {
+  launch(mission: Mission, worker: Worker): Promise<{ handle: string; incarnationId: string }>;
+  isLive(beadId: string): boolean;
+  steer(beadId: string, text: string): Promise<void>;
+  /** Reopen a lost session from its transcript. False: nothing to reopen. */
+  resume(mission: Mission, worker: Worker, note?: string): Promise<boolean>;
+  release(mission: Mission, worker: Worker): Promise<void>;
+  abort(beadId: string): Promise<void>;
+}
+export interface WorkerHooks { persist(mission: Mission): Promise<void>; subagent?: SubagentPort; prompt?(mission: Mission, worker: Worker, task?: string): string; agentDir?: string; model?: () => string | undefined; frontend?: Frontend | (() => Frontend); customCommand?: string | (() => string | undefined) }
 export interface WorkerDriver {
   dispatch(mission: Mission, assignments: WorkerAssignment[] | string[]): Promise<Worker[]>;
   reconcile(mission: Mission, beadStates: Map<string, Bead>): Promise<Worker[]>;
@@ -108,6 +118,7 @@ export function createWorkerDriver(run: Run, hooks: WorkerHooks): WorkerDriver {
   async function sessionAlive(worker: Worker): Promise<boolean> {
     const kind = hostOf(worker);
     if (kind === 'herdr') return (await run('herdr', ['agent', 'get', worker.handle!], worker.cwd)).code === 0;
+    if (kind === 'subagent') return hooks.subagent?.isLive(worker.beadId) ?? false;
     if (kind === 'none' || (kind === 'custom' && /^\d+$/.test(worker.handle ?? ''))) return (await run('kill', ['-0', worker.handle!], worker.cwd)).code === 0;
     return false;
   }
@@ -143,6 +154,12 @@ export function createWorkerDriver(run: Run, hooks: WorkerHooks): WorkerDriver {
 
   async function send(worker: Worker, mission: Mission, again = false): Promise<void> {
     const kind = hostOf(worker);
+    if (kind === 'subagent') {
+      if (!again) return;
+      if (!hooks.subagent) throw new Error('subagent runner unavailable');
+      await hooks.subagent.steer(worker.beadId, `Your full assignment for bead ${worker.beadId} is unchanged. Continue it and finish by calling yield.`);
+      return;
+    }
     if (kind === 'none') {
       if (again) throw new Error('background omp already received its assignment; there is no terminal to resend');
       return;
@@ -186,6 +203,16 @@ export function createWorkerDriver(run: Run, hooks: WorkerHooks): WorkerDriver {
     if (!worker.assignment) worker.assignment = hooks.prompt?.(mission, worker) ?? '';
     if (!worker.assignment) throw new Error(`worker prompt missing for ${worker.beadId}`);
     await writeSourceFile(mission);
+    if (kind === 'subagent') {
+      if (!hooks.subagent) throw new Error('subagent runner unavailable');
+      const identity = await hooks.subagent.launch(mission, worker);
+      worker.handle = identity.handle;
+      worker.incarnationId = identity.incarnationId;
+      worker.state = 'awaiting-claim';
+      worker.launchedAt = new Date().toISOString();
+      await persist(mission);
+      return;
+    }
     if (kind !== 'orca') {
       if (kind === 'custom' && !customCommand()) throw new Error('customCommand is required when frontend is custom');
       const spawned = kind === 'herdr'
@@ -264,6 +291,12 @@ export function createWorkerDriver(run: Run, hooks: WorkerHooks): WorkerDriver {
         }
         if (hostOf(worker) !== 'orca') {
           if (!(await sessionAlive(worker))) {
+            // A restart killed the in-process session while it held the claim: reopen its transcript,
+            // or give the bead back. A worker that failed on its own (error set) waits for the operator.
+            if (hostOf(worker) === 'subagent' && hooks.subagent && !worker.error && bead.category === 'active' && bead.claimActor === worker.beadId) {
+              if (await hooks.subagent.resume(mission, worker)) { worker.state = 'running'; changed.push(worker); continue; }
+              await hooks.subagent.release(mission, worker).catch(() => {});
+            }
             worker.state = 'missing';
             worker.error = 'recorded worker session is absent or has changed identity';
             changed.push(worker);
@@ -307,6 +340,7 @@ export function createWorkerDriver(run: Run, hooks: WorkerHooks): WorkerDriver {
         if (result.code !== 0) throw new Error(result.stderr.trim() || 'herdr agent focus failed');
         return;
       }
+      if (kind === 'subagent') throw new Error(`subagent workers have no tab: press Alt+A (Agent Hub) and select ${worker.beadId}`);
       if (kind !== 'orca') throw new Error(`${kind} frontend has no tab to focus`);
       const result = decode(await run('orca', ['terminal', 'list', '--json'], worker.cwd));
       if (result.truncated === true) throw new Error('Orca terminal topology truncated; focus held');
@@ -320,9 +354,11 @@ export function createWorkerDriver(run: Run, hooks: WorkerHooks): WorkerDriver {
       if (bead.id !== beadId || bead.category !== 'closed') throw new Error('only the exact closed mission bead may be reaped');
       const worker = mission.workers.findLast(item => item.beadId === beadId);
       if (!worker?.handle || !worker.incarnationId) throw new Error('no recorded worker terminal to reap');
-      await requireLive(worker, mission);
       const kind = hostOf(worker);
-      if (kind === 'herdr') {
+      if (kind !== 'subagent') await requireLive(worker, mission);
+      if (kind === 'subagent') {
+        await hooks.subagent?.abort(worker.beadId);
+      } else if (kind === 'herdr') {
         const result = await run('herdr', ['tab', 'close', worker.incarnationId], mission.workspace.cwd);
         if (result.code !== 0) throw new Error(result.stderr.trim() || 'herdr tab close failed');
       } else if (kind === 'none' || (kind === 'custom' && /^\d+$/.test(worker.handle))) {
@@ -345,8 +381,22 @@ export function createWorkerDriver(run: Run, hooks: WorkerHooks): WorkerDriver {
       await persist(mission);
     },
     async resend(mission, beadId, bead) {
+      const latest = mission.workers.findLast(item => item.beadId === beadId);
+      if (latest && hostOf(latest) === 'subagent' && latest.state !== 'closed') {
+        // The bead is in_progress under the worker's own claim, so the ready-bead rule below does not apply.
+        if (bead.id !== beadId || bead.category !== 'active' || bead.claimActor !== beadId) throw new Error('resend requires the worker\'s own active bead');
+        if (!hooks.subagent) throw new Error('subagent runner unavailable');
+        if (hooks.subagent.isLive(beadId)) { await send(latest, mission, true); return; }
+        // Not running: either a failed result waiting for the operator, or a session lost to a restart.
+        const note = latest.error ? `Your last result was rejected: ${latest.error}. Fix that and finish by calling yield again.` : undefined;
+        if (!(await hooks.subagent.resume(mission, latest, note))) throw new Error(`no saved session to resume for ${beadId}; release the claim with bd unclaim and dispatch again`);
+        latest.error = undefined;
+        latest.state = 'running';
+        await persist(mission);
+        return;
+      }
       if (bead.id !== beadId || bead.category !== 'ready') throw new Error('resend requires the exact currently ready mission bead');
-      const worker = mission.workers.findLast(item => item.beadId === beadId);
+      const worker = latest;
       if (!worker || worker.state !== 'awaiting-claim' || !worker.handle || !worker.incarnationId) throw new Error('no awaiting-claim worker to resend');
       if (bead.claimActor) throw new Error(`bead already claimed by ${bead.claimActor}; refusing duplicate assignment`);
       await requireLive(worker, mission);

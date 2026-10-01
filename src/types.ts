@@ -16,10 +16,11 @@ export interface Snapshot { beads: Bead[]; leaves: Bead[]; ready: string[]; clos
 export interface Terminal { handle: string; incarnationId: string; worktreePath: string; writable: boolean; connected: boolean; [key: string]: unknown }
 export interface CommandResult { stdout: string; stderr: string; code: number }
 export type Run = (command: string, args: string[], cwd: string, env?: Record<string,string>) => Promise<CommandResult>;
-export type Frontend = 'none' | 'orca' | 'herdr' | 'custom';
+export type Frontend = 'none' | 'orca' | 'herdr' | 'custom' | 'subagent';
+export type ContextMode = 'project' | 'all' | 'none';
 export type Graph = 'local' | 'beads';
 export interface SubagentRow { id: string; name: string; kind: 'task' | 'eval'; state: 'running' | 'closed' | 'error' }
-export interface MissionConfig { version: 1; controls: boolean; maxWorkers: number; frontend: Frontend; graph: Graph; modelRole: string; workerRole: string; autoDispatch: boolean; customCommand?: string; keys: { expand: string | null; fullscreen: string | null; mode: string | null } }
+export interface MissionConfig { version: 1; controls: boolean; maxWorkers: number; frontend: Frontend; graph: Graph; modelRole: string; workerRole: string; workerContext: ContextMode; reviewContext: ContextMode; autoDispatch: boolean; customCommand?: string; keys: { expand: string | null; fullscreen: string | null; mode: string | null } }
 export interface Projection { mission: Mission; snapshot?: Snapshot; resumeHold: boolean; ownershipError?: string; selected?: string; history?: AuditEvent[]; expanded?: boolean; outlineOffset?: number; nativePlan?: boolean; nextAction?: string; frontend?: Frontend; expandKey?: string | null; subagents?: SubagentRow[] }
 export interface PolicyContext { resumeHold: boolean; owned: boolean; nativePlan: boolean; fresh: boolean; maxWorkers: number }
 export interface Action { kind: 'hold' | 'isolate' | 'graph' | 'dispatch' | 'resend' | 'verify' | 'deliver' | 'review' | 'repairs' | 'complete'; detail: string; ids?: string[]; gate?: Gate }
