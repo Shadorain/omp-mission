@@ -49,7 +49,8 @@ The compact row shows the ticket, phase, mode, and actionable status. Session na
 /mission config graph beads
 /mission config frontend orca
 /mission config frontend custom -- omp --print
-/mission config modelRole smol
+/mission config modelRole slow
+/mission config workerRole task
 /mission config autoDispatch on
 ```
 
@@ -58,7 +59,8 @@ The compact row shows the ticket, phase, mode, and actionable status. Session na
 | `graph` | `local` | `local` works in this pane. `beads` is the durable worker graph. A running mission keeps the graph it started with. |
 | `frontend` | `none` | `none`, `orca`, `herdr`, or `custom`. |
 | `maxWorkers` | `2` | Integer from 1 through 8. |
-| `modelRole` | `smol` | OMP model role for the independent review session, e.g. `smol`, `slow`, or `default` (the coordinator's own model). A role that does not name one available `provider/id` model falls back to the coordinator's model; the model used is recorded on each review round. |
+| `modelRole` | `default` | OMP model role for the independent review session: `default` (the coordinator's own model), `slow`, `smol`, or any role in `modelRoles`. `@default` and `default` are the same. A role that does not name one available `provider/id` model falls back to the coordinator's model; the model used is recorded on each review round. |
+| `workerRole` | `task` | Model role for bead workers, passed as `--model` for every frontend. A role with no configured model, or `default`, leaves workers on the default model. |
 | `autoDispatch` | `false` | When on, ready waves in Auto and Force modes start without a model turn or per-wave tool approval. Pause mode, resume hold, plan mode, and lost ownership still stop it, and a failed attempt is handed to the coordinator. |
 | `controls` | `false` | Inspector action button. `/mission actions` and other commands remain available either way. |
 | `keys` | `ctrl+shift+m`, `ctrl+shift+f`, `ctrl+shift+o` | `expand`, `fullscreen`, `mode`. `null` turns one off. |

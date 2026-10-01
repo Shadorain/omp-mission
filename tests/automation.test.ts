@@ -51,3 +51,16 @@ test('workers launch on the worker role model, and inherit the default model whe
     expect(commands[0]).toContain(`omp${expected}`);
   }
 });
+
+test('herdr workers receive the worker role model as an agent argument', async () => {
+  const calls: string[][] = [];
+  const run = async (command: string, args: string[]) => {
+    if (command === 'herdr') calls.push(args);
+    const stdout = args[0] === 'tab' ? JSON.stringify({ result: { tab: { tab_id: 't1' }, root_pane: { pane_id: 'p1' } } }) : '';
+    return { code: 0, stderr: '', stdout };
+  };
+  const driver = createWorkerDriver(run, { persist: async () => {}, prompt: () => 'do it', model: () => 'devin/swe-2:high', frontend: 'herdr' });
+  await driver.dispatch(mission({ graph: 'beads' }), [{ beadId: 'b', cwd: '/tmp', files: ['a.ts'] }]);
+  const start = calls.find(args => args[0] === 'agent' && args[1] === 'start')!;
+  expect(start.slice(-3)).toEqual(['--', '--model', 'devin/swe-2:high']);
+});

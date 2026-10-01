@@ -189,7 +189,7 @@ export function createWorkerDriver(run: Run, hooks: WorkerHooks): WorkerDriver {
     if (kind !== 'orca') {
       if (kind === 'custom' && !customCommand()) throw new Error('customCommand is required when frontend is custom');
       const spawned = kind === 'herdr'
-        ? await spawnHerdr(run, mission, worker, hooks.agentDir)
+        ? await spawnHerdr(run, mission, worker, hooks.agentDir, hooks.model?.())
         : kind === 'none'
           ? await spawnBackground(run, mission, worker, hooks.agentDir, hooks.model?.())
           : await spawnCustom(run, mission, worker, customCommand()!, launchCommand(mission, worker));

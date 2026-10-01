@@ -87,7 +87,8 @@ export async function writeSourceFile(mission: Pick<Mission, "id" | "source">): 
 	await writeFile(file, renderSource(mission.source), { mode: 0o600 });
 	return file;
 }
-export async function spawnHerdr(run: Run, mission: Mission, worker: Worker, agentDir?: string): Promise<SpawnedSession> {
+
+export async function spawnHerdr(run: Run, mission: Mission, worker: Worker, agentDir?: string, model?: string): Promise<SpawnedSession> {
 	const name = agentName(worker);
 	const env = [
 		"--env", "OMP_MISSION_WORKER=1",
@@ -98,7 +99,7 @@ export async function spawnHerdr(run: Run, mission: Mission, worker: Worker, age
 	const created = await run("herdr", ["tab", "create", "--cwd", worker.cwd, "--label", name, "--no-focus", ...env], worker.cwd);
 	fail(created, "herdr tab create");
 	const ids = parseHerdrIds(created.stdout);
-	const started = await run("herdr", ["agent", "start", name, "--kind", "omp", "--pane", ids.paneId, "--timeout", "30000"], worker.cwd);
+	const started = await run("herdr", ["agent", "start", name, "--kind", "omp", "--pane", ids.paneId, "--timeout", "30000", ...(model ? ["--", "--model", model] : [])], worker.cwd);
 	if (started.code !== 0) {
 		await run("herdr", ["tab", "close", ids.tabId], worker.cwd);
 		fail(started, "herdr agent start");

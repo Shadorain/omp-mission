@@ -8,6 +8,10 @@ Beads graphs run each leaf in its own worker session. The frontend setting picks
 - The worker prompt stays short. The ticket is written once per mission to `<tmp>/omp-mission-workers/<mission-id>.source.md` and the prompt points at it; the worker reads it only when its bead lacks context. The bead itself (`bd show`) carries the task.
 - Orca injects `ORCA_TERMINAL_HANDLE` into the terminal; the close instruction uses it, so the prompt needs no handle at generation time.
 
+## Model
+
+Workers start on the `workerRole` model (default `task`) via `--model`. The role resolves when the worker launches, so a config change applies to the next worker, not running ones. `default` or an unconfigured role means no flag.
+
 ## Identity
 
 A worker is recorded with its terminal handle and incarnation id. Every focus, resend, and reap re-validates both against the live terminal list and the worktree path. A mismatch means missing, never a guess.
