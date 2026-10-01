@@ -42,6 +42,7 @@ const FRONTENDS = [
 	{ name: "orca", description: "Orca tab" },
 	{ name: "herdr", description: "Herdr tab and agent" },
 	{ name: "custom", description: "User command template" },
+	{ name: "subagent", description: "In-process OMP subagents (Agent Hub)" },
 ];
 
 const GRAPHS = [
@@ -99,10 +100,12 @@ function completeVerb(verb: string, rest: string[], partial: string, state: Miss
 	if (verb === "config") {
 		if (rest.length === 0) {
 			const keys = [
-				{ name: "frontend", description: "Session host: none, orca, herdr, custom" },
+				{ name: "frontend", description: "Session host: none, orca, herdr, custom, subagent" },
 				{ name: "graph", description: "Work graph: local or beads" },
 				{ name: "modelRole", description: "Model role for independent review" },
 				{ name: "workerRole", description: "Model role for bead workers" },
+				{ name: "workerContext", description: "Context files for subagent workers" },
+				{ name: "reviewContext", description: "Context files for review sessions" },
 				{ name: "autoDispatch", description: "Start ready waves without a model turn" },
 			].filter((key) => matches(key.name, partial));
 			return keys.length ? keys.map((key) => item(verb, key.name, key.description)) : null;
@@ -123,6 +126,15 @@ function completeVerb(verb: string, rest: string[], partial: string, state: Miss
 				{ name: "slow", description: "Strongest configured model" },
 			];
 			const items = roles.filter(role => matches(role.name, partial)).map(role => item(stem, role.name, role.description));
+			return items.length ? items : null;
+		}
+		if (rest.length === 1 && (rest[0] === "workerContext" || rest[0] === "reviewContext")) {
+			const modes = [
+				{ name: "project", description: "Only the checkout's AGENTS.md (default)" },
+				{ name: "all", description: "Everything OMP discovers" },
+				{ name: "none", description: "No context files" },
+			];
+			const items = modes.filter(mode => matches(mode.name, partial)).map(mode => item(stem, mode.name, mode.description));
 			return items.length ? items : null;
 		}
 		if (rest.length === 1 && rest[0] === "autoDispatch") {

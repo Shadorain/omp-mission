@@ -21,13 +21,15 @@ test('auto-dispatch runs only for an unpaused, owned, unheld mission with the fl
 });
 
 test('role config defaults to the coordinator for review and task for workers, and accepts @role', () => {
-  expect(DEFAULT_MISSION_CONFIG).toMatchObject({ modelRole: 'default', workerRole: 'task', autoDispatch: false });
+  expect(DEFAULT_MISSION_CONFIG).toMatchObject({ modelRole: 'default', workerRole: 'task', workerContext: 'project', reviewContext: 'project', autoDispatch: false });
   expect(validateMissionConfig({ version: 1 })).toMatchObject({ modelRole: 'default', workerRole: 'task', autoDispatch: false });
   expect(validateMissionConfig({ version: 1, modelRole: 'slow', workerRole: 'smol', autoDispatch: true })).toMatchObject({ modelRole: 'slow', workerRole: 'smol', autoDispatch: true });
   expect(validateMissionConfig({ version: 1, modelRole: '@default', workerRole: '@task' })).toMatchObject({ modelRole: 'default', workerRole: 'task' });
   expect(() => validateMissionConfig({ version: 1, modelRole: 'bad role!' })).toThrow(/modelRole/);
   expect(() => validateMissionConfig({ version: 1, workerRole: '' })).toThrow(/workerRole/);
   expect(() => validateMissionConfig({ version: 1, autoDispatch: 'yes' })).toThrow(/autoDispatch/);
+  expect(validateMissionConfig({ version: 1, frontend: 'subagent', workerContext: 'none', reviewContext: 'all' })).toMatchObject({ frontend: 'subagent', workerContext: 'none', reviewContext: 'all' });
+  expect(() => validateMissionConfig({ version: 1, workerContext: 'some' })).toThrow(/workerContext/);
 });
 
 test('role models resolve only to a plain available model, else the caller keeps the coordinator model', () => {

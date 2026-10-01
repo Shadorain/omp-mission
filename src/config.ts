@@ -12,11 +12,13 @@ export const DEFAULT_MISSION_CONFIG: MissionConfig = {
   graph: "local",
   modelRole: "default",
   workerRole: "task",
+  workerContext: "project",
+  reviewContext: "project",
   autoDispatch: false,
   keys: { expand: "ctrl+shift+m", fullscreen: "ctrl+shift+f", mode: "ctrl+shift+o" },
 };
 
-const FRONTENDS = new Set<Frontend>(["none", "orca", "herdr", "custom"]);
+const FRONTENDS = new Set<Frontend>(["none", "orca", "herdr", "custom", "subagent"]);
 const GRAPHS = new Set<Graph>(["local", "beads"]);
 function isFrontend(v: unknown): v is Frontend {
 	return typeof v === "string" && FRONTENDS.has(v as Frontend);
@@ -59,7 +61,7 @@ export function validateMissionConfig(value: unknown, path = "mission.json"): Mi
   const enabled = Object.values(normalized).filter((key): key is string => key !== null);
   if (new Set(enabled).size !== enabled.length) return fail("enabled shortcut chords must be distinct");
   const frontend = value.frontend === undefined ? "none" : value.frontend;
-  if (typeof frontend !== "string" || !isFrontend(frontend)) return fail("frontend must be none, orca, herdr, or custom");
+  if (typeof frontend !== "string" || !isFrontend(frontend)) return fail("frontend must be none, orca, herdr, custom, or subagent");
   const graph = value.graph === undefined ? "local" : value.graph;
   if (typeof graph !== "string" || !isGraph(graph)) return fail("graph must be local or beads");
   const customCommand = typeof value.customCommand === "string" ? value.customCommand.trim() : undefined;
@@ -74,8 +76,14 @@ export function validateMissionConfig(value: unknown, path = "mission.json"): Mi
     if (typeof role !== "string" || !/^[A-Za-z][A-Za-z0-9_.-]{0,40}$/.test(role)) return fail(`${name} must be a model role name such as default, task, smol, or slow`);
     roles[name] = role;
   }
+  const contexts = { workerContext: DEFAULT_MISSION_CONFIG.workerContext, reviewContext: DEFAULT_MISSION_CONFIG.reviewContext };
+  for (const name of ["workerContext", "reviewContext"] as const) {
+    const raw = value[name] === undefined ? contexts[name] : value[name];
+    if (raw !== "project" && raw !== "all" && raw !== "none") return fail(`${name} must be project, all, or none`);
+    contexts[name] = raw;
+  }
   if (value.autoDispatch !== undefined && typeof value.autoDispatch !== "boolean") return fail("autoDispatch must be boolean");
-  return { version: 1, controls: value.controls ?? false, maxWorkers, frontend, graph, modelRole: roles.modelRole, workerRole: roles.workerRole, autoDispatch: value.autoDispatch ?? false, ...(customCommand ? { customCommand } : {}), keys: normalized };
+  return { version: 1, controls: value.controls ?? false, maxWorkers, frontend, graph, modelRole: roles.modelRole, workerRole: roles.workerRole, ...contexts, autoDispatch: value.autoDispatch ?? false, ...(customCommand ? { customCommand } : {}), keys: normalized };
 }
 
 export async function readMissionConfig(agentDir: string): Promise<MissionConfig> {
@@ -120,6 +128,8 @@ export function formatMissionConfig(config: MissionConfig, path: string, mission
 		`  frontend: ${config.frontend}`,
 		`  modelRole: ${config.modelRole}`,
 		`  workerRole: ${config.workerRole}`,
+		`  workerContext: ${config.workerContext}`,
+		`  reviewContext: ${config.reviewContext}`,
 		`  autoDispatch: ${config.autoDispatch}`,
 	];
 	let g = `  graph: ${config.graph}`;

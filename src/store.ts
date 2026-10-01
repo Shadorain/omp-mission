@@ -12,7 +12,7 @@ const EVIDENCE_OUTCOMES = ["pending", "active", "passed", "failed", "skipped"] a
 
 function invalid(message: string): never { throw new Error(`Invalid mission state: ${message}`); }
 function workerFrontend(value: unknown, index: number): Frontend {
-  if (value === "none" || value === "orca" || value === "herdr" || value === "custom") return value;
+  if (value === "none" || value === "orca" || value === "herdr" || value === "custom" || value === "subagent") return value;
   invalid(`workers[${index}].frontend is unsupported`);
 }
 function object(value: unknown, label: string): Record<string, unknown> {
