@@ -28,6 +28,20 @@ Records are append-only per bead. A replaced worker is marked `closed` with `rep
 
 `resend` types one short line pointing at the prompt file. Orca's prompt receipt is the only delivery evidence: `turn_started` is success. `input_accepted` alone, or an `unsupported` provider, is reported as unconfirmed and is NEVER retried blindly. A stranded draft is submitted with a bare Enter send, no text.
 
+## Subagent frontend
+
+Code: `src/subagent.ts` (`SubagentRunner`), driven by the worker driver through `SubagentPort`. No terminal exists; the worker `handle` is the bead id and `incarnationId` is the persisted session file.
+
+- **Claim.** The runner claims with `BEADS_ACTOR=<bead id> bd update --claim` before creating the session; a failed claim starts nothing, a failed session start releases the claim (`bd unclaim --if-assignee`).
+- **Tools.** `read edit write bash grep glob find` plus `yield` with schema `{done, summary, verification?}`. `restrictToolNames`, no extensions, MCP, skills, rules, or slash commands. `tools.approvalMode` is `yolo`; the scope check below is the guard.
+- **Scope check.** `git status` plus `git hash-object` before launch (saved beside the session) and after the yield. Files whose content differs are the worker's changes; each must fall inside its own `files` or those of beads that were live at any point during its run. Violations leave the bead open.
+- **Close.** On a clean, in-scope `done:true`, the runner runs `bd close` with summary and verification. The worker never runs `bd`.
+- **Chasing.** A session that stops without yielding gets up to two reminders, then is reported failed.
+- **Restart.** `refresh` finds a subagent worker whose session is gone but whose bead is still claimed by that worker. `SessionManager.open` reopens the transcript with the saved baseline; with no transcript the claim is released and the worker goes `missing`, so `recover` re-dispatches. A worker that failed on its own keeps its error and waits for the operator.
+- **Resend.** Live: `session.steer` with a one-line continue. Not live: reopen the saved session with the last rejection as the prompt.
+- **Focus / reap.** No tab. `focus` points at the Agent Hub; `reap` aborts a live session.
+- **Context.** `workerContext` picks the context files (`src/context.ts`); the bead title, description, and acceptance are inlined into the assignment.
+
 ## Cleanup
 
 Close only the exact recorded terminal. NEVER close all terminals or the coordinator's own tab. `--keep` leaves worker tabs up.

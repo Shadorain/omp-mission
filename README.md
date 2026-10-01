@@ -57,7 +57,9 @@ The compact row shows the ticket, phase, mode, and actionable status. Session na
 | Key | Default | |
 | --- | --- | --- |
 | `graph` | `local` | `local` works in this pane. `beads` is the durable worker graph. A running mission keeps the graph it started with. |
-| `frontend` | `none` | `none`, `orca`, `herdr`, or `custom`. |
+| `frontend` | `none` | `none`, `orca`, `herdr`, `custom`, or `subagent`. |
+| `workerContext` | `project` | Context files a `subagent` worker loads: `project` (your `<agentDir>/AGENTS.md` plus the checkout's `AGENTS.md`, else `CLAUDE.md`), `all` (everything OMP discovers), or `none`. Context files ride in every request, so this is the largest fixed cost of a worker. |
+| `reviewContext` | `project` | The same choice for review sessions. |
 | `maxWorkers` | `2` | Integer from 1 through 8. |
 | `modelRole` | `default` | OMP model role for the independent review session: `default` (the coordinator's own model), `slow`, `smol`, or any role in `modelRoles`. `@default` and `default` are the same. A role that does not name one available `provider/id` model falls back to the coordinator's model; the model used is recorded on each review round. |
 | `workerRole` | `task` | Model role for bead workers, passed as `--model` for every frontend. A role with no configured model, or `default`, leaves workers on the default model. |
@@ -76,6 +78,16 @@ Workers receive the full multiline assignment through OMP's startup `@file` argu
 Restart or resume OMP after updating extension code. `/reload-plugins` does not reload extension factories.
 
 A worker never stalls a mission silently. If its terminal disappears while the bead is unclaimed, the dead record is replaced automatically and the next action becomes `dispatch`. A live worker that has not claimed its bead within 3 minutes surfaces as `resend`, answered by one `resend` after inspecting the tab. A resume hold blocks both until `/mission continue`. Auto missions stop at delivery unless review was requested; run `/mission review` to continue into the independent review.
+
+## Subagent workers
+
+`/mission config frontend subagent` runs each bead in an in-process OMP session instead of a separate terminal or `omp -p` process. Beads graphs only. The session has file, shell, and search tools plus `yield`, no extensions, MCP, skills, or rules, and approvals are off (`yolo`). Sessions appear in the Agent Hub (`Alt+A`) as `<bead-id>`.
+
+The extension, not the worker, owns `bd`. It claims the bead as the bead's own actor before the session starts. The worker yields `{done, summary, verification}`. The extension then compares the checkout against a baseline taken at launch: any file changed outside the bead's allowed paths (or the paths of beads that ran at the same time) leaves the bead open and names the files. A clean result closes the bead with the summary and verification as the close reason. `done: false`, a missing yield, or a failed `bd close` is reported and leaves the bead claimed; `/mission resend <bead-id>` resumes the saved session with the rejection as feedback.
+
+Sessions are saved under `missions/<workspace>/workers/`. After an OMP restart, a worker whose claim is still held resumes from its transcript; if the transcript is gone the claim is released and the bead is dispatched again. Closing OMP aborts live sessions and keeps their claims.
+
+With this frontend, review runs one reviewer per bead on that bead's scoped diff, in parallel, plus one integration pass for cross-bead defects on the first round. Findings carry their `beadId`. Later rounds re-review only beads whose owned files changed.
 
 ## Checkout and bead database
 

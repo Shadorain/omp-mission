@@ -8,10 +8,11 @@
 |`src/controller.ts`|Pure policy: `nextAction`, gates, mode, mutation enforcement. No I/O.|
 |`src/store.ts`|Mission persistence, validation, controller ownership lock.|
 |`src/workers.ts`, `src/hosts.ts`|Worker driver and per-frontend spawn/send/focus/reap. See @docs/workers.md.|
+|`src/subagent.ts`, `src/scope.ts`, `src/context.ts`|In-process worker sessions for `frontend: subagent`, allowed-path matching, context file selection. See @docs/workers.md.|
 |`src/isolate.ts`|Checkout reuse or worktree creation, bead database discovery. Used by `bind_workspace` when arguments are omitted.|
 |`src/beads.ts`|Reads the bead graph and history through `bd`.|
 |`src/sources.ts`|Parses `/mission` input, fetches ticket source, inspects the workspace.|
-|`src/review.ts`|Revision fingerprint and the independent reviewer session.|
+|`src/review.ts`|Revision fingerprint and the independent reviewer session. `runPerBead` runs one reviewer per bead in parallel plus an integration pass, and re-reviews only beads whose owned files changed.|
 |`src/prompts.ts`|Coordinator and worker prompts, plus per-step guides.|
 |`src/status.ts`|Model-facing views of mission and graph state.|
 |`src/ui.ts`, `src/completions.ts`, `src/config.ts`|Widget and inspector, argument completion, `mission.json`.|
