@@ -293,7 +293,8 @@ export function createWorkerDriver(run: Run, hooks: WorkerHooks): WorkerDriver {
           if (!(await sessionAlive(worker))) {
             // A restart killed the in-process session while it held the claim: reopen its transcript,
             // or give the bead back. A worker that failed on its own (error set) waits for the operator.
-            if (hostOf(worker) === 'subagent' && hooks.subagent && !worker.error && bead.category === 'active' && bead.claimActor === worker.beadId) {
+            if (hostOf(worker) === 'subagent' && hooks.subagent && bead.category === 'active' && bead.claimActor === worker.beadId) {
+              if (worker.error) continue; // rejected result: keep the reason for resend
               if (await hooks.subagent.resume(mission, worker)) { worker.state = 'running'; changed.push(worker); continue; }
               await hooks.subagent.release(mission, worker).catch(() => {});
             }
