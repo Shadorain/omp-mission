@@ -107,7 +107,7 @@ export async function spawnHerdr(run: Run, mission: Mission, worker: Worker, age
 }
 
 
-export async function spawnBackground(run: Run, mission: Mission, worker: Worker, agentDir?: string): Promise<SpawnedSession> {
+export async function spawnBackground(run: Run, mission: Mission, worker: Worker, agentDir?: string, model?: string): Promise<SpawnedSession> {
 	const promptFile = await writePromptFile(worker);
 	const logFile = join(join(tmpdir(), "omp-mission-workers"), `${agentName(worker)}.log`);
 	const script = [
@@ -115,7 +115,7 @@ export async function spawnBackground(run: Run, mission: Mission, worker: Worker
 		`export BEADS_ACTOR=${shellQuote(worker.beadId)}`,
 		...(mission.workspace.beadsDir ? [`export BEADS_DIR=${shellQuote(mission.workspace.beadsDir)}`] : []),
 		...(agentDir ? [`export PI_CODING_AGENT_DIR=${shellQuote(agentDir)}`] : []),
-		`omp -p "$(cat ${shellQuote(promptFile)})" >${shellQuote(logFile)} 2>&1 & echo $!`,
+		`omp${model ? ` --model ${shellQuote(model)}` : ""} -p "$(cat ${shellQuote(promptFile)})" >${shellQuote(logFile)} 2>&1 & echo $!`,
 	].join("; ");
 	const result = await run("bash", ["-c", script], worker.cwd);
 	fail(result, "background omp");

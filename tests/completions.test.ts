@@ -34,8 +34,9 @@ test("mode, config, and bead arguments complete", () => {
 	expect(labels("mode ")).toEqual(["auto", "pause", "force"]);
 	expect(labels("mode p")).toEqual(["pause"]);
 	expect(labels("mode auto ")).toEqual([]);
-	expect(labels("config ")).toEqual(["frontend", "graph", "modelRole", "autoDispatch"]);
-	expect(labels("config modelRole ")).toEqual(["smol", "default", "slow"]);
+	expect(labels("config ")).toEqual(["frontend", "graph", "modelRole", "workerRole", "autoDispatch"]);
+	expect(labels("config modelRole ")).toEqual(["default", "task", "smol", "slow"]);
+	expect(labels("config workerRole t")).toEqual(["task"]);
 	expect(labels("config autoDispatch o")).toEqual(["on", "off"]);
 	expect(labels("config frontend ")).toEqual(["none", "orca", "herdr", "custom"]);
 	expect(labels("config graph ")).toEqual(["local", "beads"]);

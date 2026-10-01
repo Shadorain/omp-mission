@@ -19,7 +19,7 @@ export type Run = (command: string, args: string[], cwd: string, env?: Record<st
 export type Frontend = 'none' | 'orca' | 'herdr' | 'custom';
 export type Graph = 'local' | 'beads';
 export interface SubagentRow { id: string; name: string; kind: 'task' | 'eval'; state: 'running' | 'closed' | 'error' }
-export interface MissionConfig { version: 1; controls: boolean; maxWorkers: number; frontend: Frontend; graph: Graph; modelRole: string; autoDispatch: boolean; customCommand?: string; keys: { expand: string | null; fullscreen: string | null; mode: string | null } }
+export interface MissionConfig { version: 1; controls: boolean; maxWorkers: number; frontend: Frontend; graph: Graph; modelRole: string; workerRole: string; autoDispatch: boolean; customCommand?: string; keys: { expand: string | null; fullscreen: string | null; mode: string | null } }
 export interface Projection { mission: Mission; snapshot?: Snapshot; resumeHold: boolean; ownershipError?: string; selected?: string; history?: AuditEvent[]; expanded?: boolean; outlineOffset?: number; nativePlan?: boolean; nextAction?: string; frontend?: Frontend; expandKey?: string | null; subagents?: SubagentRow[] }
 export interface PolicyContext { resumeHold: boolean; owned: boolean; nativePlan: boolean; fresh: boolean; maxWorkers: number }
 export interface Action { kind: 'hold' | 'dispatch' | 'resend' | 'verify' | 'deliver' | 'review' | 'repairs' | 'complete'; detail: string; ids?: string[]; gate?: Gate }

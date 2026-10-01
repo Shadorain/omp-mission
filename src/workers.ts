@@ -2,7 +2,7 @@ import type { Bead, Frontend, Mission, Run, Terminal, Worker } from './types.ts'
 import { spawnBackground, spawnCustom, spawnHerdr, writePromptFile, writeSourceFile } from './hosts.ts';
 
 export interface WorkerAssignment { beadId: string; cwd: string; files: string[]; assignment?: string }
-export interface WorkerHooks { persist(mission: Mission): Promise<void>; prompt?(mission: Mission, worker: Worker): string; agentDir?: string; frontend?: Frontend | (() => Frontend); customCommand?: string | (() => string | undefined) }
+export interface WorkerHooks { persist(mission: Mission): Promise<void>; prompt?(mission: Mission, worker: Worker): string; agentDir?: string; model?: () => string | undefined; frontend?: Frontend | (() => Frontend); customCommand?: string | (() => string | undefined) }
 export interface WorkerDriver {
   dispatch(mission: Mission, assignments: WorkerAssignment[] | string[]): Promise<Worker[]>;
   reconcile(mission: Mission, beadStates: Map<string, Bead>): Promise<Worker[]>;
@@ -92,10 +92,15 @@ export function createWorkerDriver(run: Run, hooks: WorkerHooks): WorkerDriver {
     const value = hooks.customCommand;
     return typeof value === 'function' ? value() : value;
   }
+  // Workers inherit the default model unless the worker role resolves to one.
+  function modelFlag(): string {
+    const model = hooks.model?.();
+    return model ? ` --model ${quote(model)}` : '';
+  }
   function launchCommand(mission: Mission, worker: Worker): string {
     const beads = mission.workspace.beadsDir ? ` BEADS_DIR=${quote(mission.workspace.beadsDir)}` : '';
     const agentEnvironment = hooks.agentDir ? ` PI_CODING_AGENT_DIR=${quote(hooks.agentDir)}` : '';
-    return `env OMP_MISSION_WORKER=${quote('1')} BEADS_ACTOR=${quote(worker.beadId)}${beads}${agentEnvironment} omp`;
+    return `env OMP_MISSION_WORKER=${quote('1')} BEADS_ACTOR=${quote(worker.beadId)}${beads}${agentEnvironment} omp${modelFlag()}`;
   }
   function hostOf(worker: Worker): Frontend {
     return worker.frontend ?? 'orca';
@@ -186,7 +191,7 @@ export function createWorkerDriver(run: Run, hooks: WorkerHooks): WorkerDriver {
       const spawned = kind === 'herdr'
         ? await spawnHerdr(run, mission, worker, hooks.agentDir)
         : kind === 'none'
-          ? await spawnBackground(run, mission, worker, hooks.agentDir)
+          ? await spawnBackground(run, mission, worker, hooks.agentDir, hooks.model?.())
           : await spawnCustom(run, mission, worker, customCommand()!, launchCommand(mission, worker));
       worker.handle = spawned.handle;
       worker.incarnationId = spawned.incarnationId;
@@ -200,7 +205,7 @@ export function createWorkerDriver(run: Run, hooks: WorkerHooks): WorkerDriver {
     const promptFile = await writePromptFile(worker);
     const agentEnvironment = hooks.agentDir ? ` PI_CODING_AGENT_DIR=${quote(hooks.agentDir)}` : '';
     const pRef = quote(promptFile);
-    const command = `env OMP_MISSION_WORKER=${quote('1')} BEADS_ACTOR=${quote(worker.beadId)} BEADS_DIR=${quote(mission.workspace.beadsDir)}${agentEnvironment} omp @${pRef}`;
+    const command = `env OMP_MISSION_WORKER=${quote('1')} BEADS_ACTOR=${quote(worker.beadId)} BEADS_DIR=${quote(mission.workspace.beadsDir)}${agentEnvironment} omp${modelFlag()} @${pRef}`;
     const result = await run('orca', ['terminal', 'create', '--worktree', `path:${worker.cwd}`, '--title', `mission-${worker.beadId}`, '--command', command, '--json'], mission.workspace.cwd);
     const payload = decode(result);
     const terminal = payload.terminal;

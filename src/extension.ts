@@ -13,7 +13,7 @@ import type { Ownership } from './store';
 import { readClaimActor, readGraph, readHistory } from './beads';
 import { createWorkerDriver } from './workers';
 import { approveGate, autoDispatchAllowed, consumeGate, effectiveGraph, enforceGate, enforceMutation, nextAction, requireBeadsGraph, revisionGate, setMode, waveGate } from './controller';
-import { captureRevision, Reviewer } from './review';
+import { captureRevision, Reviewer, roleModelString } from './review';
 import { coordinatorPrompt, guide, workerPrompt } from './prompts';
 import { createMissionWidget, createMissionInspector } from './ui';
 import { statusView } from './status';
@@ -32,7 +32,7 @@ export function nativePlan(ctx: ExtensionContext): boolean {
 export default async function missionExtension(pi: ExtensionAPI) {
  if(process.env.OMP_MISSION_WORKER==='1')return;
  const agentDir=resolveAgentDir();let config:MissionConfig;let configError:string|undefined;
- try{config=await readMissionConfig(agentDir);}catch(error){configError=String(error);config={version:1,controls:false,maxWorkers:2,frontend:'none',graph:'local',modelRole:'default',autoDispatch:false,keys:{expand:null,fullscreen:null,mode:null}};}
+ try{config=await readMissionConfig(agentDir);}catch(error){configError=String(error);config={version:1,controls:false,maxWorkers:2,frontend:'none',graph:'local',modelRole:'default',workerRole:'default',autoDispatch:false,keys:{expand:null,fullscreen:null,mode:null}};}
  let ctx:ExtensionContext|undefined;let mission:Mission|undefined;let path:string|undefined;let pending:Mission|undefined;
  let snapshot:Snapshot|undefined;let ownership:Ownership|undefined;let resumeHold=true;let ownershipError:string|undefined;
  let generation=0;let refreshing=false;let lastPoll=0;let lastWake='';let autoBlocked='';let expanded=false;let outlineOffset=0;let selected:string|undefined;let history:Projection['history'];let timer:Timer|undefined;let overlayAbort:AbortController|undefined;let operation=false;let terminalInputDispose:(()=>void)|undefined;let subagents:SubagentRow[]=[];
@@ -64,7 +64,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
  function syncCompletions(){completionState={sources:completionState.sources,beads:(snapshot?.beads??[]).map(bead=>({id:bead.id,title:bead.title,category:bead.category})),workers:(mission?.workers??[]).map(worker=>({beadId:worker.beadId,state:worker.state,handle:!!worker.handle}))};}
  async function refreshCompletionSources(){try{const saved=await listMissions(agentDir);completionState.sources=saved.map(item=>({id:item.mission.source.id,title:item.mission.source.title}));}catch{/* keep the previous source list */}}
  async function persist(value:Mission){if(value!==mission||!path||!ownership)throw new Error('No current controller ownership');await ownership.assertOwned();value.controllerNonce=ownership.nonce;value.updatedAt=new Date().toISOString();await saveMission(path,value);}
- const driver=createWorkerDriver(run,{persist:async value=>{if(value!==mission)throw new Error('Session changed during worker operation');if(ownership&&!resumeHold)await persist(value);},prompt:(mission,worker)=>workerPrompt(mission,worker,config.frontend),agentDir,frontend:()=>config.frontend,customCommand:()=>config.customCommand});
+ const driver=createWorkerDriver(run,{persist:async value=>{if(value!==mission)throw new Error('Session changed during worker operation');if(ownership&&!resumeHold)await persist(value);},prompt:(mission,worker)=>workerPrompt(mission,worker,config.frontend),agentDir,model:()=>roleModelString(config.workerRole),frontend:()=>config.frontend,customCommand:()=>config.customCommand});
  function policy(context:ExtensionContext){return {resumeHold,owned:!!ownership&&!ownershipError,nativePlan:nativePlan(context),fresh:!!snapshot&&!snapshot.error&&Date.now()-snapshot.fetchedAt<35000,maxWorkers:config.maxWorkers};}
  function status(context:ExtensionContext,brief=false){const next=mission?nextAction(mission,snapshot,policy(context)):undefined;return statusView({mission,pending,snapshot,resumeHold,ownershipError,next:next&&{...next,guide:brief?undefined:guide(next.kind)}},brief);}
  function bindTerminalInput(context:ExtensionContext){
@@ -208,15 +208,15 @@ export default async function missionExtension(pi: ExtensionAPI) {
    context.ui.notify(configNotice(where,true,`graph ${config.graph}${stay}`),'info');
    return;
   }
-  if(key==='modelRole'||key==='autoDispatch'){
+  if(key==='modelRole'||key==='workerRole'||key==='autoDispatch'){
    const words=rest.split(/\s+/);const flags=['on','off','true','false'];
-   if(words.length!==2||!value||(key==='autoDispatch'&&!flags.includes(value)))throw new Error(key==='modelRole'?'Usage: /mission config modelRole <role>  (smol, default, slow, ...)':'Usage: /mission config autoDispatch on|off');
-   const written=validateMissionConfig({...config,...(key==='modelRole'?{modelRole:value}:{autoDispatch:value==='on'||value==='true'})});await writeMissionConfig(agentDir,written);config=written;
+   if(words.length!==2||!value||(key==='autoDispatch'&&!flags.includes(value)))throw new Error(key==='autoDispatch'?'Usage: /mission config autoDispatch on|off':`Usage: /mission config ${key} <role>  (default, task, smol, slow, ...)`);
+   const written=validateMissionConfig({...config,...(key==='autoDispatch'?{autoDispatch:value==='on'||value==='true'}:{[key]:value})});await writeMissionConfig(agentDir,written);config=written;
    if(key==='autoDispatch'){autoBlocked='';await wakeCoordinator();}
-   context.ui.notify(configNotice(where,true,key==='modelRole'?`modelRole ${config.modelRole}`:`autoDispatch ${config.autoDispatch?'on':'off'}`),'info');
+   context.ui.notify(configNotice(where,true,key==='autoDispatch'?`autoDispatch ${config.autoDispatch?'on':'off'}`:`${key} ${config[key]}`),'info');
    return;
   }
-  if(key!=='frontend'||!value)throw new Error('Usage: /mission config [frontend none|orca|herdr|custom -- <command>] | [graph local|beads] | [modelRole <role>] | [autoDispatch on|off]');
+  if(key!=='frontend'||!value)throw new Error('Usage: /mission config [frontend none|orca|herdr|custom -- <command>] | [graph local|beads] | [modelRole <role>] | [workerRole <role>] | [autoDispatch on|off]');
   const customCommand = value === 'custom' ? rest.slice(rest.indexOf(value) + value.length).trim().replace(/^--\s*/, '') : undefined;
   if (value === 'custom' && !customCommand) throw new Error('Usage: /mission config frontend custom -- <command>');
   const next = validateMissionConfig({...config, frontend: value, ...(customCommand ? {customCommand} : {})});

@@ -102,6 +102,7 @@ function completeVerb(verb: string, rest: string[], partial: string, state: Miss
 				{ name: "frontend", description: "Session host: none, orca, herdr, custom" },
 				{ name: "graph", description: "Work graph: local or beads" },
 				{ name: "modelRole", description: "Model role for independent review" },
+				{ name: "workerRole", description: "Model role for bead workers" },
 				{ name: "autoDispatch", description: "Start ready waves without a model turn" },
 			].filter((key) => matches(key.name, partial));
 			return keys.length ? keys.map((key) => item(verb, key.name, key.description)) : null;
@@ -114,10 +115,11 @@ function completeVerb(verb: string, rest: string[], partial: string, state: Miss
 			const items = GRAPHS.filter(graph => matches(graph.name, partial)).map(graph => item(stem, graph.name, graph.description));
 			return items.length ? items : null;
 		}
-		if (rest.length === 1 && rest[0] === "modelRole") {
+		if (rest.length === 1 && (rest[0] === "modelRole" || rest[0] === "workerRole")) {
 			const roles = [
-				{ name: "smol", description: "Fast, cheap model (default)" },
 				{ name: "default", description: "Same model as the coordinator" },
+				{ name: "task", description: "Your task role model" },
+				{ name: "smol", description: "Fast, cheap model" },
 				{ name: "slow", description: "Strongest configured model" },
 			];
 			const items = roles.filter(role => matches(role.name, partial)).map(role => item(stem, role.name, role.description));

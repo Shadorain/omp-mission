@@ -65,12 +65,16 @@ export function pickRoleModel<T extends ModelRef>(value: string | undefined, mod
  }
  return undefined;
 }
+// The model string a role names (`provider/id[:level]`), or undefined for `default`, which means "inherit".
+export function roleModelString(role: string): string | undefined {
+ return role === 'default' ? undefined : settings.getModelRole(role) || undefined;
+}
 export class Reviewer {
  private session?: AgentSession;
  async dispose(): Promise<void> {const session=this.session;this.session=undefined;await session?.dispose();}
  async run(m: Mission, ctx: ExtensionContext, run: Run, role = 'default'): Promise<ReviewRound> {
   if(!ctx.model||!ctx.modelRegistry)throw new Error('Coordinator model/registry unavailable');
-  const model = role === 'default' ? ctx.model : pickRoleModel(settings.getModelRole(role), ctx.modelRegistry.getAvailable()) ?? ctx.model;
+  const model = pickRoleModel(roleModelString(role), ctx.modelRegistry.getAvailable()) ?? ctx.model;
   const captured=await captureRevision(m,run);
   if(m.evidence.verify?.revision!==captured.revision)throw new Error('Files changed since verification; reverify before review');
   const {session} = await createAgentSession({

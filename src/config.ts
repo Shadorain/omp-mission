@@ -10,7 +10,8 @@ export const DEFAULT_MISSION_CONFIG: MissionConfig = {
   maxWorkers: 2,
   frontend: "none",
   graph: "local",
-  modelRole: "smol",
+  modelRole: "default",
+  workerRole: "task",
   autoDispatch: false,
   keys: { expand: "ctrl+shift+m", fullscreen: "ctrl+shift+f", mode: "ctrl+shift+o" },
 };
@@ -65,10 +66,16 @@ export function validateMissionConfig(value: unknown, path = "mission.json"): Mi
   if (value.customCommand !== undefined && !customCommand) return fail("customCommand must be a non-empty command");
   if (customCommand && (customCommand.length > 2000 || /[\0\n\r]/.test(customCommand))) return fail("customCommand must be one line under 2000 characters");
   if (frontend === "custom" && !customCommand) return fail("customCommand is required when frontend is custom");
-  const modelRole = value.modelRole === undefined ? DEFAULT_MISSION_CONFIG.modelRole : value.modelRole;
-  if (typeof modelRole !== "string" || !/^[A-Za-z][A-Za-z0-9_.-]{0,40}$/.test(modelRole)) return fail("modelRole must be a model role name such as smol, default, or slow");
+  const roles: Record<"modelRole" | "workerRole", string> = { modelRole: DEFAULT_MISSION_CONFIG.modelRole, workerRole: DEFAULT_MISSION_CONFIG.workerRole };
+  for (const name of ["modelRole", "workerRole"] as const) {
+    const raw = value[name] === undefined ? roles[name] : value[name];
+    // `@task` and `task` name the same role.
+    const role = typeof raw === "string" ? raw.replace(/^@/, "") : raw;
+    if (typeof role !== "string" || !/^[A-Za-z][A-Za-z0-9_.-]{0,40}$/.test(role)) return fail(`${name} must be a model role name such as default, task, smol, or slow`);
+    roles[name] = role;
+  }
   if (value.autoDispatch !== undefined && typeof value.autoDispatch !== "boolean") return fail("autoDispatch must be boolean");
-  return { version: 1, controls: value.controls ?? false, maxWorkers, frontend, graph, modelRole, autoDispatch: value.autoDispatch ?? false, ...(customCommand ? { customCommand } : {}), keys: normalized };
+  return { version: 1, controls: value.controls ?? false, maxWorkers, frontend, graph, modelRole: roles.modelRole, workerRole: roles.workerRole, autoDispatch: value.autoDispatch ?? false, ...(customCommand ? { customCommand } : {}), keys: normalized };
 }
 
 export async function readMissionConfig(agentDir: string): Promise<MissionConfig> {
@@ -112,6 +119,7 @@ export function formatMissionConfig(config: MissionConfig, path: string, mission
 		`  maxWorkers: ${config.maxWorkers}`,
 		`  frontend: ${config.frontend}`,
 		`  modelRole: ${config.modelRole}`,
+		`  workerRole: ${config.workerRole}`,
 		`  autoDispatch: ${config.autoDispatch}`,
 	];
 	let g = `  graph: ${config.graph}`;
