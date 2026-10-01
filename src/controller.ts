@@ -54,13 +54,14 @@ export function nextAction(m: Mission, snapshot: Snapshot | undefined, policy: P
   const stalled = workers.filter(worker => worker.state === 'awaiting-claim' && !worker.error && worker.launchedAt && Date.now() - Date.parse(worker.launchedAt) > CLAIM_STALL_MS && snapshot.leaves.some(bead => bead.id === worker.beadId && bead.category === 'ready'));
   if (stalled.length) return {kind: 'resend', detail: `No claim ${Math.round(CLAIM_STALL_MS / 60000)}+ min after launch: ${stalled.map(worker => worker.beadId).join(', ')}. Inspect the tab, then resend once`, ids: stalled.map(worker => worker.beadId).sort()};
   const stopped = workers.filter(worker => worker.frontend === 'subagent' && worker.error && worker.state !== 'missing');
-  if (stopped.length) return {kind: 'resend', detail: `Worker stopped: ${stopped.map(worker => `${worker.beadId} (${worker.error!.slice(0, 240)})`).join('; ')}`, ids: stopped.map(worker => worker.beadId).sort()};
-  if (workers.some(worker => worker.state === 'missing' || worker.error)) return {kind: 'hold', detail: 'Worker identity or claim requires recovery'};
+  if (workers.some(worker => worker.state === 'missing' || (worker.error && worker.frontend !== 'subagent'))) return {kind: 'hold', detail: 'Worker identity or claim requires recovery'};
   const outstanding = snapshot.leaves.filter(bead => bead.category !== 'closed');
   if (outstanding.length) {
    const reserved = new Set(workers.map(worker => worker.beadId));
    const capacity = Math.max(0, policy.maxWorkers - workers.length);
    const ids = snapshot.ready.filter(id => m.scopes[id] && !reserved.has(id)).sort().slice(0, capacity);
+   // A stopped subagent worker waits for the operator but does not hold back other ready beads; it surfaces once nothing else can start.
+   if (stopped.length && (m.mode === 'pause' || !ids.length)) return {kind: 'resend', detail: `Worker stopped: ${stopped.map(worker => `${worker.beadId} (${worker.error!.slice(0, 240)})`).join('; ')}`, ids: stopped.map(worker => worker.beadId).sort()};
    if (m.mode === 'pause' && workers.length) return {kind: 'hold', detail: 'Current wave still running'};
    if (ids.length) {
     const gate = waveGate(m, ids, snapshot);

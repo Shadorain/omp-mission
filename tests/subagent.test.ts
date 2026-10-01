@@ -231,3 +231,29 @@ test('git snapshots see content changes to already dirty files and deletions; yi
   expect(extractYield([yielded({ done: 'yes', summary: 's' })])).toBeUndefined();
   expect(extractYield([yielded({ done: true, summary: 's', verification: 'v' })])).toEqual({ done: true, summary: 's', verification: 'v' });
 });
+
+test('a resumed worker is not blamed for sibling beads\' edits made while it was stopped, but still for paths nobody owns', async () => {
+  const file = join(root, 'sessions', 'bd-a.jsonl');
+  await mkdir(dirname(file), { recursive: true });
+  await writeFile(file, '{}');
+  const a = worker('bd-a', ['a/**']);
+  const sibling = worker('bd-b', ['b/**']);
+  const m = mission([a, sibling]);
+  const first = fake(() => {}, true);
+  const second = fake(async ({ cwd, messages }) => {
+    await writeFile(join(cwd, 'a', 'one.txt'), 'A');
+    await writeFile(join(cwd, 'b', 'two.txt'), 'sibling edit while A was down');
+    await writeFile(join(cwd, 'nobody.txt'), 'stray');
+    messages.push(yielded({ done: true, summary: 'a' }));
+  });
+  const sessions = [first, second];
+  let n = 0;
+  const { runner, settled } = harness(async () => ({ session: sessions[n++]!.session, file }));
+  await runner.launch(m, a);
+  await first.prompted;
+  await runner.abortAll();
+  a.incarnationId = file;
+  await runner.resume(m, a);
+  await runner.whenDone('bd-a');
+  expect(settled[0]![1]).toMatchObject({ ok: false, error: expect.stringMatching(/outside the allowed paths \(nobody\.txt\)/) });
+});

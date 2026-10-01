@@ -45,8 +45,6 @@ interface Live {
 	beadId: string;
 	session: SubagentSession;
 	baseline: Record<string, string>;
-	/** Beads that ran at any point while this one did: edits inside their scopes are theirs. */
-	concurrent: Set<string>;
 	aborting: boolean;
 	done: Promise<void>;
 }
@@ -217,8 +215,7 @@ export class SubagentRunner implements SubagentPort {
 		else { baseline = await snapshotChanges(this.#o.run, worker.cwd); await writeFile(baselineFile, JSON.stringify(baseline)); }
 		const contextFiles = await contextFilesFor(config.workerContext, worker.cwd, this.#o.agentDir);
 		const { session, file } = await this.#factory({ mission, worker, ctx, model, system: WORKER_SYSTEM, contextFiles, resumeFile, sessionDir: dir, thinkingLevel });
-		const live: Live = { beadId: worker.beadId, session, baseline, concurrent: new Set(), aborting: false, done: Promise.resolve() };
-		for (const other of this.#live.values()) { other.concurrent.add(worker.beadId); live.concurrent.add(other.beadId); }
+		const live: Live = { beadId: worker.beadId, session, baseline, aborting: false, done: Promise.resolve() };
 		this.#live.set(worker.beadId, live);
 		const first = !resumeFile
 			? worker.assignment
@@ -251,10 +248,12 @@ export class SubagentRunner implements SubagentPort {
 		if (!result) return { ok: false, error: 'worker ended without yielding a result' };
 		if (!result.done) return { ok: false, error: `worker reported it is not done: ${result.summary.slice(0, 400)}` };
 		const allowed = [...worker.files];
-		for (const other of mission.workers) if (live.concurrent.has(other.beadId)) allowed.push(...other.files);
+		// Edits inside another dispatched bead's paths are that worker's to answer for (its own check covers them), so a
+		// resumed worker is not blamed for what its siblings did while it was stopped. Only a path nobody owns is a stray.
+		for (const other of mission.workers) if (other.beadId !== worker.beadId) allowed.push(...other.files);
 		const changed = changedSince(live.baseline, await snapshotChanges(this.#o.run, worker.cwd));
 		const stray = outOfScope(changed, allowed);
-		if (stray.length) return { ok: false, error: `edits outside the allowed paths (${stray.slice(0, 8).join(', ')}${stray.length > 8 ? ', …' : ''}); bead left open for review` };
+		if (stray.length) return { ok: false, error: `edits outside the allowed paths (${stray.slice(0, 8).join(', ')}${stray.length > 8 ? ', …' : ''}); bead left open for review. If a concurrent worker made them, release or resend this one after cleaning up` };
 		const reason = [result.summary, result.verification ? `Verified: ${result.verification}` : ''].filter(Boolean).join('\n').slice(0, 4000);
 		const closed = await this.#o.run('bd', ['close', worker.beadId, '--reason', reason, '--json'], worker.cwd, this.#env(mission, worker));
 		if (closed.code !== 0) return { ok: false, error: `bd close failed: ${(closed.stderr || closed.stdout).trim().slice(0, 300)}` };

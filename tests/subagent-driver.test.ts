@@ -85,7 +85,7 @@ test('reap aborts the session and focus points at the Agent Hub instead of a tab
 
 test('a stopped subagent worker becomes a resend action naming the reason, while other frontends still hold', async () => {
   const { nextAction } = await import('../src/controller');
-  const snapshot = (): import('../src/types').Snapshot => ({ beads: [bead('active', 'bd-1'), { ...bead('ready'), id: 'bd-2' }], leaves: [bead('active', 'bd-1'), { ...bead('ready'), id: 'bd-2' }], ready: ['bd-2'], closed: 0, active: 1, blocked: 0, fetchedAt: Date.now() });
+  const snapshot = (ready = false): import('../src/types').Snapshot => { const beads = [bead('active', 'bd-1'), ...(ready ? [{ ...bead('ready'), id: 'bd-2' }] : [])]; return { beads, leaves: beads, ready: ready ? ['bd-2'] : [], closed: 0, active: 1, blocked: 0, fetchedAt: Date.now() }; };
   const policy = { owned: true, resumeHold: false, nativePlan: false, fresh: true, maxWorkers: 2 } as never;
   const stopped = worker({ error: 'worker reported it is not done: blocked on X' });
   const m = mission(stopped);
@@ -95,6 +95,11 @@ test('a stopped subagent worker becomes a resend action naming the reason, while
   expect(action.kind).toBe('resend');
   expect(action.ids).toEqual(['bd-1']);
   expect(action.detail).toContain('blocked on X');
+  // Other ready beads keep flowing while the stopped worker waits.
+  expect(nextAction(m, snapshot(true), policy)).toMatchObject({ kind: 'dispatch', ids: ['bd-2'] });
+  m.mode = 'pause';
+  expect(nextAction(m, snapshot(true), policy)).toMatchObject({ kind: 'resend' });
+  m.mode = 'auto';
 
   const orca = mission(worker({ error: 'x', frontend: 'orca' }));
   orca.scopes = m.scopes;
