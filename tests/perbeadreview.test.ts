@@ -125,3 +125,29 @@ test('files edited during review invalidate the round', async () => {
   };
   await expect(new Reviewer(edits).runPerBead(m, ctx, real, 'default', undefined, targets)).rejects.toThrow(/Files changed since verification|Revision changed/);
 });
+
+test('the integration pass does not repeat a defect a bead reviewer already owns, but keeps its own', async () => {
+  await writeFile(join(root, 'a', 'one.txt'), 'changed a');
+  const m = await missionAt();
+  const answer = (payload: Record<string, unknown>) => {
+    const bead = (payload.bead as { id?: string } | undefined)?.id;
+    if (bead === 'bd-a') return { summary: 's', findings: [finding('f1')] };
+    if (bead) return { summary: 's', findings: [] };
+    return { summary: 's', findings: [finding('dup'), { ...finding('seam'), line: 9 }] };
+  };
+  const round = await new Reviewer(opener([], answer)).runPerBead(m, ctx, real, 'default', undefined, targets);
+  expect(round.findings.map(f => [f.id, f.beadId])).toEqual([['bd-a:f1', 'bd-a'], ['integration:seam', undefined]]);
+});
+
+test('per-bead hashes and finding bead ids survive saving the mission, so the next round can be incremental', async () => {
+  const { validateMission } = await import('../src/store');
+  const m = await missionAt();
+  const round = await new Reviewer(opener([], () => ({ summary: 's', findings: [finding('f1')] }))).runPerBead(m, ctx, real, 'default', undefined, targets);
+  m.reviews.push(round);
+  const now = new Date().toISOString();
+  m.createdAt = m.updatedAt = now;
+  m.evidence.verify!.at = now;
+  const reloaded = validateMission(JSON.parse(JSON.stringify(m)));
+  expect(reloaded.reviews[0]!.beads).toEqual(round.beads);
+  expect(reloaded.reviews[0]!.findings.some(f => f.beadId === 'bd-a')).toBe(true);
+});

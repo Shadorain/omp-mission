@@ -144,7 +144,14 @@ export class Reviewer {
   const outcomes=settled.map(item=>(item as PromiseFulfilledResult<(typeof jobs)[number] extends Promise<infer T>?T:never>).value);
   const after=await captureRevision(m,run);if(after.revision!==captured.revision)throw new Error('Revision changed during review; result invalidated');
   const findings:Finding[]=[];
-  for(const outcome of outcomes)for(const finding of outcome.result.findings)findings.push({...finding,id:`${outcome.label}:${finding.id}`,...(outcome.beadId?{beadId:outcome.beadId}:{})});
+  const reported=new Set<string>();
+  for(const outcome of outcomes)for(const finding of outcome.result.findings){
+   // The integration pass sees the whole diff and often repeats a defect a bead reviewer already owns; keep the owned one.
+   const at=`${finding.path}:${finding.line}`;
+   if(!outcome.beadId&&reported.has(at))continue;
+   if(outcome.beadId)reported.add(at);
+   findings.push({...finding,id:`${outcome.label}:${finding.id}`,...(outcome.beadId?{beadId:outcome.beadId}:{})});
+  }
   const summary=validateReviewSummary(outcomes.map(outcome=>`[${outcome.label}] ${outcome.result.summary}`).join('\n').slice(0,49_000));
   return {round:m.round,revision:captured.revision,model:`${model.provider}/${model.id}`,summary,findings,at:new Date().toISOString(),beads:hashes};
  }
