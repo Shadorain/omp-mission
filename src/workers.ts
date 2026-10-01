@@ -18,7 +18,10 @@ export interface WorkerDriver {
   reconcile(mission: Mission, beadStates: Map<string, Bead>): Promise<Worker[]>;
   focus(worker: Worker): Promise<void>;
   reap(mission: Mission, beadId: string, bead: Bead): Promise<void>;
-  resend(mission: Mission, beadId: string, bead: Bead): Promise<void>;
+  /** `note` is operator guidance; only subagent workers can take it (they are resumed with it as the prompt). */
+  resend(mission: Mission, beadId: string, bead: Bead, note?: string): Promise<void>;
+  /** Gives a stopped subagent worker's bead back (abort, unclaim, close the record) so a fresh worker can take it. */
+  release(mission: Mission, beadId: string, bead: Bead): Promise<void>;
   recover(mission: Mission, beadId: string, bead: Bead): Promise<void>;
 }
 
@@ -381,16 +384,28 @@ export function createWorkerDriver(run: Run, hooks: WorkerHooks): WorkerDriver {
       worker.error = `replaced: ${worker.error ?? 'recorded worker terminal is gone'}`;
       await persist(mission);
     },
-    async resend(mission, beadId, bead) {
+    async release(mission, beadId, bead) {
+      const worker = mission.workers.findLast(item => item.beadId === beadId && item.state !== 'closed');
+      if (!worker || hostOf(worker) !== 'subagent') throw new Error('release applies to a running or stopped subagent worker');
+      if (!hooks.subagent) throw new Error('subagent runner unavailable');
+      if (bead.id !== beadId || bead.category !== 'active' || bead.claimActor !== beadId) throw new Error('release requires the bead still claimed by its own worker');
+      await hooks.subagent.abort(beadId);
+      await hooks.subagent.release(mission, worker);
+      worker.state = 'closed';
+      worker.error = `released: ${worker.error ?? 'by operator'}`;
+      await persist(mission);
+    },
+    async resend(mission, beadId, bead, note) {
       const latest = mission.workers.findLast(item => item.beadId === beadId);
       if (latest && hostOf(latest) === 'subagent' && latest.state !== 'closed') {
         // The bead is in_progress under the worker's own claim, so the ready-bead rule below does not apply.
         if (bead.id !== beadId || bead.category !== 'active' || bead.claimActor !== beadId) throw new Error('resend requires the worker\'s own active bead');
         if (!hooks.subagent) throw new Error('subagent runner unavailable');
-        if (hooks.subagent.isLive(beadId)) { await send(latest, mission, true); return; }
+        if (hooks.subagent.isLive(beadId)) { if (note) await hooks.subagent.steer(beadId, note); else await send(latest, mission, true); return; }
         // Not running: either a failed result waiting for the operator, or a session lost to a restart.
-        const note = latest.error ? `Your last result was rejected: ${latest.error}. Fix that and finish by calling yield again.` : undefined;
-        if (!(await hooks.subagent.resume(mission, latest, note))) throw new Error(`no saved session to resume for ${beadId}; release the claim with bd unclaim and dispatch again`);
+        const rejected = latest.error ? `Your last result was rejected: ${latest.error}.` : '';
+        const prompt = [rejected, note, 'Finish by calling yield.'].filter(Boolean).join(' ');
+        if (!(await hooks.subagent.resume(mission, latest, prompt))) throw new Error(`no saved session to resume for ${beadId}; release the claim with bd unclaim and dispatch again`);
         latest.error = undefined;
         latest.state = 'running';
         await persist(mission);

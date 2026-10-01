@@ -24,7 +24,7 @@ import { SubagentRunner, subagentPrompt } from './subagent';
 import { sourceFilePath, writeSourceFile } from './hosts';
 import { noteSubagentSpawn, noteSubagentToolEnd, noteSubagentToolStart, noteSubagentTurnEnd } from './subagents';
 
-const controls = ['show','continue','mode','approve','review','history','focus','resend','dispatch','reap','actions','config'];
+const controls = ['show','continue','mode','approve','review','history','focus','resend','release','dispatch','reap','actions','config'];
 export function nativePlan(ctx: ExtensionContext): boolean {
  let mode = 'none';
  for (const entry of ctx.sessionManager.getBranch()) {
@@ -64,7 +64,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
   };
  };
  let completionState:MissionCompletionState={sources:[],beads:[],workers:[]};
- function syncCompletions(){completionState={sources:completionState.sources,beads:(snapshot?.beads??[]).map(bead=>({id:bead.id,title:bead.title,category:bead.category})),workers:(mission?.workers??[]).map(worker=>({beadId:worker.beadId,state:worker.state,handle:!!worker.handle}))};}
+ function syncCompletions(){completionState={sources:completionState.sources,beads:(snapshot?.beads??[]).map(bead=>({id:bead.id,title:bead.title,category:bead.category})),workers:(mission?.workers??[]).map(worker=>({beadId:worker.beadId,state:worker.state,handle:!!worker.handle,stopped:worker.frontend==='subagent'&&!!worker.error&&worker.state!=='closed'}))};}
  async function refreshCompletionSources(){try{const saved=await listMissions(agentDir);completionState.sources=saved.map(item=>({id:item.mission.source.id,title:item.mission.source.title}));}catch{/* keep the previous source list */}}
  async function persist(value:Mission){if(value!==mission||!path||!ownership)throw new Error('No current controller ownership');await ownership.assertOwned();value.controllerNonce=ownership.nonce;value.updatedAt=new Date().toISOString();await saveMission(path,value);}
  // In-process workers report back here: a clean result already closed the bead; a rejected one waits for the operator.
@@ -248,13 +248,14 @@ export default async function missionExtension(pi: ExtensionAPI) {
      options.push('focus');
      if(!resumeHold){
       options.push('resend');
+      if(worker.state!=='closed'&&worker.frontend==='subagent')options.push('release');
       if(!mission.keep&&snapshot?.leaves.find(b=>b.id===selected)?.status==='closed')options.push('reap');
      }
     }
    }
   }
   const chosen=await context.ui.select(`Mission actions${mission?.gate?': '+mission.gate.detail:''}`,options);
-  if(chosen)await command(chosen+(selected&&['focus','resend','reap'].includes(chosen)?' '+selected:''),context);
+  if(chosen)await command(chosen+(selected&&['focus','resend','release','reap'].includes(chosen)?' '+selected:''),context);
  }
  async function command(args:string,context:ExtensionContext){
   if(!eligible(context))return;ctx=context;
@@ -285,7 +286,8 @@ export default async function missionExtension(pi: ExtensionAPI) {
     }
     if(['mode','review','approve'].includes(verb!))return await decision(context,verb!,arg);
     if(verb==='continue')return await request(context,'continue');
-    if(['resend','reap'].includes(verb!))return await request(context,verb!,{beadId:arg});
+    if(verb==='resend'){const note=args.trim().split(/\s+/).slice(2).join(' ');return await request(context,'resend',{beadId:arg,...(note?{detail:note}:{})});}
+    if(['release','reap'].includes(verb!))return await request(context,verb!,{beadId:arg});
     return await request(context,'dispatch');
    }
  const parsed=parseMissionInput(args);if(parsed.force&&nativePlan(context))throw new Error('Force cannot execute inside native plan mode');const saved=await listMissions(agentDir);let target=parsed;
@@ -314,7 +316,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
  const scopesSchema=z.record(z.string(),z.array(z.string()).min(1));
  pi.registerTool({name:'mission_status',defaultInactive:true,loadMode:'essential',label:'Mission status',description:'Inspect authoritative cached mission graph, hold, gates and next coordinator action.',approval:'read',parameters:z.object({}),execute:async(_id,_params,_signal,_update,context)=>{if(!eligible(context))throw new Error('Mission coordinator only');if(!operation)await refresh(false);return {content:[{type:'text',text:JSON.stringify(status(context))}],details:{}};}});
  const controlSchema=z.object({
-  operation:z.enum(['start','continue','bind_workspace','bind_graph','dispatch','record_verification','record_delivery','run_review','accept_repairs','bind_repairs','resend','reap','reject_finding']),
+  operation:z.enum(['start','continue','bind_workspace','bind_graph','dispatch','record_verification','record_delivery','run_review','accept_repairs','bind_repairs','resend','release','reap','reject_finding']),
   cwd:z.string().optional(),base:z.string().optional(),beadsDir:z.string().optional(),delivery:z.enum(['pr','local']).optional(),
   epicId:z.string().optional(),scopes:scopesSchema.optional(),repairLinks:z.record(z.string(),z.array(z.string())).optional(),
   beadId:z.string().optional(),detail:z.string().optional(),passed:z.boolean().optional(),url:z.string().optional(),
@@ -423,10 +425,11 @@ export default async function missionExtension(pi: ExtensionAPI) {
       mission.phase = 'complete';
       mission.evidence.complete = evidence;
      }
-    }else if(params.operation==='resend'||params.operation==='reap'){
+    }else if(params.operation==='resend'||params.operation==='release'||params.operation==='reap'){
      requireBeadsGraph(mission);if(!params.beadId)throw new Error('beadId required');await refresh(false);
      const bead=snapshot?.beads.find(b=>b.id===params.beadId);if(!bead||snapshot?.error)throw new Error('Fresh mission bead required');
-     if(params.operation==='resend')await driver.resend(mission,params.beadId,bead);
+     if(params.operation==='resend')await driver.resend(mission,params.beadId,bead,params.detail);
+     else if(params.operation==='release')await driver.release(mission,params.beadId,bead);
      else await driver.reap(mission,params.beadId,bead);
     }
     if(epoch!==generation)throw new Error('Session changed during operation');await persist(mission);

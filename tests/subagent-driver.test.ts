@@ -65,7 +65,7 @@ test('resend steers a live session, and reopens a rejected one with the rejectio
   const rejected = worker({ error: 'edits outside the allowed paths (x)' });
   const second = port({ canResume: true });
   await second.driver.resend(mission(rejected), 'bd-1', bead('active', 'bd-1'));
-  expect(second.calls).toEqual(['resume:Your last result was rejected: edits outside the allowed paths (x). Fix that and finish by calling yield again.']);
+  expect(second.calls).toEqual(['resume:Your last result was rejected: edits outside the allowed paths (x). Finish by calling yield.']);
   expect(rejected.error).toBeUndefined();
   expect(rejected.state).toBe('running');
 
@@ -81,4 +81,45 @@ test('reap aborts the session and focus points at the Agent Hub instead of a tab
   expect(calls).toEqual(['abort']);
   expect(w.state).toBe('closed');
   await expect(driver.focus(worker())).rejects.toThrow(/Alt\+A/);
+});
+
+test('a stopped subagent worker becomes a resend action naming the reason, while other frontends still hold', async () => {
+  const { nextAction } = await import('../src/controller');
+  const snapshot = (): import('../src/types').Snapshot => ({ beads: [bead('active', 'bd-1'), { ...bead('ready'), id: 'bd-2' }], leaves: [bead('active', 'bd-1'), { ...bead('ready'), id: 'bd-2' }], ready: ['bd-2'], closed: 0, active: 1, blocked: 0, fetchedAt: Date.now() });
+  const policy = { owned: true, resumeHold: false, nativePlan: false, fresh: true, maxWorkers: 2 } as never;
+  const stopped = worker({ error: 'worker reported it is not done: blocked on X' });
+  const m = mission(stopped);
+  m.scopes = { 'bd-1': ['a/**'], 'bd-2': ['b/**'] };
+  m.epicId = 'epic';
+  const action = nextAction(m, snapshot(), policy);
+  expect(action.kind).toBe('resend');
+  expect(action.ids).toEqual(['bd-1']);
+  expect(action.detail).toContain('blocked on X');
+
+  const orca = mission(worker({ error: 'x', frontend: 'orca' }));
+  orca.scopes = m.scopes;
+  orca.epicId = 'epic';
+  expect(nextAction(orca, snapshot(), policy)).toMatchObject({ kind: 'hold' });
+});
+
+test('resend with guidance continues the stopped session with the rejection and the guidance together', async () => {
+  const w = worker({ error: 'edits outside the allowed paths (docs.txt)' });
+  const { driver, calls } = port({ canResume: true });
+  await driver.resend(mission(w), 'bd-1', bead('active', 'bd-1'), 'Leave docs.txt alone.');
+  expect(calls).toEqual(['resume:Your last result was rejected: edits outside the allowed paths (docs.txt). Leave docs.txt alone. Finish by calling yield.']);
+
+  const live = port({ live: true });
+  await live.driver.resend(mission(worker()), 'bd-1', bead('active', 'bd-1'), 'Use the v2 helper.');
+  expect(live.calls).toEqual(['steer:Use the v2 helper.']);
+});
+
+test('release gives the bead back: aborts, unclaims, and closes the worker record so a fresh one can start', async () => {
+  const w = worker({ error: 'worker reported it is not done: blocked' });
+  const { driver, calls } = port();
+  await driver.release(mission(w), 'bd-1', bead('active', 'bd-1'));
+  expect(calls).toEqual(['abort', 'release']);
+  expect(w.state).toBe('closed');
+  expect(w.error).toBe('released: worker reported it is not done: blocked');
+  await expect(driver.release(mission(worker()), 'bd-1', bead('active', 'someone-else'))).rejects.toThrow(/still claimed by its own worker/);
+  await expect(driver.release(mission(worker({ frontend: 'orca' })), 'bd-1', bead('active', 'bd-1'))).rejects.toThrow(/subagent worker/);
 });

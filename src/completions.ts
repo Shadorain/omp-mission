@@ -1,6 +1,6 @@
 export interface CompletionSource { id: string; title: string }
 export interface CompletionBead { id: string; title: string; category?: string }
-export interface CompletionWorker { beadId: string; state: string; handle?: boolean }
+export interface CompletionWorker { beadId: string; state: string; handle?: boolean; /** A subagent worker that stopped with an error and awaits guidance or release. */ stopped?: boolean }
 export interface MissionCompletionState {
 	sources: CompletionSource[];
 	beads: CompletionBead[];
@@ -17,7 +17,8 @@ const VERBS: Array<{ name: string; description: string }> = [
 	{ name: "review", description: "Request an independent review" },
 	{ name: "history", description: "Show bead history" },
 	{ name: "focus", description: "Focus the worker session" },
-	{ name: "resend", description: "Resend the assignment" },
+	{ name: "resend", description: "Resend the assignment, or guide a stopped subagent worker" },
+	{ name: "release", description: "Give a subagent worker's bead back for a fresh worker" },
 	{ name: "dispatch", description: "Dispatch the ready wave" },
 	{ name: "reap", description: "Close the worker session" },
 	{ name: "actions", description: "Open the action menu" },
@@ -149,11 +150,12 @@ function completeVerb(verb: string, rest: string[], partial: string, state: Miss
 		const items = beadItems(verb, state.beads, partial);
 		return items.length ? items : null;
 	}
-	if (verb === "focus" || verb === "resend" || verb === "reap") {
+	if (verb === "focus" || verb === "resend" || verb === "release" || verb === "reap") {
 		if (rest.length > 0) return null;
 		const workers = workerBeads(state, (worker, bead) => {
 			if (verb === "focus") return worker.handle === true;
-			if (verb === "resend") return worker.state === "awaiting-claim";
+			if (verb === "resend") return worker.state === "awaiting-claim" || worker.stopped === true;
+			if (verb === "release") return worker.stopped === true || worker.state === "running";
 			return worker.handle === true && (worker.state === "closed" || bead?.category === "closed");
 		});
 		const items = beadItems(verb, workers, partial);

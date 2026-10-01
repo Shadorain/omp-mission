@@ -38,7 +38,8 @@ Code: `src/subagent.ts` (`SubagentRunner`), driven by the worker driver through 
 - **Close.** On a clean, in-scope `done:true`, the runner runs `bd close` with summary and verification. The worker never runs `bd`.
 - **Chasing.** A session that stops without yielding gets up to two reminders, then is reported failed.
 - **Restart.** `refresh` finds a subagent worker whose session is gone but whose bead is still claimed by that worker. `SessionManager.open` reopens the transcript with the saved baseline; with no transcript the claim is released and the worker goes `missing`, so `recover` re-dispatches. A worker that failed on its own keeps its error and waits for the operator.
-- **Resend.** Live: `session.steer` with a one-line continue. Not live: reopen the saved session with the last rejection as the prompt.
+- **Resend.** Live: `session.steer` with the operator's guidance, else a one-line continue. Not live: reopen the saved session with the last rejection and the guidance as the prompt. A subagent worker with a stored error makes the next action `resend` (not the generic recovery hold).
+- **Release.** `release` aborts the session, runs `bd unclaim --if-assignee`, and closes the worker record; the bead returns to ready for a fresh dispatch.
 - **Focus / reap.** No tab. `focus` points at the Agent Hub; `reap` aborts a live session.
 - **Context.** `workerContext` picks the context files (`src/context.ts`); the bead title, description, and acceptance are inlined into the assignment.
 

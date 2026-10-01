@@ -53,6 +53,8 @@ export function nextAction(m: Mission, snapshot: Snapshot | undefined, policy: P
   const workers = m.workers.filter(worker => worker.state !== 'closed');
   const stalled = workers.filter(worker => worker.state === 'awaiting-claim' && !worker.error && worker.launchedAt && Date.now() - Date.parse(worker.launchedAt) > CLAIM_STALL_MS && snapshot.leaves.some(bead => bead.id === worker.beadId && bead.category === 'ready'));
   if (stalled.length) return {kind: 'resend', detail: `No claim ${Math.round(CLAIM_STALL_MS / 60000)}+ min after launch: ${stalled.map(worker => worker.beadId).join(', ')}. Inspect the tab, then resend once`, ids: stalled.map(worker => worker.beadId).sort()};
+  const stopped = workers.filter(worker => worker.frontend === 'subagent' && worker.error && worker.state !== 'missing');
+  if (stopped.length) return {kind: 'resend', detail: `Worker stopped: ${stopped.map(worker => `${worker.beadId} (${worker.error!.slice(0, 240)})`).join('; ')}`, ids: stopped.map(worker => worker.beadId).sort()};
   if (workers.some(worker => worker.state === 'missing' || worker.error)) return {kind: 'hold', detail: 'Worker identity or claim requires recovery'};
   const outstanding = snapshot.leaves.filter(bead => bead.category !== 'closed');
   if (outstanding.length) {
