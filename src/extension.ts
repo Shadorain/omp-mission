@@ -171,7 +171,9 @@ export default async function missionExtension(pi: ExtensionAPI) {
   try{await control({operation:'dispatch'},context);context.ui.notify(`Auto-dispatched ${action.ids?.join(', ')}`,'info');return true;}
   catch(error){autoBlocked=signature;context.ui.notify(`Auto-dispatch held, handing to the coordinator: ${error instanceof Error?error.message:String(error)}`,'warning');return false;}
  }
- async function wakeCoordinator(){if(quiet||!ctx||!mission||operation||!eligible(ctx)||!ctx.isIdle()||ctx.hasPendingMessages())return;const action=nextAction(mission,snapshot,policy(ctx));if(action.gate){mission.gate=action.gate;if(ownership&&!resumeHold)await persist(mission);await render();return;}if(action.kind==='hold')return;if(await autoDispatch(ctx,action))return;const signature=JSON.stringify([mission.id,mission.round,action.kind,action.ids,mission.evidence.verify?.revision,mission.reviews.length]);if(signature===lastWake)return;lastWake=signature;const view=withGuide(action,true)!;pi.sendUserMessage(`Mission: ${action.detail}${action.ids?.length?` [${action.ids.join(', ')}]`:''}. Next: ${action.kind}. ${view.guide??''}`.trim(),{deliverAs:'followUp',attribution:'agent'});}
+ async function wakeCoordinator(){if(quiet||!ctx||!mission||operation||!eligible(ctx))return;const action=nextAction(mission,snapshot,policy(ctx));if(action.gate){mission.gate=action.gate;if(ownership&&!resumeHold)await persist(mission);await render();return;}if(action.kind==='hold')return;if(await autoDispatch(ctx,action))return;
+ // Only the model needs an idle session with an empty queue. Dispatch above never touches it, so a stuck queue cannot stall the wave.
+ if(!ctx.isIdle()||ctx.hasPendingMessages())return;const signature=JSON.stringify([mission.id,mission.round,action.kind,action.ids,mission.evidence.verify?.revision,mission.reviews.length]);if(signature===lastWake)return;lastWake=signature;const view=withGuide(action,true)!;pi.sendUserMessage(`Mission: ${action.detail}${action.ids?.length?` [${action.ids.join(', ')}]`:''}. Next: ${action.kind}. ${view.guide??''}`.trim(),{attribution:'agent'});}
  async function request(context:ExtensionContext,op:string,extra:Record<string,unknown>={}){
   if(!eligible(context))throw new Error('Mission coordinator only');
   await control({operation:op,...extra},context);
@@ -429,7 +431,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
      requireBeadsGraph(mission);if(!params.beadId)throw new Error('beadId required');await refresh(false);
      const bead=snapshot?.beads.find(b=>b.id===params.beadId);if(!bead||snapshot?.error)throw new Error('Fresh mission bead required');
      if(params.operation==='resend')await driver.resend(mission,params.beadId,bead,params.detail);
-     else if(params.operation==='release')await driver.release(mission,params.beadId,bead);
+     else if(params.operation==='release'){await driver.release(mission,params.beadId,bead);await refresh(false);}
      else await driver.reap(mission,params.beadId,bead);
     }
     if(epoch!==generation)throw new Error('Session changed during operation');await persist(mission);

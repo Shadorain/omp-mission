@@ -15,7 +15,7 @@ type Execute = (id: string, params: Params, signal: undefined, update: undefined
 type EventHandler = (event: unknown, context: ExtensionContext) => Promise<void>;
 const noRun: Run = async () => { throw new Error('Unexpected command'); };
 
-async function fixture(graph: Graph, leaves = true) {
+async function fixture(graph: Graph, leaves = true, host: { idle?: boolean; pending?: boolean } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'mission-lifecycle-'));
   const cwd = join(root, 'workspace');
   await mkdir(cwd);
@@ -40,6 +40,7 @@ async function fixture(graph: Graph, leaves = true) {
   const tools = new Map<string, Execute>();
   let commandHandler: ((args: string, context: ExtensionContext) => Promise<void>) | undefined;
   const sent: string[] = [];
+  const sentOptions: unknown[] = [];
   const notices: string[] = [];
   const events = new Map<string, EventHandler>();
   let active: string[] = [];
@@ -49,7 +50,7 @@ async function fixture(graph: Graph, leaves = true) {
     agent: { kind: 'main' }, cwd, hasUI: false,
     sessionManager: { getBranch: () => [{ type: 'custom', customType: 'mission:pointer', data: { path } }], getSessionName: () => undefined },
     ui: { notify: (message: string) => { notices.push(message); }, setWidget: () => {} },
-    isIdle: () => false, hasPendingMessages: () => false,
+    isIdle: () => host.idle ?? false, hasPendingMessages: () => host.pending ?? false,
     setInterval: () => 1, clearTimer: () => {},
   } as unknown as ExtensionContext;
   const api = {
@@ -60,7 +61,7 @@ async function fixture(graph: Graph, leaves = true) {
     registerCommand: (_name: string, spec: { handler: (args: string, context: ExtensionContext) => Promise<void> }) => { commandHandler = spec.handler; }, registerShortcut: () => {},
     on: (name: string, handler: EventHandler) => events.set(name, handler), events: { on: () => {} },
     getActiveTools: () => active, setActiveTools: async (names: string[]) => { active = names; },
-    appendEntry: () => {}, sendUserMessage: (message: string) => { sent.push(message); },
+    appendEntry: () => {}, sendUserMessage: (message: string, options?: unknown) => { sent.push(message); sentOptions.push(options); },
     exec: async (command: string, args: string[]) => {
       const bdIndex = args.indexOf('bd');
       if (command === 'env' && bdIndex >= 0) args = args.slice(bdIndex + 1);
@@ -89,7 +90,7 @@ async function fixture(graph: Graph, leaves = true) {
   const execute = (params: Params) => control('test', params, undefined, undefined, context);
   await execute({ operation: 'continue' });
   return {
-    command: async (args: string) => { await commandHandler!(args, context); }, sent, notices,
+    command: async (args: string) => { await commandHandler!(args, context); }, sent, sentOptions, notices,
     execute, cwd, state: () => loadMission(path),
     dispose: async () => { try { await shutdown({}, context); } finally { await rm(root, { recursive: true, force: true }); } },
   };
@@ -151,4 +152,18 @@ test('operator commands run the control operation directly instead of asking the
     expect(mission.notices.some(message => message.startsWith('Mission continue done'))).toBe(true);
     expect((await mission.state()).phase).toBe('execute');
   } finally { await mission.dispose(); }
+});
+
+test('an idle session is woken with a plain prompt, never a queued follow-up that nothing would drain', async () => {
+  const mission = await fixture('beads', true, { idle: true });
+  try {
+    expect(mission.sent).toHaveLength(1);
+    expect(mission.sent[0]).toContain('Next: verify');
+    expect(mission.sentOptions[0]).toEqual({ attribution: 'agent' });
+  } finally { await mission.dispose(); }
+});
+
+test('a queued message keeps the model from being woken again', async () => {
+  const mission = await fixture('beads', true, { idle: true, pending: true });
+  try { expect(mission.sent).toEqual([]); } finally { await mission.dispose(); }
 });
