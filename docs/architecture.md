@@ -30,6 +30,14 @@ Two graph kinds. `local`: work happens in the coordinator pane, no workers. `bea
 - **Pause mode**: each wave, review, and repair acceptance needs an approved gate. A gate token binds to the exact scope, so a changed scope invalidates approval.
 - **Native approval**: `mission_control` is an `exec` tool. Its approval prompt is part of the model-initiated path.
 
+## Automatic start
+
+Approving the plan is the approval to start. A `before_agent_start` hook sees the synthetic `Plan approved.` prompt (or the first message of a `--force` start) and, before the first execution turn, runs `start`. For a beads graph it also runs `bind_workspace` in reuse-only mode: a checkout whose branch or path already names the ticket is bound, with its bead database; a worktree is never created here. The hook returns one message with the result and the next step's guide, and records the wake signature so the model is not woken twice. Any failure is reported in that message and the model falls back to the manual operation. The hook never changes the system prompt.
+
+## Compaction
+
+`session.compacting` pins mission essentials into the summary (ticket file path, phase, epic, checkout, open workers, unfinished beads), because the summarizer is lossy. The ticket file is rewritten at that point if /tmp was cleaned. `session_compact` forgets which guides were sent, so the next result re-teaches the current step.
+
 ## Two entry paths
 
 - Model: `mission_control` tool, native approval, brief result.

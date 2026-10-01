@@ -22,4 +22,4 @@ export interface SubagentRow { id: string; name: string; kind: 'task' | 'eval'; 
 export interface MissionConfig { version: 1; controls: boolean; maxWorkers: number; frontend: Frontend; graph: Graph; modelRole: string; workerRole: string; autoDispatch: boolean; customCommand?: string; keys: { expand: string | null; fullscreen: string | null; mode: string | null } }
 export interface Projection { mission: Mission; snapshot?: Snapshot; resumeHold: boolean; ownershipError?: string; selected?: string; history?: AuditEvent[]; expanded?: boolean; outlineOffset?: number; nativePlan?: boolean; nextAction?: string; frontend?: Frontend; expandKey?: string | null; subagents?: SubagentRow[] }
 export interface PolicyContext { resumeHold: boolean; owned: boolean; nativePlan: boolean; fresh: boolean; maxWorkers: number }
-export interface Action { kind: 'hold' | 'dispatch' | 'resend' | 'verify' | 'deliver' | 'review' | 'repairs' | 'complete'; detail: string; ids?: string[]; gate?: Gate }
+export interface Action { kind: 'hold' | 'isolate' | 'graph' | 'dispatch' | 'resend' | 'verify' | 'deliver' | 'review' | 'repairs' | 'complete'; detail: string; ids?: string[]; gate?: Gate }

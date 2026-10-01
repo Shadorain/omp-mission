@@ -74,3 +74,11 @@ test('a missing bead database is reported with the init command, never initialis
   await expect(discoverBeadsDir(async () => ({ stdout: '', stderr: 'no database', code: 1 }), repo)).rejects.toThrow(/bd init --stealth/);
   expect(await discoverBeadsDir(async () => ({ stdout: JSON.stringify({ path: root }), stderr: '', code: 0 }), repo)).toBe(root);
 });
+
+test('reuse-only mode never creates a worktree, but still reuses a checkout that fits', async () => {
+  await expect(isolateCheckout(run, { source: linear('CHR-9'), start: repo, base: 'main', create: false })).rejects.toThrow(/created explicitly/);
+  expect(await run('git', ['worktree', 'list'], repo).then(r => r.stdout.trim().split('\n').length)).toBe(1);
+  const ticket = join(root, 'ticket');
+  await git(repo, 'worktree', 'add', '-q', '-b', 'chr-9-feature', ticket);
+  expect(await isolateCheckout(run, { source: linear('CHR-9'), start: ticket, create: false })).toMatchObject({ cwd: await realpath(ticket), created: false });
+});

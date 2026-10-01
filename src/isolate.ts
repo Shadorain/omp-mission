@@ -9,6 +9,8 @@ export interface IsolateInput {
 	start: string;
 	base?: string;
 	delivery?: 'pr' | 'local';
+	/** False: only reuse a checkout that already fits; never create a worktree. */
+	create?: boolean;
 }
 export interface Isolated { cwd: string; base?: string; delivery: 'pr' | 'local'; created: boolean }
 
@@ -39,6 +41,7 @@ export async function isolateCheckout(run: Run, input: IsolateInput): Promise<Is
 	if (!primaryCheckout(workspace)) {
 		throw new Error(`Checkout ${workspace.cwd} is a linked worktree that does not belong to ${source.id}; pass cwd of the ticket checkout, or start from the primary checkout`);
 	}
+	if (input.create === false) throw new Error(`No existing checkout for ${source.id}; a mission worktree must be created explicitly`);
 	if (!workspace.base) throw new Error('Repository base branch unresolved; pass base explicitly');
 	const slug = branchSlug(source);
 	if (!slug) throw new Error(`Cannot derive a branch name from ${source.id}`);

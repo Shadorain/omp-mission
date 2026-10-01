@@ -19,6 +19,7 @@ import { createMissionWidget, createMissionInspector } from './ui';
 import { briefView, statusView, type NextView } from './status';
 import { missionArgumentCompletions, type MissionCompletionState } from './completions';
 import { discoverBeadsDir, isolateCheckout } from './isolate';
+import { sourceFilePath, writeSourceFile } from './hosts';
 import { noteSubagentSpawn, noteSubagentToolEnd, noteSubagentToolStart, noteSubagentTurnEnd } from './subagents';
 
 const controls = ['show','continue','mode','approve','review','history','focus','resend','dispatch','reap','actions','config'];
@@ -35,7 +36,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
  try{config=await readMissionConfig(agentDir);}catch(error){configError=String(error);config={version:1,controls:false,maxWorkers:2,frontend:'none',graph:'local',modelRole:'default',workerRole:'default',autoDispatch:false,keys:{expand:null,fullscreen:null,mode:null}};}
  let ctx:ExtensionContext|undefined;let mission:Mission|undefined;let path:string|undefined;let pending:Mission|undefined;
  let snapshot:Snapshot|undefined;let ownership:Ownership|undefined;let resumeHold=true;let ownershipError:string|undefined;
- let generation=0;let refreshing=false;let lastPoll=0;let lastWake='';let autoBlocked='';let expanded=false;let outlineOffset=0;let selected:string|undefined;let history:Projection['history'];let timer:Timer|undefined;let overlayAbort:AbortController|undefined;let operation=false;let terminalInputDispose:(()=>void)|undefined;let subagents:SubagentRow[]=[];
+ let generation=0;let refreshing=false;let lastPoll=0;let lastWake='';let autoBlocked='';let quiet=false;let expanded=false;let outlineOffset=0;let selected:string|undefined;let history:Projection['history'];let timer:Timer|undefined;let overlayAbort:AbortController|undefined;let operation=false;let terminalInputDispose:(()=>void)|undefined;let subagents:SubagentRow[]=[];
  let lifetime=new AbortController();let operationSignal:AbortSignal|undefined;
  let inspectionIntent:{mode?:Mode;reviewRequested?:boolean}={};
  const reviewer=new Reviewer();
@@ -165,7 +166,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
   try{await control({operation:'dispatch'},context);context.ui.notify(`Auto-dispatched ${action.ids?.join(', ')}`,'info');return true;}
   catch(error){autoBlocked=signature;context.ui.notify(`Auto-dispatch held, handing to the coordinator: ${error instanceof Error?error.message:String(error)}`,'warning');return false;}
  }
- async function wakeCoordinator(){if(!ctx||!mission||operation||!eligible(ctx)||!ctx.isIdle()||ctx.hasPendingMessages())return;const action=nextAction(mission,snapshot,policy(ctx));if(action.gate){mission.gate=action.gate;if(ownership&&!resumeHold)await persist(mission);await render();return;}if(action.kind==='hold')return;if(await autoDispatch(ctx,action))return;const signature=JSON.stringify([mission.id,mission.round,action.kind,action.ids,mission.evidence.verify?.revision,mission.reviews.length]);if(signature===lastWake)return;lastWake=signature;const view=withGuide(action,true)!;pi.sendUserMessage(`Mission: ${action.detail}${action.ids?.length?` [${action.ids.join(', ')}]`:''}. Next: ${action.kind}. ${view.guide??''}`.trim(),{deliverAs:'followUp',attribution:'agent'});}
+ async function wakeCoordinator(){if(quiet||!ctx||!mission||operation||!eligible(ctx)||!ctx.isIdle()||ctx.hasPendingMessages())return;const action=nextAction(mission,snapshot,policy(ctx));if(action.gate){mission.gate=action.gate;if(ownership&&!resumeHold)await persist(mission);await render();return;}if(action.kind==='hold')return;if(await autoDispatch(ctx,action))return;const signature=JSON.stringify([mission.id,mission.round,action.kind,action.ids,mission.evidence.verify?.revision,mission.reviews.length]);if(signature===lastWake)return;lastWake=signature;const view=withGuide(action,true)!;pi.sendUserMessage(`Mission: ${action.detail}${action.ids?.length?` [${action.ids.join(', ')}]`:''}. Next: ${action.kind}. ${view.guide??''}`.trim(),{deliverAs:'followUp',attribution:'agent'});}
  async function request(context:ExtensionContext,op:string,extra:Record<string,unknown>={}){
   if(!eligible(context))throw new Error('Mission coordinator only');
   await control({operation:op,...extra},context);
@@ -314,12 +315,12 @@ export default async function missionExtension(pi: ExtensionAPI) {
   beadId:z.string().optional(),detail:z.string().optional(),passed:z.boolean().optional(),url:z.string().optional(),
   mode:z.enum(['auto','pause','force']).optional(),keep:z.boolean().optional(),findingId:z.string().optional()
  });
- async function control(rawParams:unknown,context:ExtensionContext,_signal?:AbortSignal){
+ async function control(rawParams:unknown,context:ExtensionContext,_signal?:AbortSignal,internal:{reuseOnly?:boolean}={}){
   const params=controlSchema.parse(rawParams);
   if(!eligible(context)||nativePlan(context))throw new Error('Mission mutations are forbidden for children or native plan mode');if(operation)throw new Error('Mission operation already running');operation=true;operationSignal=_signal;ctx=context;const epoch=generation;let reviewStarted=false;
   const cancelReview=()=>{void reviewer.dispose();};_signal?.addEventListener('abort',cancelReview,{once:true});
   try{
-   if(params.operation==='start'){if(mission)throw new Error('Mission already started');if(!pending)throw new Error('Resolve /mission source first');mission=pending;pending=undefined;path=missionPath(agentDir,mission);await acquire();resumeHold=false;mission.phase='isolate';mission.evidence.plan={outcome:'passed',detail:'Operator approved plan or explicit Force start',at:new Date().toISOString()};await persist(mission);pi.appendEntry('mission:pointer',{path});}
+   if(params.operation==='start'){if(mission)throw new Error('Mission already started');if(!pending)throw new Error('Resolve /mission source first');mission=pending;pending=undefined;path=missionPath(agentDir,mission);await acquire();resumeHold=false;mission.phase='isolate';mission.evidence.plan={outcome:'passed',detail:'Operator approved plan or explicit Force start',at:new Date().toISOString()};await persist(mission);pi.appendEntry('mission:pointer',{path});await writeSourceFile(mission);}
    else if(params.operation==='continue'){
     if(!mission)throw new Error('No saved mission');await acquire();const mode=params.mode??inspectionIntent.mode;if(mode)setMode(mission,mode);
     if(inspectionIntent.reviewRequested){mission.reviewRequested=true;if(mission.evidence.review?.outcome==='failed')delete mission.evidence.review;}
@@ -329,7 +330,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
     if(!mission)throw new Error('No active mission');enforceMutation(mission,policy(context));await ownership!.assertOwned();
     if(params.operation==='bind_workspace'){
      let {cwd,beadsDir,delivery,base}=params;let note='';
-     if(!cwd){const isolated=await isolateCheckout(run,{source:mission.source,start:mission.workspace.cwd,base,delivery});cwd=isolated.cwd;base??=isolated.base;delivery??=isolated.delivery;note=`${isolated.created?'created':'reusing'} ${cwd}`;}
+     if(!cwd){const isolated=await isolateCheckout(run,{source:mission.source,start:mission.workspace.cwd,base,delivery,create:!internal.reuseOnly});cwd=isolated.cwd;base??=isolated.base;delivery??=isolated.delivery;note=`${isolated.created?'created':'reusing'} ${cwd}`;}
      else if(!delivery&&mission.source.kind==='freeform')delivery='local';
      beadsDir??=await discoverBeadsDir(run,cwd);
      const workspace=await inspectWorkspace(cwd,run,{explicitBase:base,delivery,githubRepo:mission.source.repo});if(workspace.key!==mission.workspace.key)throw new Error('Workspace repository identity differs');if(workspace.commonDir&&!workspace.base)throw new Error('Repository base unresolved');const bd=await run('bd',['--readonly','where','--json'],workspace.cwd,{BEADS_DIR:beadsDir});if(bd.code)throw new Error(bd.stderr||'Bead database unreachable');const where=JSON.parse(bd.stdout);if(await realpath(where.path)!==await realpath(beadsDir))throw new Error('BEADS_DIR does not match canonical database');workspace.beadsDir=await realpath(beadsDir);mission.workspace=workspace;mission.phase='graph';mission.evidence.isolate={outcome:'passed',detail:params.detail??(note||workspace.cwd),at:new Date().toISOString()};
@@ -436,6 +437,41 @@ export default async function missionExtension(pi: ExtensionAPI) {
  pi.on('input',(event,context)=>{if(!eligible(context)||event.text.trim().split(/\s+/)[0]!=='/mission')return;const args=event.text.trim().slice('/mission'.length);const verb=args.trim().split(/\s+/)[0];if(controls.includes(verb??'')||mission)return;try{if(!parseMissionInput(args).force&&!nativePlan(context))return {text:`/plan ${event.text}`};}catch{ return; }});
  pi.on('session_start',async(_event,context)=>restore(context));pi.on('session_switch',async(_event,context)=>restore(context));pi.on('session_branch',async(_event,context)=>restore(context));pi.on('session_shutdown',async()=>detach());
  pi.on('auto_compaction_end',async(_event,context)=>{ctx=context;await render();});
+ // Approving the plan is the approval to start. Start (and bind a checkout that already belongs to the ticket)
+ // before the first execution turn, and hand the model its next step in the same turn.
+ pi.on('before_agent_start',async(event,context)=>{
+  if(!eligible(context)||mission||!pending||nativePlan(context))return;
+  if(!event.prompt.startsWith('Plan approved.')&&!event.prompt.includes('Mission pending recovery JSON'))return;
+  const notes:string[]=[];quiet=true;
+  try{
+   await control({operation:'start'},context);notes.push('Mission started.');
+   const started=mission as Mission|undefined;
+   if(started&&effectiveGraph(started)==='beads'){
+    try{await control({operation:'bind_workspace'},context,undefined,{reuseOnly:true});const bound=mission as Mission|undefined;if(bound)notes.push(`Checkout bound: ${bound.workspace.cwd}, delivery ${bound.workspace.delivery}, beads ${bound.workspace.beadsDir}.`);}
+    catch(error){notes.push(`Checkout not bound automatically (${error instanceof Error?error.message:String(error)}).`);}
+   }
+  }catch(error){context.ui.notify(`Mission did not start: ${error instanceof Error?error.message:String(error)}`,'error');return;}
+  finally{quiet=false;}
+  const current=mission as Mission|undefined;if(!current)return;
+  const action=nextAction(current,snapshot,policy(context));
+  lastWake=JSON.stringify([current.id,current.round,action.kind,action.ids,current.evidence.verify?.revision,current.reviews.length]);
+  const view=withGuide(action,true);
+  return {message:{customType:'mission:started',content:`${notes.join(' ')} Next: ${action.kind}. ${view?.guide??action.detail}`,display:false}};
+ });
+ // Pin what a lossy summary must not lose, and re-teach the current step afterwards.
+ pi.on('session.compacting',async()=>{
+  const m=mission as Mission|undefined;if(!m)return;
+  await writeSourceFile(m).catch(()=>{});
+  const open=m.workers.filter(w=>w.state!=='closed').map(w=>`${w.beadId}:${w.state}`).join(', ')||'none';
+  const waiting=snapshot?.leaves.filter(b=>b.category!=='closed').map(b=>`${b.id}:${b.category}`).join(', ')||'none';
+  return {context:[
+   `Mission ${m.id} (${displaySourceId(m.source)}): ${m.source.title}. The full ticket is in ${sourceFilePath(m)}; it is not in this summary, read it when needed.`,
+   `Phase ${m.phase}, mode ${m.mode}, graph ${effectiveGraph(m)}, epic ${m.epicId??'unbound'}, round ${m.round}. Checkout ${m.workspace.cwd}${m.workspace.branch?` on ${m.workspace.branch}`:''}, base ${m.workspace.base??'none'}, delivery ${m.workspace.delivery}.`,
+   `Open workers: ${open}. Unfinished beads: ${waiting}.`,
+   'Call mission_status for evidence and review findings, then follow the next-step guidance it returns.',
+  ]};
+ });
+ pi.on('session_compact',()=>{guided='';});
  pi.on('before_subagent_spawn',(event)=>{subagents=noteSubagentSpawn(subagents,{agent:event.agent,invocationKind:event.invocationKind,spawnKey:event.spawnKey});void render();});
  pi.on('tool_execution_start',(event)=>{subagents=noteSubagentToolStart(subagents,event);void render();});
  pi.on('tool_execution_end',(event)=>{subagents=noteSubagentToolEnd(subagents,event);void render();});

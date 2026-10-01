@@ -47,7 +47,7 @@ export function nextAction(m: Mission, snapshot: Snapshot | undefined, policy: P
  if (local) {
   if (m.workers.length) return {kind: 'hold', detail: 'Local graph cannot own bead workers'};
  } else {
-  if (!m.epicId) return {kind: 'hold', detail: 'Bind workspace and task graph'};
+  if (!m.epicId) return m.phase === 'isolate' ? {kind: 'isolate', detail: 'Bind the ticket checkout and bead database'} : {kind: 'graph', detail: 'Create the epic and scoped leaves, then bind them'};
   if (!snapshot || !policy.fresh || snapshot.error) return {kind: 'hold', detail: snapshot?.error ?? 'Fresh graph required'};
   if (!snapshot.leaves.length) return {kind: 'hold', detail: 'Graph has no implementation leaves'};
   const workers = m.workers.filter(worker => worker.state !== 'closed');
