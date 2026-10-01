@@ -66,6 +66,16 @@ export function pickRoleModel<T extends ModelRef>(value: string | undefined, mod
  }
  return undefined;
 }
+// The thinking level a role value carries (`provider/id:high` -> `high`), for the first entry that names an available model.
+export function roleThinkingLevel(value: string | undefined): string | undefined {
+ for (const raw of (value ?? '').split(',')) {
+  const spec = raw.trim();
+  const cut = spec.lastIndexOf(':');
+  if (cut > 0 && LEVELS.has(spec.slice(cut + 1))) return spec.slice(cut + 1);
+  if (spec) return undefined;
+ }
+ return undefined;
+}
 // The model string a role names (`provider/id[:level]`), or undefined for `default`, which means "inherit".
 export function roleModelString(role: string): string | undefined {
  if (role === 'default') return undefined;

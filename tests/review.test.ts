@@ -47,3 +47,12 @@ test('review parsing rejects malformed responses, mismatched revisions and dupli
   expect(() => parseReview(JSON.stringify({reviewedRevision:'old',summary:'Clean',findings:[]}), 'r')).toThrow();
   expect(() => parseReview(JSON.stringify({reviewedRevision:'r',summary:'Defects',findings:[finding,finding]}), 'r')).toThrow();
 });
+
+test('roleThinkingLevel reads the level suffix from a role value', async () => {
+  const { roleThinkingLevel } = await import('../src/review');
+  expect(roleThinkingLevel('devin/swe-2:high')).toBe('high');
+  expect(roleThinkingLevel('a/x:low, b/y:max')).toBe('low');
+  expect(roleThinkingLevel('devin/swe-2')).toBeUndefined();
+  expect(roleThinkingLevel(undefined)).toBeUndefined();
+  expect(roleThinkingLevel('')).toBeUndefined();
+});

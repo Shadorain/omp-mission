@@ -3,7 +3,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { AgentRegistry, createAgentSession, SessionManager, Settings, type ExtensionContext } from '@oh-my-pi/pi-coding-agent';
 import { contextFilesFor, type ContextFile } from './context';
-import { pickRoleModel, roleModelString } from './review';
+import { pickRoleModel, roleModelString, roleThinkingLevel } from './review';
 import { outOfScope } from './scope';
 import { sourceFilePath } from './hosts';
 import type { MissionConfig, Mission, Run, Worker } from './types';
@@ -22,6 +22,7 @@ export interface SessionRequest {
 	worker: Worker;
 	ctx: ExtensionContext;
 	model: NonNullable<ExtensionContext['model']>;
+	thinkingLevel?: string;
 	system: string;
 	contextFiles: ContextFile[] | undefined;
 	/** Existing session file to reopen after a restart. */
@@ -119,7 +120,7 @@ const defaultFactory: SessionFactory = async request => {
 	const { ctx, model } = request;
 	const manager = request.resumeFile ? await SessionManager.open(request.resumeFile) : SessionManager.create(request.worker.cwd, request.sessionDir);
 	const { session } = await createAgentSession({
-		cwd: request.worker.cwd, authStorage: ctx.modelRegistry.authStorage, modelRegistry: ctx.modelRegistry, model,
+		cwd: request.worker.cwd, authStorage: ctx.modelRegistry.authStorage, modelRegistry: ctx.modelRegistry, model, ...(request.thinkingLevel ? { thinkingLevel: request.thinkingLevel as never } : {}),
 		...(request.contextFiles ? { contextFiles: request.contextFiles } : {}),
 		appendSystemPrompt: request.system,
 		hasUI: false, enableLsp: false, enableMCP: false, enableIrc: false, skipPythonPreflight: true,
@@ -204,7 +205,10 @@ export class SubagentRunner implements SubagentPort {
 		const ctx = this.#o.context();
 		if (!ctx?.model || !ctx.modelRegistry) throw new Error('coordinator model/registry unavailable');
 		const config = this.#o.config();
-		const model = pickRoleModel(roleModelString(config.workerRole), ctx.modelRegistry.getAvailable()) ?? ctx.model;
+		const roleValue = roleModelString(config.workerRole);
+		const picked = pickRoleModel(roleValue, ctx.modelRegistry.getAvailable());
+		const model = picked ?? ctx.model;
+		const thinkingLevel = picked ? roleThinkingLevel(roleValue) : undefined;
 		const dir = this.#dir(mission);
 		await mkdir(dir, { recursive: true });
 		const baselineFile = this.#baselineFile(mission, worker);
@@ -212,7 +216,7 @@ export class SubagentRunner implements SubagentPort {
 		if (resumeFile && existsSync(baselineFile)) baseline = JSON.parse(await readFile(baselineFile, 'utf8')) as Record<string, string>;
 		else { baseline = await snapshotChanges(this.#o.run, worker.cwd); await writeFile(baselineFile, JSON.stringify(baseline)); }
 		const contextFiles = await contextFilesFor(config.workerContext, worker.cwd, this.#o.agentDir);
-		const { session, file } = await this.#factory({ mission, worker, ctx, model, system: WORKER_SYSTEM, contextFiles, resumeFile, sessionDir: dir });
+		const { session, file } = await this.#factory({ mission, worker, ctx, model, system: WORKER_SYSTEM, contextFiles, resumeFile, sessionDir: dir, thinkingLevel });
 		const live: Live = { beadId: worker.beadId, session, baseline, concurrent: new Set(), aborting: false, done: Promise.resolve() };
 		for (const other of this.#live.values()) { other.concurrent.add(worker.beadId); live.concurrent.add(other.beadId); }
 		this.#live.set(worker.beadId, live);
