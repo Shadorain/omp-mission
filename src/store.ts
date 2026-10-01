@@ -239,6 +239,9 @@ export async function acquireOwnership(
       compromised = true;
       onCompromised(error);
     },
+  }).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ELOCKED") throw Object.assign(new Error("Another OMP session controls this mission. If that session crashed, its lock expires after 30 seconds: retry /mission continue then."), { code: "ELOCKED" });
+    throw error;
   });
   const nonce = randomUUID();
   let ownedMission: Mission;

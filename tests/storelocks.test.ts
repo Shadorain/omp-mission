@@ -192,7 +192,7 @@ describe("acquireOwnership", () => {
     const dir = join(root, "missions", "ws1"); mkdirSync(dir, { recursive: true });
     const p = join(dir, "m.json");
     const o1 = await acquireOwnership(p, mkMission("m"));
-    await expect(acquireOwnership(p, mkMission("m"))).rejects.toThrow(/held|ELOCKED/);
+    await expect(acquireOwnership(p, mkMission("m"))).rejects.toMatchObject({ code: "ELOCKED" });
     await o1.release();
     const o2 = await acquireOwnership(p, mkMission("m"));
     expect(o2.nonce).not.toBe(o1.nonce);
@@ -222,7 +222,7 @@ describe("acquireOwnership", () => {
       if (value) out += decoder.decode(value);
     }
     expect(out).toContain("ACQUIRED");
-    await expect(acquireOwnership(p, mkMission("m"))).rejects.toThrow(/held|ELOCKED/);
+    await expect(acquireOwnership(p, mkMission("m"))).rejects.toMatchObject({ code: "ELOCKED" });
     proc.kill(9);
     rmSync(root, { recursive: true, force: true });
   });
@@ -232,7 +232,7 @@ describe("acquireOwnership", () => {
     const p = join(dir, "m.json");
     writeFileSync(p, JSON.stringify(mkMission("m")));
     mkdirSync(p + ".lock");
-    await expect(acquireOwnership(p, mkMission("m"))).rejects.toThrow(/held|ELOCKED/);
+    await expect(acquireOwnership(p, mkMission("m"))).rejects.toMatchObject({ code: "ELOCKED" });
     // Backdating mtime exercises the stale-takeover path without a real 30s wait.
     utimesSync(p + ".lock", new Date(Date.now() - 31_000), new Date(Date.now() - 31_000));
     const o = await acquireOwnership(p, mkMission("m"));
@@ -317,7 +317,7 @@ describe("acquireOwnership", () => {
     const rp = join(real, "missions", "ws1", "m.json");
     const lp = join(link, "missions", "ws1", "m.json");
     const o = await acquireOwnership(rp, mkMission("m"));
-    await expect(acquireOwnership(lp, mkMission("m"))).rejects.toThrow(/held|ELOCKED/);
+    await expect(acquireOwnership(lp, mkMission("m"))).rejects.toMatchObject({ code: "ELOCKED" });
     await o.release();
     rmSync(root, { recursive: true, force: true });
   });

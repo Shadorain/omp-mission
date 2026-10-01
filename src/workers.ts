@@ -12,7 +12,7 @@ export interface SubagentPort {
   release(mission: Mission, worker: Worker): Promise<void>;
   abort(beadId: string): Promise<void>;
 }
-export interface WorkerHooks { persist(mission: Mission): Promise<void>; subagent?: SubagentPort; prompt?(mission: Mission, worker: Worker, task?: string): string; agentDir?: string; model?: () => string | undefined; frontend?: Frontend | (() => Frontend); customCommand?: string | (() => string | undefined) }
+export interface WorkerHooks { persist(mission: Mission): Promise<void>; subagent?: SubagentPort; /** False while this session may not mutate the mission (no ownership, resume hold, plan mode). Reopening or releasing a subagent session mutates beads, so it waits. */ canMutate?: () => boolean; prompt?(mission: Mission, worker: Worker, task?: string): string; agentDir?: string; model?: () => string | undefined; frontend?: Frontend | (() => Frontend); customCommand?: string | (() => string | undefined) }
 export interface WorkerDriver {
   dispatch(mission: Mission, assignments: WorkerAssignment[] | string[]): Promise<Worker[]>;
   reconcile(mission: Mission, beadStates: Map<string, Bead>): Promise<Worker[]>;
@@ -297,7 +297,7 @@ export function createWorkerDriver(run: Run, hooks: WorkerHooks): WorkerDriver {
             // A restart killed the in-process session while it held the claim: reopen its transcript,
             // or give the bead back. A worker that failed on its own (error set) waits for the operator.
             if (hostOf(worker) === 'subagent' && hooks.subagent && bead.category === 'active' && bead.claimActor === worker.beadId) {
-              if (worker.error) continue; // rejected result: keep the reason for resend
+              if (worker.error || hooks.canMutate?.() === false) continue; // rejected result keeps its reason; a non-owning or held session only observes
               if (await hooks.subagent.resume(mission, worker)) { worker.state = 'running'; changed.push(worker); continue; }
               await hooks.subagent.release(mission, worker).catch(() => {});
             }

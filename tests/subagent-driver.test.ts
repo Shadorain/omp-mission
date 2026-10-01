@@ -128,3 +128,24 @@ test('release gives the bead back: aborts, unclaims, and closes the worker recor
   await expect(driver.release(mission(worker()), 'bd-1', bead('active', 'someone-else'))).rejects.toThrow(/still claimed by its own worker/);
   await expect(driver.release(mission(worker({ frontend: 'orca' })), 'bd-1', bead('active', 'bd-1'))).rejects.toThrow(/subagent worker/);
 });
+
+test('a session that may not mutate the mission never reopens or releases a worker', async () => {
+  const w = worker();
+  const calls: string[] = [];
+  const subagent: SubagentPort = {
+    async launch() { return { handle: 'bd-1', incarnationId: '/s/bd-1.jsonl' }; },
+    isLive: () => false,
+    async steer() {},
+    async resume() { calls.push('resume'); return true; },
+    async release() { calls.push('release'); },
+    async abort() {},
+  };
+  let allowed = false;
+  const driver = createWorkerDriver(run, { persist: async () => {}, subagent, frontend: 'subagent', canMutate: () => allowed });
+  await driver.reconcile(mission(w), new Map([['bd-1', bead('active', 'bd-1')]]));
+  expect(calls).toEqual([]);
+  expect(w.state).toBe('running');
+  allowed = true;
+  await driver.reconcile(mission(w), new Map([['bd-1', bead('active', 'bd-1')]]));
+  expect(calls).toEqual(['resume']);
+});
