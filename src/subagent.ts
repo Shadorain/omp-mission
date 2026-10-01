@@ -1,6 +1,6 @@
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { AgentRegistry, createAgentSession, SessionManager, Settings, type ExtensionContext } from '@oh-my-pi/pi-coding-agent';
 import { contextFilesFor, type ContextFile } from './context';
 import { pickRoleModel, roleModelString, roleThinkingLevel } from './review';
@@ -107,6 +107,23 @@ export async function snapshotChanges(run: Run, cwd: string): Promise<Record<str
 		chunk.forEach((path, i) => { snapshot[path] = hashes[i] ?? ''; });
 	}
 	return snapshot;
+}
+
+/** Everything a worker's mutating tools were asked to touch, as one string: the evidence for who made a stray file. */
+export function mutationText(messages: readonly unknown[]): string {
+	const parts: string[] = [];
+	for (const message of messages) {
+		const content = (message as { role?: string; content?: unknown }).content;
+		if (!Array.isArray(content)) continue;
+		for (const block of content as Array<{ type?: string; name?: string; arguments?: unknown }>) {
+			if (block.type === 'toolCall' && (block.name === 'edit' || block.name === 'write' || block.name === 'bash')) parts.push(JSON.stringify(block.arguments ?? {}));
+		}
+	}
+	return parts.join('\n');
+}
+
+function mentions(text: string, path: string): boolean {
+	return text.includes(path) || text.includes(basename(path));
 }
 
 export function changedSince(before: Record<string, string>, after: Record<string, string>): string[] {
@@ -237,10 +254,19 @@ export class SubagentRunner implements SubagentPort {
 			if (live.aborting) return;
 			outcome = { ok: false, error: `worker session failed: ${error instanceof Error ? error.message : String(error)}` };
 		} finally {
+			await this.#writeMentions(mission, worker, mutationText(live.session.state.messages));
 			this.#live.delete(live.beadId);
 			await live.session.dispose().catch(() => {});
 		}
 		if (outcome) this.#o.onSettled(live.beadId, outcome);
+	}
+
+	#mentionsFile(mission: Mission, worker: Worker): string { return join(this.#dir(mission), `${worker.beadId}.mentions.txt`); }
+	async #writeMentions(mission: Mission, worker: Worker, text: string): Promise<void> {
+		try { await writeFile(this.#mentionsFile(mission, worker), text); } catch { /* attribution evidence is best effort */ }
+	}
+	async #readMentions(mission: Mission, worker: Worker): Promise<string> {
+		try { return await readFile(this.#mentionsFile(mission, worker), 'utf8'); } catch { return ''; }
 	}
 
 	async #finish(live: Live, mission: Mission, worker: Worker): Promise<Settled> {
@@ -252,7 +278,19 @@ export class SubagentRunner implements SubagentPort {
 		// resumed worker is not blamed for what its siblings did while it was stopped. Only a path nobody owns is a stray.
 		for (const other of mission.workers) if (other.beadId !== worker.beadId) allowed.push(...other.files);
 		const changed = changedSince(live.baseline, await snapshotChanges(this.#o.run, worker.cwd));
-		const stray = outOfScope(changed, allowed);
+		let stray = outOfScope(changed, allowed);
+		if (stray.length) {
+			// A path nobody owns goes to the worker whose own commands named it. Only blame this worker when it named the
+			// path, or when no other worker did, so a sibling's stray file does not reject an innocent finisher.
+			const mine = mutationText(live.session.state.messages);
+			const others: string[] = [];
+			for (const other of mission.workers) {
+				if (other.beadId === worker.beadId) continue;
+				const running = this.#live.get(other.beadId);
+				others.push(running ? mutationText(running.session.state.messages) : await this.#readMentions(mission, other));
+			}
+			stray = stray.filter(path => mentions(mine, path) || !others.some(text => mentions(text, path)));
+		}
 		if (stray.length) return { ok: false, error: `edits outside the allowed paths (${stray.slice(0, 8).join(', ')}${stray.length > 8 ? ', …' : ''}); bead left open for review. If a concurrent worker made them, release or resend this one after cleaning up` };
 		const reason = [result.summary, result.verification ? `Verified: ${result.verification}` : ''].filter(Boolean).join('\n').slice(0, 4000);
 		const closed = await this.#o.run('bd', ['close', worker.beadId, '--reason', reason, '--json'], worker.cwd, this.#env(mission, worker));

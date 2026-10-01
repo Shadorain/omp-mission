@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { ExtensionContext } from '@oh-my-pi/pi-coding-agent';
 import { DEFAULT_MISSION_CONFIG } from '../src/config';
-import { changedSince, extractYield, snapshotChanges, SubagentRunner, type SessionFactory, type Settled, type SubagentSession } from '../src/subagent';
+import { changedSince, extractYield, mutationText, snapshotChanges, SubagentRunner, type SessionFactory, type Settled, type SubagentSession } from '../src/subagent';
 import type { Mission, Run, Worker } from '../src/types';
 
 const real: Run = async (command, args, cwd, env) => {
@@ -256,4 +256,33 @@ test('a resumed worker is not blamed for sibling beads\' edits made while it was
   await runner.resume(m, a);
   await runner.whenDone('bd-a');
   expect(settled[0]![1]).toMatchObject({ ok: false, error: expect.stringMatching(/outside the allowed paths \(nobody\.txt\)/) });
+});
+
+const toolCall = (name: string, args: unknown) => ({ role: 'assistant', content: [{ type: 'toolCall', name, arguments: args }] });
+
+test('a stray file is blamed on the worker whose commands named it, not on an innocent concurrent finisher', async () => {
+  const a = worker('bd-a', ['a/**']);
+  const b = worker('bd-b', ['b/**']);
+  const m = mission([a, b]);
+  let release!: () => void;
+  const hold = new Promise<void>(resolve => { release = resolve; });
+  // B writes the stray file and keeps running; A finishes cleanly while the stray exists.
+  const fb = fake(async ({ cwd, messages }) => { messages.push(toolCall('bash', { command: 'echo ok > verify-output.txt' })); await writeFile(join(cwd, 'verify-output.txt'), 'ok'); await hold; messages.push(yielded({ done: true, summary: 'b' })); });
+  const fa = fake(async ({ cwd, messages }) => { await fb.prompted; await writeFile(join(cwd, 'a', 'one.txt'), 'A'); messages.push(toolCall('edit', { path: 'a/one.txt' }), yielded({ done: true, summary: 'a' })); });
+  const sessions = [fa, fb];
+  let n = 0;
+  const { runner, settled } = harness(async () => ({ session: sessions[n++]!.session, file: join(root, `s${n}.jsonl`) }));
+  await runner.launch(m, a);
+  await runner.launch(m, b);
+  await runner.whenDone('bd-a');
+  expect(settled.find(([id]) => id === 'bd-a')![1]).toEqual({ ok: true, summary: 'a' });
+  release();
+  await runner.whenDone('bd-b');
+  expect(settled.find(([id]) => id === 'bd-b')![1]).toMatchObject({ ok: false, error: expect.stringMatching(/outside the allowed paths \(verify-output\.txt\)/) });
+});
+
+test('mutationText keeps only edit, write, and bash arguments', () => {
+  const text = mutationText([toolCall('read', { path: 'secret.txt' }), toolCall('bash', { command: 'touch x.txt' }), { role: 'user', content: 'ignored' }]);
+  expect(text).toContain('touch x.txt');
+  expect(text).not.toContain('secret.txt');
 });
