@@ -2,7 +2,7 @@
 
 Plan and run a ticket or task through verification and review. The row above the editor is the live state, and the line under it says what to run next.
 
-![Resumed session, Pause gate, expanded row, failed review, tab completion, and the action menu](docs/preview.png)
+![Resumed session, Pause gate, expanded bead outline, failed review, tab completion, and the action menu](docs/preview-v2.png)
 
 OMP 18.4.4 or later. Restart OMP after install.
 
