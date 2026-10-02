@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { ExtensionContext } from '@oh-my-pi/pi-coding-agent';
 import { DEFAULT_MISSION_CONFIG } from '../src/config';
-import { changedSince, extractYield, mutationText, snapshotChanges, SubagentRunner, type SessionFactory, type Settled, type SubagentSession } from '../src/subagent';
+import { changedSince, extractYield, mutationText, snapshotChanges, subagentPrompt, SubagentRunner, type SessionFactory, type Settled, type SubagentSession } from '../src/subagent';
 import type { Mission, Run, Worker } from '../src/types';
 
 const real: Run = async (command, args, cwd, env) => {
@@ -285,4 +285,26 @@ test('mutationText keeps only edit, write, and bash arguments', () => {
   const text = mutationText([toolCall('read', { path: 'secret.txt' }), toolCall('bash', { command: 'touch x.txt' }), { role: 'user', content: 'ignored' }]);
   expect(text).toContain('touch x.txt');
   expect(text).not.toContain('secret.txt');
+});
+
+test('the coordinator stages the worker\'s own changes, new files included, and nothing of a sibling\'s or an unrelated file', async () => {
+  const a = worker('bd-a', ['a/**']);
+  const b = worker('bd-b', ['b/**']);
+  const m = mission([a, b]);
+  const f = fake(async ({ cwd, messages }) => {
+    await writeFile(join(cwd, 'a', 'one.txt'), 'changed');
+    await writeFile(join(cwd, 'a', 'new.txt'), 'brand new');
+    await writeFile(join(cwd, 'b', 'two.txt'), 'sibling work in progress');
+    messages.push(yielded({ done: true, summary: 'a' }));
+  });
+  const { runner, settled } = harness(async () => ({ session: f.session, file: join(root, 's.jsonl') }));
+  await runner.launch(m, a);
+  await runner.whenDone('bd-a');
+  expect(settled[0]![1].ok).toBe(true);
+  expect((await git(cwd, 'diff', '--cached', '--name-only')).split('\n').sort()).toEqual(['a/new.txt', 'a/one.txt']);
+  expect(await git(cwd, 'status', '--porcelain', '--', 'b/two.txt')).toBe('M b/two.txt');
+});
+
+test('the worker prompt leaves staging to the coordinator', () => {
+  expect(subagentPrompt(mission([worker('bd-a', ['a/**'])]), worker('bd-a', ['a/**']), 'task')).toContain('do not run git add');
 });

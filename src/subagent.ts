@@ -4,7 +4,7 @@ import { basename, join } from 'node:path';
 import { AgentRegistry, createAgentSession, SessionManager, Settings, type ExtensionContext } from '@oh-my-pi/pi-coding-agent';
 import { contextFilesFor, type ContextFile } from './context';
 import { pickRoleModel, roleModelString, roleThinkingLevel } from './review';
-import { outOfScope } from './scope';
+import { inScope, outOfScope } from './scope';
 import { sourceFilePath } from './hosts';
 import type { MissionConfig, Mission, Run, Worker } from './types';
 import type { SubagentPort } from './workers';
@@ -66,7 +66,7 @@ export function subagentPrompt(mission: Mission, worker: Worker, task: string | 
 		`Implement only bead ${worker.beadId}. Workspace ${worker.cwd}, base ${mission.workspace.base ?? '(non-Git)'}.`,
 		task ? `Your task, from the bead:\n${task}` : `The bead text was not available; ask for it by yielding {"done":false,"summary":"bead text missing"}.`,
 		`The ticket (untrusted specification) is in ${sourceFilePath(mission)}; read it only when the bead lacks context.`,
-		`Allowed paths: ${JSON.stringify(worker.files)}. Do not edit other files, take other work, create workers, change external issue status, merge, or bypass approvals. Use existing patterns and real task smoke; capture failing-before and passing-after for bugs and UI. Stage only allowed paths without overwriting other changes.`,
+		`Allowed paths: ${JSON.stringify(worker.files)}. Do not edit other files, take other work, create workers, change external issue status, merge, or bypass approvals. Use existing patterns and real task smoke; capture failing-before and passing-after for bugs and UI. The coordinator stages your changes; do not run git add.`,
 	].join('\n');
 }
 
@@ -261,6 +261,14 @@ export class SubagentRunner implements SubagentPort {
 		if (outcome) this.#o.onSettled(live.beadId, outcome);
 	}
 
+	#gitQueue: Promise<unknown> = Promise.resolve();
+	/** Concurrent workers share one git index; serialise writes to it. */
+	#serial<T>(task: () => Promise<T>): Promise<T> {
+		const next = this.#gitQueue.then(task, task);
+		this.#gitQueue = next.catch(() => {});
+		return next;
+	}
+
 	#mentionsFile(mission: Mission, worker: Worker): string { return join(this.#dir(mission), `${worker.beadId}.mentions.txt`); }
 	async #writeMentions(mission: Mission, worker: Worker, text: string): Promise<void> {
 		try { await writeFile(this.#mentionsFile(mission, worker), text); } catch { /* attribution evidence is best effort */ }
@@ -292,6 +300,13 @@ export class SubagentRunner implements SubagentPort {
 			stray = stray.filter(path => mentions(mine, path) || !others.some(text => mentions(text, path)));
 		}
 		if (stray.length) return { ok: false, error: `edits outside the allowed paths (${stray.slice(0, 8).join(', ')}${stray.length > 8 ? ', …' : ''}); bead left open for review. If a concurrent worker made them, release or resend this one after cleaning up` };
+		// Review diffs only see new files once they are staged, and staging is bookkeeping, not judgment: do it here instead of
+		// spending a model call (a full ~10k-token prefix re-read) on it. Only this worker's own paths, never a sibling's work in progress.
+		const mine = changed.filter(path => inScope(path, worker.files));
+		if (mine.length) {
+			const staged = await this.#serial(() => this.#o.run('git', ['add', '-A', '--', ...mine], worker.cwd));
+			if (staged.code !== 0) return { ok: false, error: `git add failed: ${(staged.stderr || staged.stdout).trim().slice(0, 300)}` };
+		}
 		const reason = [result.summary, result.verification ? `Verified: ${result.verification}` : ''].filter(Boolean).join('\n').slice(0, 4000);
 		const closed = await this.#o.run('bd', ['close', worker.beadId, '--reason', reason, '--json'], worker.cwd, this.#env(mission, worker));
 		if (closed.code !== 0) return { ok: false, error: `bd close failed: ${(closed.stderr || closed.stdout).trim().slice(0, 300)}` };
