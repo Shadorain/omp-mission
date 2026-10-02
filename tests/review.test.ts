@@ -56,3 +56,13 @@ test('roleThinkingLevel reads the level suffix from a role value', async () => {
   expect(roleThinkingLevel(undefined)).toBeUndefined();
   expect(roleThinkingLevel('')).toBeUndefined();
 });
+
+test('boundDiff keeps small file sections and names oversized ones instead of sending them inline', async () => {
+  const { boundDiff } = await import('../src/review');
+  const section = (path: string, size: number) => `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n${'+x\n'.repeat(size)}`;
+  const diff = section('small.ts', 2) + section('lock.yaml', 5000) + section('tiny.ts', 1);
+  const bounded = boundDiff(diff, 500);
+  expect(bounded.omitted).toEqual(['lock.yaml']);
+  expect(bounded.diff).toBe(section('small.ts', 2) + section('tiny.ts', 1));
+  expect(boundDiff(diff, diff.length)).toEqual({ diff, omitted: [] });
+});
