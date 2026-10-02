@@ -56,5 +56,5 @@ Every tool result and message stays in context for the rest of the session, and 
 - **The ticket reaches the coordinator once**, in the recovery JSON of the first message, and reaches workers as a file they read on demand.
 - **The coordinator never polls**; the extension wakes it on state change.
 - **autoDispatch** runs `dispatch` in `wakeCoordinator` when `autoDispatchAllowed` says so, so a plain wave costs no model turn. A failure hands the same wake to the model once.
-- **Model-chosen work** (verify, deliver, repairs) stays with the coordinator. Review is the exception when the operator types `/mission review` or `/mission approve` at its gate: `decision()` starts `run_review` itself, since the reviewer is its own session and the coordinator would only relay a tool call.
+- **Model-chosen work** (graph and scopes, verify, deliver, repair work, rejecting findings) stays with the coordinator. Mechanical steps run in the extension once the operator's request is satisfied: `autoReview` in `wakeCoordinator` starts a requested, ready (and in Pause approved) review, and `decision()` runs `dispatch` or `accept_repairs` when `/mission approve` approves that exact gate. A review is its own session, so the coordinator would only relay a tool call.
 - Operator output sent with `sendMessage` enters context. Keep it short (`/mission history` shows 12 events).

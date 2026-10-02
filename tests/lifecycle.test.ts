@@ -42,7 +42,13 @@ async function fixture(graph: Graph, leaves = true, host: { idle?: boolean; pend
   const sent: string[] = [];
   const sentOptions: unknown[] = [];
   const notices: string[] = [];
-  const noticeWaiters: Array<{ prefix: string; resolve: (message: string) => void }> = [];
+  const noticeWaiters: Array<{ prefix: string; count: number; resolve: (message: string) => void }> = [];
+  const settleNoticeWaiters = () => {
+    for (const waiter of noticeWaiters) {
+      const hits = notices.filter(message => message.startsWith(waiter.prefix));
+      if (hits.length >= waiter.count) waiter.resolve(hits[waiter.count - 1]!);
+    }
+  };
   const events = new Map<string, EventHandler>();
   let active: string[] = [];
   // This fixture supplies only host services used by these operations. Storage,
@@ -50,7 +56,7 @@ async function fixture(graph: Graph, leaves = true, host: { idle?: boolean; pend
   const context = {
     agent: { kind: 'main' }, cwd, hasUI: false,
     sessionManager: { getBranch: () => [{ type: 'custom', customType: 'mission:pointer', data: { path } }], getSessionName: () => undefined },
-    ui: { notify: (message: string) => { notices.push(message); for (const waiter of noticeWaiters.filter(entry => message.startsWith(entry.prefix))) waiter.resolve(message); }, setWidget: () => {} },
+    ui: { notify: (message: string) => { notices.push(message); settleNoticeWaiters(); }, setWidget: () => {} },
     isIdle: () => host.idle ?? false, hasPendingMessages: () => host.pending ?? false,
     setInterval: () => 1, clearTimer: () => {},
   } as unknown as ExtensionContext;
@@ -92,7 +98,7 @@ async function fixture(graph: Graph, leaves = true, host: { idle?: boolean; pend
   if (!host.resumed) await execute({ operation: 'continue' });
   return {
     command: async (args: string) => { await commandHandler!(args, context); }, sent, sentOptions, notices,
-    noticeStarting: (prefix: string) => { const { promise, resolve } = Promise.withResolvers<string>(); noticeWaiters.push({ prefix, resolve }); return promise; },
+    noticeCount: (prefix: string, count: number) => { const { promise, resolve } = Promise.withResolvers<string>(); noticeWaiters.push({ prefix, count, resolve }); settleNoticeWaiters(); return promise; },
     execute, cwd, state: () => loadMission(path),
     dispose: async () => { try { await shutdown({}, context); } finally { await rm(root, { recursive: true, force: true }); } },
   };
@@ -179,16 +185,31 @@ test('/mission review in a resumed session says to run /mission continue instead
   } finally { await mission.dispose(); }
 });
 
-test('/mission review runs the review in the extension, without a coordinator model turn', async () => {
+test('a requested review starts in the extension without waking the model, and /mission review retries a failure', async () => {
   const mission = await fixture('local', true, { idle: true, unreviewed: true });
   try {
-    const wakes = mission.sent.length;
-    const failed = mission.noticeStarting('Review failed');
-    await mission.command('review');
-    // The fixture host has no model, so the review fails once it starts; reaching that failure proves the extension ran run_review itself.
-    expect(await failed).toContain('Coordinator model/registry unavailable');
-    expect(mission.notices.some(notice => notice.startsWith('Independent review started'))).toBe(true);
+    // The fixture host has no model, so each review fails once it starts; reaching that failure proves the extension ran run_review itself.
+    expect(await mission.noticeCount('Review failed', 1)).toContain('Coordinator model/registry unavailable');
+    expect(mission.sent).toEqual([]);
     expect((await mission.state()).evidence.review?.outcome).toBe('failed');
-    expect(mission.sent).toHaveLength(wakes);
+    const retried = mission.noticeCount('Review failed', 2);
+    await mission.command('review');
+    await retried;
+    expect(mission.notices.filter(notice => notice.startsWith('Independent review started'))).toHaveLength(2);
+    expect(mission.sent).toEqual([]);
+  } finally { await mission.dispose(); }
+});
+
+test('/mission approve at a repairs gate accepts the repairs in the extension', async () => {
+  const mission = await fixture('local', true, { idle: true });
+  try {
+    await mission.command('mode pause');
+    expect((await mission.state()).gate?.kind).toBe('repairs');
+    await mission.command('approve');
+    const accepted = await mission.state();
+    expect(accepted.phase).toBe('repair');
+    expect(accepted.evidence.repair?.outcome).toBe('active');
+    // The model is woken for the repair work itself, not to relay accept_repairs.
+    expect(mission.sent.at(-1)).toContain('Next: verify');
   } finally { await mission.dispose(); }
 });

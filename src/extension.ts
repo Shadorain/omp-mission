@@ -180,7 +180,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
   try{await control({operation:'dispatch'},context);context.ui.notify(`Auto-dispatched ${action.ids?.join(', ')}`,'info');return true;}
   catch(error){autoBlocked=signature;context.ui.notify(`Auto-dispatch held, handing to the coordinator: ${error instanceof Error?error.message:String(error)}`,'warning');return false;}
  }
- async function wakeCoordinator(){if(quiet||!ctx||!mission||operation||!eligible(ctx))return;const action=nextAction(mission,snapshot,policy(ctx));if(action.gate){mission.gate=action.gate;if(ownership&&!resumeHold)await persist(mission);await render();return;}if(action.kind==='hold')return;if(await autoDispatch(ctx,action))return;
+ async function wakeCoordinator(){if(quiet||!ctx||!mission||operation||!eligible(ctx))return;const action=nextAction(mission,snapshot,policy(ctx));if(action.gate){mission.gate=action.gate;if(ownership&&!resumeHold)await persist(mission);await render();return;}if(action.kind==='hold')return;if(await autoDispatch(ctx,action))return;if(autoReview(ctx,action))return;
  // Only the model needs an idle session with an empty queue. Dispatch above never touches it, so a stuck queue cannot stall the wave.
  if(!ctx.isIdle()||ctx.hasPendingMessages())return;const signature=JSON.stringify([mission.id,mission.round,action.kind,action.ids,mission.evidence.verify?.revision,mission.reviews.length]);if(signature===lastWake)return;lastWake=signature;const view=withGuide(action,true)!;pi.sendUserMessage(`Mission: ${action.detail}${action.ids?.length?` [${action.ids.join(', ')}]`:''}. Next: ${action.kind}. ${view.guide??''}`.trim(),{attribution:'agent'});}
  async function request(context:ExtensionContext,op:string,extra:Record<string,unknown>={}){
@@ -212,23 +212,34 @@ export default async function missionExtension(pi: ExtensionAPI) {
   else if(verb==='review'){mission.reviewRequested=true;if(mission.evidence.review?.outcome==='failed')delete mission.evidence.review;if(resumeHold)inspectionIntent.reviewRequested=true;}
   else if(verb==='approve'){if(resumeHold)throw new Error('Resumed session is read-only: run /mission continue first, then /mission approve');if(!mission.gate)throw new Error('No gate is waiting for approval. /mission shows what is next');approveGate(mission,mission.gate.token);}
   if(ownership)await persist(mission);await render();
-  // The review itself runs in its own session; the coordinator model would only relay a tool call (a full-context turn), so a typed command starts it directly.
-  if((verb==='review'||verb==='approve')&&!resumeHold&&ownership&&!operation){
+  if(!resumeHold&&ownership&&!operation&&(verb==='review'||verb==='approve')){
+   reviewBlocked='';
    await refresh(false);
-   if(nextAction(mission,snapshot,policy(context)).kind==='review'){startReview(context);return;}
+   // Approving a gate is the operator's authorization of exactly that step, and the step is mechanical once approved, so run it here instead of paying a coordinator turn to relay a tool call.
+   if(verb==='approve'){
+    const next=nextAction(mission,snapshot,policy(context));
+    if(next.kind==='dispatch'){await request(context,'dispatch');return;}
+    if(next.kind==='repairs'&&mission.evidence.repair?.outcome!=='active'){await request(context,'accept_repairs');return;}
+   }
   }
   await wakeCoordinator();
   // A hold wakes nothing and renders no gate, so say why instead of leaving the command silent.
   const after=nextAction(mission,snapshot,policy(context));
-  if(after.kind==='hold'&&!after.gate&&(verb==='review'||resumeHold))context.ui.notify(resumeHold?`Resumed session is read-only: run /mission continue first. Your ${verb==='review'?'review request is queued and starts':'change is queued and applies'} then.`:after.detail,resumeHold?'warning':'info');
+  if(!operation&&after.kind==='hold'&&!after.gate&&(verb==='review'||resumeHold))context.ui.notify(resumeHold?`Resumed session is read-only: run /mission continue first. Your ${verb==='review'?'review request is queued and starts':'change is queued and applies'} then.`:after.detail,resumeHold?'warning':'info');
  }
- // Fire and forget: a review can outlast the command handler, and every outcome is reported through notify.
- function startReview(context:ExtensionContext){
+ // The review runs in its own session, so the coordinator would only relay a tool call (a full-context turn). A requested review that is ready (and, in Pause, approved) starts here, the way autoDispatch does for waves.
+ let reviewBlocked='';
+ function autoReview(context:ExtensionContext,action:Action):boolean{
+  const m=mission;if(!m||action.kind!=='review'||action.gate||!m.reviewRequested)return false;
+  const signature=JSON.stringify([m.id,m.round,m.evidence.verify?.revision,m.reviews.length]);
+  if(signature===reviewBlocked)return false;
   context.ui.notify('Independent review started in its own session. It can take several minutes; the result is reported here.','info');
+  // Fire and forget: a review can outlast the command handler, and every outcome is reported through notify.
   void control({operation:'run_review'},context).then(()=>{
    const round=mission?.reviews.at(-1);const open=round?.findings.filter(finding=>!finding.rejection).length??0;
    context.ui.notify(round?(open?`Independent review found ${open} issue${open===1?'':'s'}. /mission shows the next step.`:'Independent review passed with no findings.'):'Independent review finished.','info');
-  },error=>context.ui.notify(`Review failed: ${error instanceof Error?error.message:String(error)}. /mission review retries it.`,'error'));
+  },error=>{reviewBlocked=signature;context.ui.notify(`Review failed: ${error instanceof Error?error.message:String(error)}. /mission review retries it.`,'error');});
+  return true;
  }
  async function configure(context:ExtensionContext, raw:string){
   const rest=raw.trim().replace(/^config\b/,'').trim();
