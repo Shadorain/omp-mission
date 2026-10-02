@@ -15,7 +15,7 @@ type Execute = (id: string, params: Params, signal: undefined, update: undefined
 type EventHandler = (event: unknown, context: ExtensionContext) => Promise<void>;
 const noRun: Run = async () => { throw new Error('Unexpected command'); };
 
-async function fixture(graph: Graph, leaves = true, host: { idle?: boolean; pending?: boolean; resumed?: boolean } = {}) {
+async function fixture(graph: Graph, leaves = true, host: { idle?: boolean; pending?: boolean; resumed?: boolean; unreviewed?: boolean } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'mission-lifecycle-'));
   const cwd = join(root, 'workspace');
   await mkdir(cwd);
@@ -33,7 +33,7 @@ async function fixture(graph: Graph, leaves = true, host: { idle?: boolean; pend
     mission.phase = 'review';
     mission.evidence.verify = { outcome: 'passed', revision, detail: 'before', at: 'now' };
     mission.evidence.deliver = { outcome: 'passed', revision, detail: 'before', at: 'now' };
-    mission.reviews = [{ round: 1, revision, summary: 'Defect', model: 'test', at: 'now', findings: [{ id: 'f', severity: 'high', path: 'task.txt', line: 1, title: 'Defect', body: 'Fix task.txt' }] }];
+    mission.reviews = host.unreviewed ? [] : [{ round: 1, revision, summary: 'Defect', model: 'test', at: 'now', findings: [{ id: 'f', severity: 'high', path: 'task.txt', line: 1, title: 'Defect', body: 'Fix task.txt' }] }];
   }
   const path = missionPath(root, mission);
   await saveMission(path, mission);
@@ -42,6 +42,7 @@ async function fixture(graph: Graph, leaves = true, host: { idle?: boolean; pend
   const sent: string[] = [];
   const sentOptions: unknown[] = [];
   const notices: string[] = [];
+  const noticeWaiters: Array<{ prefix: string; resolve: (message: string) => void }> = [];
   const events = new Map<string, EventHandler>();
   let active: string[] = [];
   // This fixture supplies only host services used by these operations. Storage,
@@ -49,7 +50,7 @@ async function fixture(graph: Graph, leaves = true, host: { idle?: boolean; pend
   const context = {
     agent: { kind: 'main' }, cwd, hasUI: false,
     sessionManager: { getBranch: () => [{ type: 'custom', customType: 'mission:pointer', data: { path } }], getSessionName: () => undefined },
-    ui: { notify: (message: string) => { notices.push(message); }, setWidget: () => {} },
+    ui: { notify: (message: string) => { notices.push(message); for (const waiter of noticeWaiters.filter(entry => message.startsWith(entry.prefix))) waiter.resolve(message); }, setWidget: () => {} },
     isIdle: () => host.idle ?? false, hasPendingMessages: () => host.pending ?? false,
     setInterval: () => 1, clearTimer: () => {},
   } as unknown as ExtensionContext;
@@ -91,6 +92,7 @@ async function fixture(graph: Graph, leaves = true, host: { idle?: boolean; pend
   if (!host.resumed) await execute({ operation: 'continue' });
   return {
     command: async (args: string) => { await commandHandler!(args, context); }, sent, sentOptions, notices,
+    noticeStarting: (prefix: string) => { const { promise, resolve } = Promise.withResolvers<string>(); noticeWaiters.push({ prefix, resolve }); return promise; },
     execute, cwd, state: () => loadMission(path),
     dispose: async () => { try { await shutdown({}, context); } finally { await rm(root, { recursive: true, force: true }); } },
   };
@@ -174,5 +176,19 @@ test('/mission review in a resumed session says to run /mission continue instead
     await mission.command('review');
     expect(mission.notices.some(notice => notice.includes('/mission continue'))).toBe(true);
     expect(mission.sent).toEqual([]);
+  } finally { await mission.dispose(); }
+});
+
+test('/mission review runs the review in the extension, without a coordinator model turn', async () => {
+  const mission = await fixture('local', true, { idle: true, unreviewed: true });
+  try {
+    const wakes = mission.sent.length;
+    const failed = mission.noticeStarting('Review failed');
+    await mission.command('review');
+    // The fixture host has no model, so the review fails once it starts; reaching that failure proves the extension ran run_review itself.
+    expect(await failed).toContain('Coordinator model/registry unavailable');
+    expect(mission.notices.some(notice => notice.startsWith('Independent review started'))).toBe(true);
+    expect((await mission.state()).evidence.review?.outcome).toBe('failed');
+    expect(mission.sent).toHaveLength(wakes);
   } finally { await mission.dispose(); }
 });

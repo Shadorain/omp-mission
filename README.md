@@ -109,6 +109,8 @@ The diff sent to the reviewer is capped (about 300 KB). Whole per-file sections 
 
 The review diff is measured from the merge-base of `HEAD` and the base branch (preferring `origin/<base>`), and before each review a `pr` mission adopts the open PR's real base (`gh pr view`), so a stacked or integration-branch PR is reviewed on its own change, not on everything since `main`. The reviewer's time budget is 5 minutes plus 15 seconds per changed file, capped at 30 minutes.
 
+Typing `/mission review` (or `/mission approve` at the review gate) starts the review directly in the extension and reports the outcome with a notice, with no coordinator model turn. Only model-initiated reviews (Force mode, or a wake the extension cannot run itself) go through `mission_control run_review`.
+
 Accepting local repairs advances the review round and clears earlier verification and delivery evidence. Passing verification requires changed output while actionable findings remain. Beads repairs advance the round when their finding-linked graph is bound; verification requires a nonempty graph whose implementation leaves are completed (`closed` or `done`).
 
 Repair evidence becomes passed or failed with verification, rather than staying active through delivery. Explicitly rejecting every accepted finding skips repair evidence and allows unchanged output to be reverified. Delivery and independent rereview remain required for changed output.

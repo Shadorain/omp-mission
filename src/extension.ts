@@ -65,6 +65,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
  };
  // A pending mission has no saved action yet; a saved one asks the controller what a person can do now.
  function currentStep(context:ExtensionContext){
+  if(operation&&mission)return {text:mission.evidence.review?.outcome==='active'?'Independent review running; the result is reported here when it ends':'Mission operation running'};
   if(mission){const p=policy(context);return operatorStep(mission,nextAction(mission,snapshot,p),p,ownershipError);}
   return pending&&nativePlan(context)?{text:'Approve the plan to start the mission'}:undefined;
  }
@@ -210,10 +211,24 @@ export default async function missionExtension(pi: ExtensionAPI) {
   if(verb==='mode'){const modes:Mode[]=['auto','pause','force'];const mode=z.enum(['auto','pause','force']).parse(arg??modes[(modes.indexOf(mission.mode)+1)%3]);setMode(mission,mode);if(resumeHold)inspectionIntent.mode=mode;}
   else if(verb==='review'){mission.reviewRequested=true;if(mission.evidence.review?.outcome==='failed')delete mission.evidence.review;if(resumeHold)inspectionIntent.reviewRequested=true;}
   else if(verb==='approve'){if(resumeHold)throw new Error('Resumed session is read-only: run /mission continue first, then /mission approve');if(!mission.gate)throw new Error('No gate is waiting for approval. /mission shows what is next');approveGate(mission,mission.gate.token);}
-  if(ownership)await persist(mission);await render();await wakeCoordinator();
+  if(ownership)await persist(mission);await render();
+  // The review itself runs in its own session; the coordinator model would only relay a tool call (a full-context turn), so a typed command starts it directly.
+  if((verb==='review'||verb==='approve')&&!resumeHold&&ownership&&!operation){
+   await refresh(false);
+   if(nextAction(mission,snapshot,policy(context)).kind==='review'){startReview(context);return;}
+  }
+  await wakeCoordinator();
   // A hold wakes nothing and renders no gate, so say why instead of leaving the command silent.
   const after=nextAction(mission,snapshot,policy(context));
   if(after.kind==='hold'&&!after.gate&&(verb==='review'||resumeHold))context.ui.notify(resumeHold?`Resumed session is read-only: run /mission continue first. Your ${verb==='review'?'review request is queued and starts':'change is queued and applies'} then.`:after.detail,resumeHold?'warning':'info');
+ }
+ // Fire and forget: a review can outlast the command handler, and every outcome is reported through notify.
+ function startReview(context:ExtensionContext){
+  context.ui.notify('Independent review started in its own session. It can take several minutes; the result is reported here.','info');
+  void control({operation:'run_review'},context).then(()=>{
+   const round=mission?.reviews.at(-1);const open=round?.findings.filter(finding=>!finding.rejection).length??0;
+   context.ui.notify(round?(open?`Independent review found ${open} issue${open===1?'':'s'}. /mission shows the next step.`:'Independent review passed with no findings.'):'Independent review finished.','info');
+  },error=>context.ui.notify(`Review failed: ${error instanceof Error?error.message:String(error)}. /mission review retries it.`,'error'));
  }
  async function configure(context:ExtensionContext, raw:string){
   const rest=raw.trim().replace(/^config\b/,'').trim();
