@@ -12,12 +12,12 @@ import { acquireOwnership, listMissions, loadMission, missionId, missionPath, sa
 import type { Ownership } from './store';
 import { readClaimActor, readGraph, readHistory } from './beads';
 import { createWorkerDriver } from './workers';
-import { approveGate, autoDispatchAllowed, consumeGate, effectiveGraph, enforceGate, enforceMutation, nextAction, requireBeadsGraph, revisionGate, setMode, waveGate } from './controller';
+import { approveGate, autoDispatchAllowed, consumeGate, effectiveGraph, enforceGate, enforceMutation, nextAction, operatorStep, requireBeadsGraph, revisionGate, setMode, waveGate } from './controller';
 import { captureRevision, Reviewer, roleModelString } from './review';
 import { beadTask, coordinatorPrompt, guide, workerPrompt } from './prompts';
-import { createMissionWidget, createMissionInspector } from './ui';
+import { createMissionWidget, createMissionInspector, phaseLabel } from './ui';
 import { briefView, statusView, type NextView } from './status';
-import { missionArgumentCompletions, type MissionCompletionState } from './completions';
+import { missionArgumentCompletions, VERBS, type MissionCompletionState } from './completions';
 import { discoverBeadsDir, isolateCheckout } from './isolate';
 import { contextFilesFor } from './context';
 import { SubagentRunner, subagentPrompt } from './subagent';
@@ -59,12 +59,17 @@ export default async function missionExtension(pi: ExtensionAPI) {
    mission: current, snapshot, resumeHold: mission ? resumeHold : false,
    ownershipError, selected, history, expanded, outlineOffset,
    nativePlan: ctx ? nativePlan(ctx) : false,
-   nextAction: ctx && mission ? nextAction(mission, snapshot, policy(ctx)).detail : undefined,
+   step: ctx ? currentStep(ctx) : undefined,
    frontend: config.frontend, expandKey: config.keys.expand, subagents,
   };
  };
+ // A pending mission has no saved action yet; a saved one asks the controller what a person can do now.
+ function currentStep(context:ExtensionContext){
+  if(mission){const p=policy(context);return operatorStep(mission,nextAction(mission,snapshot,p),p,ownershipError);}
+  return pending&&nativePlan(context)?{text:'Approve the plan to start the mission'}:undefined;
+ }
  let completionState:MissionCompletionState={sources:[],beads:[],workers:[]};
- function syncCompletions(){completionState={sources:completionState.sources,beads:(snapshot?.beads??[]).map(bead=>({id:bead.id,title:bead.title,category:bead.category})),workers:(mission?.workers??[]).map(worker=>({beadId:worker.beadId,state:worker.state,handle:!!worker.handle,stopped:worker.frontend==='subagent'&&!!worker.error&&worker.state!=='closed'}))};}
+ function syncCompletions(){completionState={sources:completionState.sources,recommended:(ctx?currentStep(ctx)?.command:undefined)?.match(/^\/mission (\w+)/)?.[1],beads:(snapshot?.beads??[]).map(bead=>({id:bead.id,title:bead.title,category:bead.category})),workers:(mission?.workers??[]).map(worker=>({beadId:worker.beadId,state:worker.state,handle:!!worker.handle,stopped:worker.frontend==='subagent'&&!!worker.error&&worker.state!=='closed'}))};}
  async function refreshCompletionSources(){try{const saved=await listMissions(agentDir);completionState.sources=saved.map(item=>({id:item.mission.source.id,title:item.mission.source.title}));}catch{/* keep the previous source list */}}
  async function persist(value:Mission){if(value!==mission||!path||!ownership)throw new Error('No current controller ownership');await ownership.assertOwned();value.controllerNonce=ownership.nonce;value.updatedAt=new Date().toISOString();await saveMission(path,value);}
  // In-process workers report back here: a clean result already closed the bead; a rejected one waits for the operator.
@@ -112,7 +117,10 @@ export default async function missionExtension(pi: ExtensionAPI) {
  async function acquire(){if(!mission||!path)throw new Error('No saved mission');if(ownership){await ownership.assertOwned();return;}ownershipError=undefined;ownership=await acquireOwnership(path,mission,error=>{ownershipError=`Controller lost: ${error.message}`;resumeHold=true;lastWake='';void reviewer.dispose();void render();});mission=ownership.mission;mission.controllerNonce=ownership.nonce;}
  async function release(){const current=ownership;ownership=undefined;await current?.release();}
  async function detach(context?:ExtensionContext){generation++;lifetime.abort();lifetime=new AbortController();terminalInputDispose?.();terminalInputDispose=undefined;overlayAbort?.abort();overlayAbort=undefined;if(timer&&ctx)ctx.clearTimer(timer);timer=undefined;await reviewer.dispose();await workerAgents.abortAll();await release();ctx?.ui.setWidget('mission',undefined);ctx=context;mission=undefined;pending=undefined;path=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;lastWake='';guided='';selected=undefined;history=undefined;lastPoll=0;outlineOffset=0;inspectionIntent={};subagents=[];}
- async function attach(file:string,context:ExtensionContext){await release();mission=await loadMission(file);path=file;pending=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;ctx=context;await refresh(false);await render();}
+ async function attach(file:string,context:ExtensionContext,announce=true){await release();mission=await loadMission(file);path=file;pending=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;ctx=context;await refresh(false);await render();
+  const step=announce?currentStep(context):undefined;
+  if(step)context.ui.notify(`${displaySourceId(mission.source)} · ${phaseLabel(mission.phase)}. ${step.command?`Next: ${step.command} — `:''}${step.text}. /mission opens the action menu.`,'info');
+ }
  async function restore(context:ExtensionContext){
   if(!eligible(context))return;
   await detach(context);
@@ -177,8 +185,8 @@ export default async function missionExtension(pi: ExtensionAPI) {
  async function request(context:ExtensionContext,op:string,extra:Record<string,unknown>={}){
   if(!eligible(context))throw new Error('Mission coordinator only');
   await control({operation:op,...extra},context);
-  const next=mission?nextAction(mission,snapshot,policy(context)).detail:undefined;
-  context.ui.notify(`Mission ${op} done${next?`. Next: ${next}`:''}`,'info');
+  const step=currentStep(context);
+  context.ui.notify(`Mission ${op} done${step?`. Next: ${step.command?`${step.command} — `:''}${step.text}`:''}`,'info');
  }
  async function inspect(context:ExtensionContext){
   if(!projection())throw new Error('No active mission');
@@ -201,8 +209,11 @@ export default async function missionExtension(pi: ExtensionAPI) {
   if(!mission)throw new Error('No active mission');if(nativePlan(context))throw new Error('Mission mutations are forbidden in native plan mode');
   if(verb==='mode'){const modes:Mode[]=['auto','pause','force'];const mode=z.enum(['auto','pause','force']).parse(arg??modes[(modes.indexOf(mission.mode)+1)%3]);setMode(mission,mode);if(resumeHold)inspectionIntent.mode=mode;}
   else if(verb==='review'){mission.reviewRequested=true;if(mission.evidence.review?.outcome==='failed')delete mission.evidence.review;if(resumeHold)inspectionIntent.reviewRequested=true;}
-  else if(verb==='approve'){if(resumeHold)throw new Error('Resumed inspection: continue before approving');if(!mission.gate)throw new Error('No displayed gate');approveGate(mission,mission.gate.token);}
+  else if(verb==='approve'){if(resumeHold)throw new Error('Resumed session is read-only: run /mission continue first, then /mission approve');if(!mission.gate)throw new Error('No gate is waiting for approval. /mission shows what is next');approveGate(mission,mission.gate.token);}
   if(ownership)await persist(mission);await render();await wakeCoordinator();
+  // A hold wakes nothing and renders no gate, so say why instead of leaving the command silent.
+  const after=nextAction(mission,snapshot,policy(context));
+  if(after.kind==='hold'&&!after.gate&&(verb==='review'||resumeHold))context.ui.notify(resumeHold?`Resumed session is read-only: run /mission continue first. Your ${verb==='review'?'review request is queued and starts':'change is queued and applies'} then.`:after.detail,resumeHold?'warning':'info');
  }
  async function configure(context:ExtensionContext, raw:string){
   const rest=raw.trim().replace(/^config\b/,'').trim();
@@ -256,7 +267,13 @@ export default async function missionExtension(pi: ExtensionAPI) {
     }
    }
   }
-  const chosen=await context.ui.select(`Mission actions${mission?.gate?': '+mission.gate.detail:''}`,options);
+  const step=currentStep(context);
+  const recommended=step?.command?.match(/^\/mission (\w+)/)?.[1];
+  const ordered=recommended&&options.includes(recommended)?[recommended,...options.filter(verb=>verb!==recommended)]:options;
+  const labels=new Map(ordered.map(verb=>[`${verb===recommended?'▸':' '} ${verb} — ${VERBS.find(entry=>entry.name===verb)?.short??''}`,verb]));
+  const head=projection()!.mission;
+  const picked=await context.ui.select(`${displaySourceId(head.source)} · ${phaseLabel(head.phase)}${step?` — ${step.command?`Next: ${step.command} — `:''}${step.text}`:''}`,[...labels.keys()]);
+  const chosen=picked?labels.get(picked):undefined;
   if(chosen)await command(chosen+(selected&&['focus','resend','release','reap'].includes(chosen)?' '+selected:''),context);
  }
  async function command(args:string,context:ExtensionContext){
@@ -294,18 +311,18 @@ export default async function missionExtension(pi: ExtensionAPI) {
    }
  const parsed=parseMissionInput(args);if(parsed.force&&nativePlan(context))throw new Error('Force cannot execute inside native plan mode');const saved=await listMissions(agentDir);let target=parsed;
  if(!target.source&&target.freeform===undefined){
-  if(mission){if(parsed.force&&mission.phase!=='complete')await request(context,'continue',{mode:parsed.pause?'pause':'force',keep:parsed.keep});return await render();}
+  if(mission){if(parsed.force&&mission.phase!=='complete')await request(context,'continue',{mode:parsed.pause?'pause':'force',keep:parsed.keep});if(!parsed.force&&context.hasUI)return await actions(context);return await render();}
   const inferred=await inferMissionSource(context.cwd,run,saved.map(item=>({path:item.path,source:item.mission.source,workspace:item.mission.workspace})));
   if(inferred.ambiguous.length){
    const choice=await context.ui.select('Select mission (inspection)',inferred.ambiguous);if(!choice)return;
-   const hit=saved.find(item=>item.mission.source.id===choice||item.path===choice);if(hit)return await attach(hit.path,context);
+   const hit=saved.find(item=>item.mission.source.id===choice||item.path===choice);if(hit)return await attach(hit.path,context,!parsed.force);
    target={...target,source:choice};
   }else if(inferred.source){
-   const hit=saved.find(item=>item.path===inferred.source);if(hit){await attach(hit.path,context);if(parsed.force&&mission!.phase!=='complete')await request(context,'continue',{mode:parsed.pause?'pause':'force',keep:parsed.keep});return;}
+   const hit=saved.find(item=>item.path===inferred.source);if(hit){await attach(hit.path,context,!parsed.force);if(parsed.force&&mission!.phase!=='complete')await request(context,'continue',{mode:parsed.pause?'pause':'force',keep:parsed.keep});return;}
    target={...target,source:inferred.source};
   }else throw new Error(inferred.reason??'Usage: /mission CHR-142 | owner/repo#123 | -- description');
  }
- const source=await fetchSource(target,context.cwd,run);const workspace=await inspectWorkspace(context.cwd,run,{githubRepo:source.repo});assertSourceCheckout(source,workspace);const existing=saved.find(item=>item.mission.workspace.key===workspace.key&&item.mission.source.id===source.id);if(existing){await attach(existing.path,context);if(parsed.force&&mission!.phase!=='complete')await request(context,'continue',{mode:parsed.pause?'pause':'force',keep:parsed.keep});return;}
+ const source=await fetchSource(target,context.cwd,run);const workspace=await inspectWorkspace(context.cwd,run,{githubRepo:source.repo});assertSourceCheckout(source,workspace);const existing=saved.find(item=>item.mission.workspace.key===workspace.key&&item.mission.source.id===source.id);if(existing){await attach(existing.path,context,!parsed.force);if(parsed.force&&mission!.phase!=='complete')await request(context,'continue',{mode:parsed.pause?'pause':'force',keep:parsed.keep});return;}
  const bound=saved.find(item=>item.mission.workspace.cwd===workspace.cwd&&item.mission.source.id!==source.id&&item.mission.phase!=='complete');if(bound)throw new Error(`Checkout is bound to ${bound.mission.source.id}`);
  if(!parsed.force&&!nativePlan(context))throw new Error('Start through /plan /mission, or use --force outside plan mode');
  const planned: Mission = {version:1,id:missionId(source),source,workspace,graph:config.graph,scopes:{},phase:'plan',evidence:{},mode:parsed.pause?'pause':parsed.force?'force':'auto',keep:parsed.keep,reviewRequested:parsed.force,workers:[],reviews:[],repairLinks:{},round:1,createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()};

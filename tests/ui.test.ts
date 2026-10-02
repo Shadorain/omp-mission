@@ -39,6 +39,18 @@ describe("mission UI", () => {
 		expect(widget.render(13).every((row) => visibleWidth(row) <= 13)).toBe(true);
 	});
 
+	test("widget shows the next command under the summary and keeps it within the width", () => {
+		const current: Projection = { ...projection([bead("one")]), step: { command: "/mission continue", text: "Take control of this resumed mission" } };
+		const wide = new MissionWidget(() => current, () => 40, theme).render(120);
+		expect(wide).toHaveLength(2);
+		expect(wide[1]).toContain("/mission continue");
+		expect(wide[1]).toContain("/mission for the action menu");
+		const narrow = new MissionWidget(() => current, () => 40, theme).render(30);
+		expect(narrow[1]).not.toContain("action menu");
+		for (const row of narrow) expect(visibleWidth(row)).toBeLessThanOrEqual(30);
+		expect(new MissionWidget(() => ({ ...current, step: undefined }), () => 40, theme).render(120)).toHaveLength(1);
+	});
+
 	test("inspector keeps selected bead and clamps after graph refresh", () => {
 		const selected: string[] = [];
 		let current = projection([bead("root", ["a", "b"]), bead("a", [], "root"), bead("b", [], "root")]);

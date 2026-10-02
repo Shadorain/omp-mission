@@ -5,24 +5,27 @@ export interface MissionCompletionState {
 	sources: CompletionSource[];
 	beads: CompletionBead[];
 	workers: CompletionWorker[];
+	/** Verb the operator should run now (from the mission's next step); listed first and marked. */
+	recommended?: string;
 }
 
 export interface CompletionItem { value: string; label: string; description?: string; hint?: string }
 
-const VERBS: Array<{ name: string; description: string }> = [
-	{ name: "show", description: "Open the inspector" },
-	{ name: "continue", description: "Leave inspection and resume" },
-	{ name: "mode", description: "Set auto, pause, or force" },
-	{ name: "approve", description: "Approve the displayed gate" },
-	{ name: "review", description: "Request an independent review" },
-	{ name: "history", description: "Show bead history" },
-	{ name: "focus", description: "Focus the worker session" },
-	{ name: "resend", description: "Resend the assignment, or guide a stopped subagent worker" },
-	{ name: "release", description: "Give a subagent worker's bead back for a fresh worker" },
-	{ name: "dispatch", description: "Dispatch the ready wave" },
-	{ name: "reap", description: "Close the worker session" },
-	{ name: "actions", description: "Open the action menu" },
-	{ name: "config", description: "Show or set graph, frontend, or config" },
+/** `description` says when to run it (autocomplete); `short` fits the action menu. */
+export const VERBS: Array<{ name: string; description: string; short: string }> = [
+	{ name: "show", short: "Open the inspector", description: "Open the inspector overlay. Read-only, safe any time" },
+	{ name: "continue", short: "Take control of a resumed mission", description: "After a restart: take control of the saved mission (needed first)" },
+	{ name: "mode", short: "Switch auto / pause / force", description: "How it runs: auto, pause (you approve each gate) or force" },
+	{ name: "approve", short: "Approve the waiting gate", description: "Pause mode: approve the gate shown in the widget" },
+	{ name: "review", short: "Request or retry independent review", description: "After delivery: request an independent review, or retry one" },
+	{ name: "history", short: "Show a bead's audit log", description: "Beads graph: show the audit log of one bead" },
+	{ name: "focus", short: "Jump to a worker session", description: "Beads graph: jump to the session of a bead's worker" },
+	{ name: "resend", short: "Resend assignment or guide a worker", description: "Worker never claimed its bead, or stopped: resend or guide it" },
+	{ name: "release", short: "Hand a bead back for a fresh worker", description: "Worker stuck or stopped: hand its bead back to be retaken" },
+	{ name: "dispatch", short: "Start the ready wave", description: "Beads graph: start the ready wave yourself" },
+	{ name: "reap", short: "Close a finished worker's session", description: "Beads graph: close the session of a worker whose bead is done" },
+	{ name: "actions", short: "Open this menu", description: "Menu of what is valid now, next step first (same as /mission)" },
+	{ name: "config", short: "Show or set options", description: "Show or set graph, frontend, model roles and other options" },
 ];
 
 const FLAGS: Array<{ name: string; alias?: string; description: string }> = [
@@ -33,9 +36,9 @@ const FLAGS: Array<{ name: string; alias?: string; description: string }> = [
 ];
 
 const MODES = [
-	{ name: "auto", description: "Run waves without an extra pause" },
-	{ name: "pause", description: "Wait at every gate" },
-	{ name: "force", description: "Execute and request review" },
+	{ name: "auto", description: "Coordinator runs each wave without asking; review only when you request it" },
+	{ name: "pause", description: "You approve every gate with /mission approve before work starts" },
+	{ name: "force", description: "Run without gates and always request independent review" },
 ];
 
 const FRONTENDS = [
@@ -165,7 +168,9 @@ function completeVerb(verb: string, rest: string[], partial: string, state: Miss
 }
 
 function firstToken(partial: string, state: MissionCompletionState): CompletionItem[] | null {
-	const verbs = VERBS.filter(verb => matches(verb.name, partial)).map(verb => item("", verb.name, verb.description));
+	const verbs = VERBS.filter(verb => matches(verb.name, partial))
+		.map(verb => verb.name === state.recommended ? item("", verb.name, `▸ Next: ${verb.description}`) : item("", verb.name, verb.description))
+		.sort((a, b) => Number(b.label === state.recommended) - Number(a.label === state.recommended));
 	const flags = partial.startsWith("-") || partial.length === 0
 		? FLAGS.filter(flag => flagMatches(flag, partial)).map(flag => item("", flag.name, flag.description))
 		: [];

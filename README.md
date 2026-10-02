@@ -1,8 +1,8 @@
 # omp-mission
 
-Plan and run a ticket or task through verification and review. The row above the editor is the live state.
+Plan and run a ticket or task through verification and review. The row above the editor is the live state, and the line under it says what to run next.
 
-![Compact gate, compact auto, and expanded bead list](docs/preview.png)
+![Resumed session, Pause gate, expanded row, failed review, tab completion, and the action menu](docs/preview.png)
 
 OMP 18.4.4 or later. Restart OMP after install.
 
@@ -34,6 +34,10 @@ git clone https://github.com/Shadorain/omp-mission.git ~/.omp/agent/extensions/o
 /mission show | continue | mode | approve | review
 /mission history | focus | resend | reap | dispatch | actions | config
 ```
+
+**Not sure what to run? Type `/mission`.** On an active mission it opens the action menu: only commands valid right now, the next step first (`▸`) and preselected. `continue` is not a next-step command. It takes control of a saved mission after an OMP restart or resume, and until you run it `approve`, `review` and `dispatch` stay read-only (`review` and `mode` are queued and applied by `continue`).
+
+The row under the mission summary always says what is next, for example `→ /mission continue  Take control of this resumed mission`, `→ /mission approve  Start workers: bd-1, bd-2` at a Pause gate, or `→ /mission review  The last review failed. Retry it`. When the coordinator is working it shows a dim status instead, so a command is only offered when a person has to run it. Tab completion lists the same next verb first, and each verb's description says when to use it. Attaching a saved mission also prints the next step.
 
 Commands you type run directly, with no model turn. Only model-initiated operations go through the `mission_control` tool and its native approval. Tool results are compact; the full source and worker assignments stay in the saved mission, not in context.
 

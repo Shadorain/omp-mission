@@ -5,7 +5,7 @@
 |File|Owns|
 |---|---|
 |`src/extension.ts`|Wiring: events, command, tools, widget, shortcuts. `control()` is the single mutation entry.|
-|`src/controller.ts`|Pure policy: `nextAction`, gates, mode, mutation enforcement. No I/O.|
+|`src/controller.ts`|Pure policy: `nextAction`, `operatorStep` (the command a person should run now, shown in the widget, menu and completions), gates, mode, mutation enforcement. No I/O.|
 |`src/store.ts`|Mission persistence, validation, controller ownership lock.|
 |`src/workers.ts`, `src/hosts.ts`|Worker driver and per-frontend spawn/send/focus/reap. See @docs/workers.md.|
 |`src/subagent.ts`, `src/scope.ts`, `src/context.ts`|In-process worker sessions for `frontend: subagent`, allowed-path matching, context file selection. See @docs/workers.md.|

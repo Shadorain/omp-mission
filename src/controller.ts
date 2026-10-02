@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { Action, Gate, Graph, Mission, Mode, PolicyContext, Snapshot } from './types';
+import type { Action, Gate, Graph, Mission, Mode, PolicyContext, Snapshot, Step } from './types';
 export function token(value: unknown): string { return createHash('sha256').update(JSON.stringify(value)).digest('hex'); }
 export function waveGate(m: Mission, ids: string[], snapshot: Snapshot): Gate {
   return {kind:'wave',token:token([m.id,m.round,ids.map(id=>[id,m.scopes[id],snapshot.beads.find(b=>b.id===id)?.status,snapshot.ready.includes(id)])]),detail:`Start workers: ${ids.join(', ')}`,approved:false};
@@ -94,4 +94,25 @@ export function nextAction(m: Mission, snapshot: Snapshot | undefined, policy: P
  const gate = revisionGate(m, 'review', revision);
  if (m.mode === 'pause' && (m.gate?.token !== gate.token || !m.gate.approved)) return {kind: 'hold', detail: gate.detail, gate};
  return {kind: 'review', detail: 'Run independent revision-bound review'};
+}
+/**
+ * The one thing the operator can do now. Holds that wait on a person get a command; states the
+ * coordinator drives get a status line only, so a command is never offered that would do nothing.
+ */
+export function operatorStep(m: Mission, action: Action, p: PolicyContext, ownershipError?: string): Step {
+ if (p.nativePlan) return {text: m.phase === 'plan' ? 'Approve the plan to start the mission' : 'Plan mode is read-only; leave plan mode to continue'};
+ if (ownershipError) return {command: '/mission continue', text: `Lost control of the mission (${ownershipError}); take it back`};
+ if (p.resumeHold && m.phase !== 'complete') return {command: '/mission continue', text: 'Take control of this resumed mission'};
+ if (m.phase === 'complete') return {text: 'Complete. Nothing left to run'};
+ if (action.gate) return {command: '/mission approve', text: action.gate.detail};
+ if (m.blocker) return {command: '/mission actions', text: m.blocker};
+ if (action.kind === 'resend' && action.ids?.length) return {command: `/mission resend ${action.ids[0]}`, text: action.detail};
+ if (action.kind === 'hold') {
+  const delivered = m.evidence.deliver?.outcome === 'passed';
+  if (delivered && !m.reviewRequested) return {command: '/mission review', text: 'Result is ready. Request an independent review, or stop here'};
+  if (delivered && m.evidence.review?.outcome === 'failed') return {command: '/mission review', text: 'The last review failed. Retry it'};
+  if (action.detail.startsWith('Worker identity')) return {command: '/mission actions', text: action.detail};
+  return {text: action.detail};
+ }
+ return {text: `Coordinator: ${action.detail}`};
 }

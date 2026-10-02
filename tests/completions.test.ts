@@ -62,3 +62,11 @@ test("completion values replace the whole argument with a trailing space", () =>
 	expect(item?.value).toBe("config frontend orca ");
 	expect(item?.description).toBe("Orca tab");
 });
+
+test("the recommended verb is listed first and marked with its reason", () => {
+	const items = missionArgumentCompletions("", { ...state, recommended: "continue" }) ?? [];
+	expect(items[0]?.label).toBe("continue");
+	expect(items[0]?.description).toStartWith("▸ Next:");
+	expect(items.filter(item => item.description?.startsWith("▸")).length).toBe(1);
+	expect(missionArgumentCompletions("", state)?.[0]?.label).toBe("show");
+});

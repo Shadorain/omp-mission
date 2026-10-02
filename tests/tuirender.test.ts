@@ -78,7 +78,7 @@ function buildHostileMission(beadCount: number): Projection {
     resumeHold: true,
     nativePlan: true,
     ownershipError: "lock compromised \u001b[31moh no\u001b[0m",
-    nextAction: "doing hostile stuff",
+    step: { command: "/mission continue", text: "doing hostile stuff \u001b[31mred\u001b[0m\nnewline" },
     expanded: true,
   };
 }

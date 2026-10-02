@@ -8,7 +8,7 @@ import { displaySourceId } from "./sources.ts";
 export interface MissionInspectorCallbacks { close(): void; select(beadId: string): void | Promise<void>; actions?: () => void | Promise<void> }
 export type MissionView = "outline" | "history" | "evidence";
 
-const phaseLabel = (phase: Phase) => phase[0]?.toUpperCase() + phase.slice(1);
+export const phaseLabel = (phase: Phase) => phase[0]?.toUpperCase() + phase.slice(1);
 const phaseStatus = (mission: Mission, phase: Phase) => {
 	const evidence = mission.evidence[phase];
 	return evidence?.outcome ?? (mission.phase === phase ? "active" : "pending");
@@ -89,6 +89,18 @@ function detailLine(projection: Projection, theme: Theme, width: number): string
 	return clip(paint(theme, "dim", `  ${details.join(" · ")}`), width);
 }
 
+/** "→ /mission continue  Take control of this resumed mission": the next thing to run, or what the coordinator is doing. */
+function stepLine(projection: Projection, theme: Theme, width: number): string | undefined {
+	const step = projection.step;
+	if (!step) return undefined;
+	const text = step.text.replace(/[\u0000-\u001f\u007f\s]+/g, " ").trim();
+	const base = step.command
+		? `  ${paint(theme, "accent", "→")} ${paint(theme, "accent", step.command)}  ${paint(theme, "text", text)}`
+		: `  ${paint(theme, "dim", `· ${text}`)}`;
+	const hint = paint(theme, "dim", "  ·  /mission for the action menu");
+	return clip(visibleWidth(base) + visibleWidth(hint) <= width ? base + hint : base, width);
+}
+
 function phaseTrack(mission: Mission, theme: Theme, width: number): string {
 	const index = Math.max(0, phases.indexOf(mission.phase));
 	const slots = phases.length;
@@ -142,10 +154,11 @@ function beadLine(bead: Bead, mission: Mission, theme: Theme, width: number): st
 
 export function missionWidgetLines(projection: Projection, width: number, expanded = false, terminalHeight = 18, theme: Theme): readonly string[] {
 	const summary = fitLine(projection, theme, width);
-	if (!expanded) return [summary];
+	const step = stepLine(projection, theme, width);
+	if (!expanded) return step ? [summary, step] : [summary];
 	const cap = Math.max(0, Math.floor(Math.max(0, terminalHeight) * 0.45));
 	if (cap <= 0) return [];
-	const lines = [summary];
+	const lines = step ? [summary, step] : [summary];
 	const title = projection.mission.source.title.replace(/\s+/g, " ").trim();
 	if (title && lines.length < cap) lines.push(clip(paint(theme, "dim", `  ${title}`), width));
 	if (lines.length < cap) lines.push(detailLine(projection, theme, width));

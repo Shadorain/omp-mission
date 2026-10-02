@@ -15,7 +15,7 @@ type Execute = (id: string, params: Params, signal: undefined, update: undefined
 type EventHandler = (event: unknown, context: ExtensionContext) => Promise<void>;
 const noRun: Run = async () => { throw new Error('Unexpected command'); };
 
-async function fixture(graph: Graph, leaves = true, host: { idle?: boolean; pending?: boolean } = {}) {
+async function fixture(graph: Graph, leaves = true, host: { idle?: boolean; pending?: boolean; resumed?: boolean } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'mission-lifecycle-'));
   const cwd = join(root, 'workspace');
   await mkdir(cwd);
@@ -88,7 +88,7 @@ async function fixture(graph: Graph, leaves = true, host: { idle?: boolean; pend
   if (!start || !shutdown || !control) throw new Error('Mission extension unavailable');
   await start({}, context);
   const execute = (params: Params) => control('test', params, undefined, undefined, context);
-  await execute({ operation: 'continue' });
+  if (!host.resumed) await execute({ operation: 'continue' });
   return {
     command: async (args: string) => { await commandHandler!(args, context); }, sent, sentOptions, notices,
     execute, cwd, state: () => loadMission(path),
@@ -166,4 +166,13 @@ test('an idle session is woken with a plain prompt, never a queued follow-up tha
 test('a queued message keeps the model from being woken again', async () => {
   const mission = await fixture('beads', true, { idle: true, pending: true });
   try { expect(mission.sent).toEqual([]); } finally { await mission.dispose(); }
+});
+
+test('/mission review in a resumed session says to run /mission continue instead of staying silent', async () => {
+  const mission = await fixture('local', true, { idle: true, resumed: true });
+  try {
+    await mission.command('review');
+    expect(mission.notices.some(notice => notice.includes('/mission continue'))).toBe(true);
+    expect(mission.sent).toEqual([]);
+  } finally { await mission.dispose(); }
 });

@@ -1,5 +1,5 @@
 import {test,expect} from 'bun:test';
-import {nextAction,setMode,approveGate,enforceMutation,enforceGate,waveGate} from '../src/controller';
+import {nextAction,operatorStep,setMode,approveGate,enforceMutation,enforceGate,waveGate} from '../src/controller';
 import type {Mission,Snapshot,PolicyContext} from '../src/types';
 export function fixture(): Mission {return {version:1,id:'freeform-test',source:{kind:'freeform',id:'test',title:'test',body:'test',comments:'',extra:''},workspace:{key:'key',cwd:'/tmp',delivery:'local'},epicId:'epic',scopes:{a:['a.ts'],b:['b.ts']},phase:'execute',evidence:{},mode:'auto',keep:false,reviewRequested:false,workers:[],reviews:[],repairLinks:{},round:1,createdAt:'now',updatedAt:'now'};}
 const ready:Snapshot={beads:[{id:'a',title:'a',status:'open',children:[],ready:true,category:'ready'},{id:'b',title:'b',status:'open',children:[],ready:true,category:'ready'}],leaves:[],ready:['a','b'],closed:0,active:0,blocked:0,fetchedAt:Date.now()};ready.leaves=ready.beads;
@@ -15,3 +15,20 @@ test('delivery without requested review is not complete',()=>{const m=fixture();
 test('failed review holds until explicitly retried or a new revision is verified',()=>{const m=fixture();m.reviewRequested=true;m.evidence.verify={outcome:'passed',revision:'rev',detail:'Node assertions passed',at:'now'};m.evidence.deliver={outcome:'passed',revision:'rev',detail:'local',at:'now'};m.evidence.review={outcome:'failed',revision:'rev',detail:'Malformed reviewer JSON',at:'now'};expect(nextAction(m,closed,policy).kind).toBe('hold');delete m.evidence.review;expect(nextAction(m,closed,policy).kind).toBe('review');});
 test('empty graph cannot advance to verification or delivery',()=>{const m=fixture();expect(nextAction(m,{...ready,beads:[],leaves:[],ready:[]},policy).kind).toBe('hold');});
 test('Pause independently gates review entry and repair acceptance',()=>{const m=fixture();m.mode='pause';m.reviewRequested=true;m.evidence.verify={outcome:'passed',revision:'rev',detail:'Node assertions passed',at:'now'};m.evidence.deliver={outcome:'passed',revision:'rev',detail:'local',at:'now'};m.gate=nextAction(m,closed,policy).gate;expect(m.gate?.kind).toBe('review');approveGate(m,m.gate!.token);expect(nextAction(m,closed,policy).kind).toBe('review');m.reviews=[{round:1,revision:'rev',model:'independent',summary:'Defect',findings:[{id:'R1',severity:'high',path:'a.ts',line:1,title:'Boundary defect',body:'Boundary defect'}],at:'now'}];m.gate=nextAction(m,closed,policy).gate;expect(m.gate?.kind).toBe('repairs');approveGate(m,m.gate!.token);expect(nextAction(m,closed,policy).kind).toBe('repairs');});
+
+test('operator step names the command a person must run, and stays silent when the coordinator is working',()=>{
+ const step=(m:Mission,p:PolicyContext=policy,snap:Snapshot|undefined=ready,err?:string)=>operatorStep(m,nextAction(m,snap,p),p,err);
+ const m=fixture();
+ expect(step(m,{...policy,resumeHold:true}).command).toBe('/mission continue');
+ expect(step(m,{...policy,owned:false},ready,'lock lost').command).toBe('/mission continue');
+ expect(step(m,{...policy,nativePlan:true}).command).toBeUndefined();
+ expect(step(m).command).toBeUndefined();
+ m.mode='pause';
+ expect(step(m).command).toBe('/mission approve');
+ m.mode='auto';m.evidence.verify={outcome:'passed',revision:'rev',detail:'ok',at:'now'};m.evidence.deliver={outcome:'passed',detail:'local',at:'now'};
+ expect(step(m,policy,closed).command).toBe('/mission review');
+ m.reviewRequested=true;m.evidence.review={outcome:'failed',revision:'rev',detail:'boom',at:'now'};
+ expect(step(m,policy,closed)).toMatchObject({command:'/mission review'});
+ m.phase='complete';
+ expect(step(m,{...policy,resumeHold:true}).command).toBeUndefined();
+});
