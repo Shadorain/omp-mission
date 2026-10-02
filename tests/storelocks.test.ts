@@ -211,20 +211,24 @@ describe("acquireOwnership", () => {
     ].join("\n"));
     const p = join(dir, "m.json");
     const proc = Bun.spawn([process.execPath, childFile, p, JSON.stringify(mkMission("m"))], { stdout: "pipe", stderr: "pipe" });
-    // Real subprocess startup cannot be faked; poll its stdout for the acquisition marker.
-    const decoder = new TextDecoder();
-    const reader = (proc.stdout as ReadableStream<Uint8Array>).getReader();
-    let out = "";
-    const deadline = Date.now() + 15_000;
-    while (!out.includes("ACQUIRED") && Date.now() < deadline) {
-      const { done, value } = await Promise.race([reader.read(), delay(500).then(() => ({ done: false, value: undefined }))]);
-      if (done) break;
-      if (value) out += decoder.decode(value);
+    try {
+      // Real subprocess startup cannot be faked; poll its stdout for the acquisition marker.
+      const decoder = new TextDecoder();
+      const reader = (proc.stdout as ReadableStream<Uint8Array>).getReader();
+      let out = "";
+      const deadline = Date.now() + 15_000;
+      while (!out.includes("ACQUIRED") && Date.now() < deadline) {
+        const { done, value } = await Promise.race([reader.read(), delay(500).then(() => ({ done: false, value: undefined }))]);
+        if (done) break;
+        if (value) out += decoder.decode(value);
+      }
+      expect(out).toContain("ACQUIRED");
+      await expect(acquireOwnership(p, mkMission("m"))).rejects.toMatchObject({ code: "ELOCKED" });
+    } finally {
+      proc.kill(9);
+      await proc.exited;
+      rmSync(root, { recursive: true, force: true });
     }
-    expect(out).toContain("ACQUIRED");
-    await expect(acquireOwnership(p, mkMission("m"))).rejects.toMatchObject({ code: "ELOCKED" });
-    proc.kill(9);
-    rmSync(root, { recursive: true, force: true });
   });
   test("orphaned lockdir: fresh -> ELOCKED, stale (>30s mtime) -> takeover", async () => {
     const root = mkdtempSync(join(tmpdir(), TMP_PREFIX));
