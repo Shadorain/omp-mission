@@ -2,13 +2,32 @@ import {test,expect} from 'bun:test';
 import {mkdtemp,writeFile,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {captureRevision,parseReview} from '../src/review';
+import {captureRevision,parseReview,reviewBudgetMs} from '../src/review';
 import type {Mission,Run} from '../src/types';
 import {validateMission} from '../src/store';
 function mission(cwd:string):Mission{return {version:1,id:'review-test',source:{kind:'freeform',id:'test',title:'review',body:'behavior',comments:'',extra:''},workspace:{key:'key',cwd,delivery:'local'},scopes:{a:['a.ts']},phase:'review',mode:'pause',keep:false,reviewRequested:true,evidence:{},workers:[],reviews:[],repairLinks:{},round:1,createdAt:'now',updatedAt:'now'};}
 const noRun:Run=async()=>{throw new Error('Unexpected CLI');};
 test('declared local file modifications and deletion invalidate captured revision',async()=>{const cwd=await mkdtemp(join(tmpdir(),'mission-revision-'));try{await writeFile(join(cwd,'a.ts'),'broken');const m=mission(cwd);const before=await captureRevision(m,noRun);await writeFile(join(cwd,'a.ts'),'fixed');const after=await captureRevision(m,noRun);expect(after.revision).not.toBe(before.revision);await rm(join(cwd,'a.ts'));expect((await captureRevision(m,noRun)).revision).not.toBe(after.revision);}finally{await rm(cwd,{recursive:true,force:true});}});
 test('local fingerprint refuses escaping scopes',async()=>{const cwd=await mkdtemp(join(tmpdir(),'mission-escape-'));try{const m=mission(cwd);m.scopes.a=['../secret'];await expect(captureRevision(m,noRun)).rejects.toThrow('escapes');}finally{await rm(cwd,{recursive:true,force:true});}});
+test('the review diff is measured from the merge-base of the freshest base ref',async()=>{
+ const cwd=await mkdtemp(join(tmpdir(),'mission-base-'));
+ try{
+  const m=mission(cwd);m.workspace={key:'key',cwd,commonDir:cwd,base:'dev',delivery:'pr'};
+  const diffs:string[][]=[];let originExists=true;
+  const run:Run=async(cmd,args)=>{
+   if(args[0]==='merge-base')return args[2]==='origin/dev'&&originExists?{code:0,stdout:'fresh123\n',stderr:''}:args[2]==='dev'?{code:0,stdout:'stale456\n',stderr:''}:{code:1,stdout:'',stderr:'bad ref'};
+   if(args[0]==='diff'){diffs.push(args);return {code:0,stdout:'',stderr:''};}
+   return {code:0,stdout:'',stderr:''};
+  };
+  await captureRevision(m,run);originExists=false;await captureRevision(m,run);
+  expect(diffs.map(args=>args[1])).toEqual(['fresh123','stale456']);
+ }finally{await rm(cwd,{recursive:true,force:true});}
+});
+test('reviewer time budget grows with the change and is capped',()=>{
+ expect(reviewBudgetMs(0)).toBe(5*60_000);
+ expect(reviewBudgetMs(10)).toBe(5*60_000+150_000);
+ expect(reviewBudgetMs(10_000)).toBe(30*60_000);
+});
 
 // parser/persistence compatibility regressions: parseReview must reject cases validateMission rejects for reviews
 test('parseReview rejects empty/blank/oversized summary (matches review.summary text contract)', () => {

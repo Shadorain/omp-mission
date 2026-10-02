@@ -399,8 +399,10 @@ export default async function missionExtension(pi: ExtensionAPI) {
     }else if(params.operation==='run_review'){
      await refresh(false);const action=nextAction(mission,snapshot,policy(context));
      if(!(action.kind==='review'||action.kind==='hold'&&action.gate?.kind==='review')||!mission.reviewRequested||mission.evidence.verify?.outcome!=='passed'||mission.evidence.deliver?.outcome!=='passed')throw new Error(action.detail);
+     // The review diff is measured from the PR's real base; the mission's guess (e.g. the repo default branch) is wrong for stacked or integration-branch PRs.
+     if(mission.workspace.delivery==='pr'&&mission.workspace.commonDir){const pr=await run('gh',['pr','view','--json','baseRefName'],mission.workspace.cwd);let prBase:unknown;try{prBase=pr.code===0?JSON.parse(pr.stdout).baseRefName:undefined;}catch{/* no PR yet: keep the recorded base */}if(typeof prBase==='string'&&prBase&&prBase!==mission.workspace.base)mission.workspace.base=prBase;}
      const revision=(await captureRevision(mission,run)).revision;if(revision!==mission.evidence.verify.revision)throw new Error('Revision changed since verification');
-     enforceGate(mission,revisionGate(mission,'review',revision));mission.phase='review';mission.evidence.review={outcome:'active',detail:'Independent reviewer running',revision,at:new Date().toISOString()};await persist(mission);reviewStarted=true;
+     enforceGate(mission,revisionGate(mission,'review',revision));mission.phase='review';mission.evidence.review={outcome:'active',detail:'Independent reviewer running',revision,at:new Date().toISOString()};await persist(mission);reviewStarted=true;await render();
      const reviewFiles=await contextFilesFor(config.reviewContext,mission.workspace.cwd,agentDir);const targets=config.frontend==='subagent'&&mission.graph==='beads'&&snapshot?snapshot.leaves.filter(b=>mission!.scopes[b.id]?.length).map(b=>({id:b.id,title:b.title,text:beadTask(b)??b.title,files:mission!.scopes[b.id]!})):[];const result=targets.length>1?await reviewer.runPerBead(mission,context,run,config.modelRole,reviewFiles,targets):await reviewer.run(mission,context,run,config.modelRole,reviewFiles);if(epoch!==generation)throw new Error('Session changed during review');
      consumeGate(mission);
      mission.reviews.push(result);

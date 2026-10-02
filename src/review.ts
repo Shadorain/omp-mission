@@ -7,13 +7,28 @@ import type { Finding, Mission, ReviewRound, Run } from './types';
 import { isRecord } from './guards';
 import { validateFinding, validateReviewSummary } from './store';
 export interface RevisionCapture { revision: string; diff: string; files: string[] }
+/**
+ * The commit the change is measured from: the merge-base of HEAD and the base branch, preferring origin/<base>.
+ * A stale local base branch (or a base that has moved on) would drag unrelated changes into the review diff.
+ */
+async function diffBase(m: Mission, run: Run): Promise<string> {
+ const base=m.workspace.base;if(!base)return 'HEAD';
+ for(const ref of [`origin/${base}`,base]){
+  const found=await run('git',['merge-base','HEAD',ref],m.workspace.cwd);
+  if(found.code===0&&found.stdout.trim())return found.stdout.trim();
+ }
+ return base;
+}
+const countDiffFiles=(diff:string)=>(diff.match(/^diff --git /gm)??[]).length;
+/** Reviewer time budget: 5 minutes plus 15 seconds per changed file, capped at 30 minutes. A fixed 5 minutes aborted large PRs with nothing to show. */
+export const reviewBudgetMs=(changedFiles:number)=>Math.min(30*60_000,300_000+changedFiles*15_000);
 export async function captureRevision(m: Mission, run: Run): Promise<RevisionCapture> {
  const cwd=m.workspace.cwd; const hash=createHash('sha256'); let files:string[];let diff='';
  if(m.workspace.commonDir){
   const head=await run('git',['rev-parse','HEAD'],cwd); if(head.code)throw new Error(head.stderr||'Cannot read HEAD');hash.update(head.stdout);
   const listed=await run('git',['ls-files','-z','--cached','--others','--exclude-standard'],cwd);if(listed.code)throw new Error(listed.stderr);
   files=[...new Set(listed.stdout.split('\0').filter(Boolean))].sort();
-  const changes=await run('git',['diff',m.workspace.base??'HEAD','--'],cwd);if(changes.code)throw new Error(changes.stderr);diff=changes.stdout;
+  const changes=await run('git',['diff',await diffBase(m,run),'--'],cwd);if(changes.code)throw new Error(changes.stderr);diff=changes.stdout;
  }else files=[...new Set(Object.values(m.scopes).flat())].sort();
  const root=await realpath(cwd);
  for(const file of files){
@@ -118,7 +133,7 @@ export async function scopeHash(cwd: string, files: readonly string[]): Promise<
 }
 export type ReviewSession = Pick<AgentSession, 'prompt' | 'dispose' | 'state'>;
 type Model = NonNullable<ExtensionContext['model']>;
-export type ReviewOpener = (m: Mission, ctx: ExtensionContext, model: Model, contextFiles: Array<{ path: string; content: string }> | undefined, note: string) => Promise<{ session: ReviewSession }>;
+export type ReviewOpener = (m: Mission, ctx: ExtensionContext, model: Model, contextFiles: Array<{ path: string; content: string }> | undefined, note: string, budgetMs?: number) => Promise<{ session: ReviewSession }>;
 export class Reviewer {
  private sessions = new Set<ReviewSession>();
  constructor(private readonly opener?: ReviewOpener) {}
@@ -140,15 +155,16 @@ export class Reviewer {
   const first=!previous?.beads;
   const changed=targets.filter(target=>first||previous!.beads![target.id]!==hashes[target.id]);
   const integrate=first||changed.length===0;
+  const from=await diffBase(m,run);
   const jobs:Array<Promise<{label:string;beadId?:string;result:Pick<ReviewRound,'summary'|'findings'>}>>=[];
   for(const target of changed){
    const files=owned(target);
    jobs.push((async()=>{
-    const diff=m.workspace.commonDir?await run('git',['diff',m.workspace.base??'HEAD','--',...files],m.workspace.cwd):undefined;
+    const diff=m.workspace.commonDir?await run('git',['diff',from,'--',...files],m.workspace.cwd):undefined;
     if(diff?.code)throw new Error(diff.stderr||`Cannot diff ${target.id}`);
     const bounded=boundDiff(diff?.stdout??'');
     const payload=JSON.stringify({reviewedRevision:captured.revision,bead:{id:target.id,title:target.title,task:target.text},source:{title:m.source.title},files,diff:bounded.diff,...(bounded.omitted.length?{omittedDiffs:bounded.omitted}:{}),previousFindings:previous?.findings.filter(finding=>finding.beadId===target.id)});
-    const parsed=await this.#review(m,ctx,model,contextFiles,BEAD_NOTE,payload,captured.revision);
+    const parsed=await this.#review(m,ctx,model,contextFiles,BEAD_NOTE,payload,captured.revision,files.length);
     return {label:target.id,beadId:target.id,result:parsed};
    })());
   }
@@ -156,7 +172,7 @@ export class Reviewer {
    jobs.push((async()=>{
     const bounded=boundDiff(captured.diff);
     const payload=JSON.stringify({reviewedRevision:captured.revision,source:m.source,workspace:m.workspace,beads:targets.map(target=>({id:target.id,title:target.title,files:target.files})),verification:m.evidence.verify,files:captured.files,diff:bounded.diff,...(bounded.omitted.length?{omittedDiffs:bounded.omitted}:{}),previousFindings:previous?.findings.filter(finding=>!finding.beadId)});
-    const parsed=await this.#review(m,ctx,model,contextFiles,INTEGRATION_NOTE,payload,captured.revision);
+    const parsed=await this.#review(m,ctx,model,contextFiles,INTEGRATION_NOTE,payload,captured.revision,countDiffFiles(captured.diff));
     return {label:'integration',result:parsed};
    })());
   }
@@ -177,15 +193,15 @@ export class Reviewer {
   const summary=validateReviewSummary(outcomes.map(outcome=>`[${outcome.label}] ${outcome.result.summary}`).join('\n').slice(0,49_000));
   return {round:m.round,revision:captured.revision,model:`${model.provider}/${model.id}`,summary,findings,at:new Date().toISOString(),beads:hashes};
  }
- async #review(m: Mission, ctx: ExtensionContext, model: Model, contextFiles: Array<{ path: string; content: string }> | undefined, note: string, payload: string, revision: string): Promise<Pick<ReviewRound,'summary'|'findings'>> {
-  const opened=await (this.opener??((...args)=>this.#open(...args)))(m,ctx,model,contextFiles,note);const session=opened.session;this.sessions.add(session);
+ async #review(m: Mission, ctx: ExtensionContext, model: Model, contextFiles: Array<{ path: string; content: string }> | undefined, note: string, payload: string, revision: string, changedFiles: number): Promise<Pick<ReviewRound,'summary'|'findings'>> {
+  const opened=await (this.opener??((...args)=>this.#open(...args)))(m,ctx,model,contextFiles,note,reviewBudgetMs(changedFiles));const session=opened.session;this.sessions.add(session);
   try{
    await session.prompt(payload,{expandPromptTemplates:false});
    const {summary,findings}=parseReview(finalText(session),revision);
    return {summary,findings};
   }finally{this.sessions.delete(session);await session.dispose();}
  }
- async #open(m: Mission, ctx: ExtensionContext, model: Model, contextFiles: Array<{ path: string; content: string }> | undefined, note: string) {
+ async #open(m: Mission, ctx: ExtensionContext, model: Model, contextFiles: Array<{ path: string; content: string }> | undefined, note: string, budgetMs = reviewBudgetMs(0)) {
   const opened=await createAgentSession({
    cwd: m.workspace.cwd, authStorage: ctx.modelRegistry.authStorage,
    modelRegistry: ctx.modelRegistry, model, ...(contextFiles ? { contextFiles } : {}),
@@ -199,7 +215,7 @@ export class Reviewer {
    settings: Settings.isolated({'advisor.enabled':false,'autolearn.enabled':false,'compaction.enabled':false,'retry.enabled':true}),
    agentId: `mission-review-${crypto.randomUUID()}`,
    agentDisplayName: 'Mission independent review', agentRegistry: new AgentRegistry(),
-   deadline: Date.now() + 300000,
+   deadline: Date.now() + budgetMs,
   });
   return opened;
  }
@@ -208,21 +224,7 @@ export class Reviewer {
   const model = pickRoleModel(roleModelString(role), ctx.modelRegistry.getAvailable()) ?? ctx.model;
   const captured=await captureRevision(m,run);
   if(m.evidence.verify?.revision!==captured.revision)throw new Error('Files changed since verification; reverify before review');
-  const {session} = await createAgentSession({
-   cwd: m.workspace.cwd, authStorage: ctx.modelRegistry.authStorage,
-   modelRegistry: ctx.modelRegistry, model, ...(contextFiles ? { contextFiles } : {}),
-   appendSystemPrompt: REVIEW_SYSTEM,
-   hasUI: false, enableLsp: false, enableMCP: false, enableIrc: false,
-   skipPythonPreflight: true, disableExtensionDiscovery: true, bindProcessState: false,
-   toolNames: ['read', 'grep', 'glob', 'find'], restrictToolNames: true,
-   requireYieldTool: false, customTools: [], skills: [], rules: [],
-   promptTemplates: [], slashCommands: [],
-   sessionManager: SessionManager.inMemory(),
-   settings: Settings.isolated({'advisor.enabled':false,'autolearn.enabled':false,'compaction.enabled':false,'retry.enabled':true}),
-   agentId: `mission-review-${crypto.randomUUID()}`,
-   agentDisplayName: 'Mission independent review', agentRegistry: new AgentRegistry(),
-   deadline: Date.now() + 300000,
-  });
+  const {session} = await this.#open(m,ctx,model,contextFiles,'',reviewBudgetMs(countDiffFiles(captured.diff)));
   this.sessions.add(session);
   try{
    const bounded=boundDiff(captured.diff);
