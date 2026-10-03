@@ -225,6 +225,7 @@ function evidenceRows(mission: Mission): string[] {
 	});
 	for (const review of mission.reviews) {
 		rows.push(`Review ${review.revision} · ${review.at}`);
+		for (const [label, file] of Object.entries(review.transcripts ?? {})) rows.push(`Reviewer ${label} · ${file}`);
 		for (const finding of review.findings) {
 			rows.push(`${finding.id} · ${finding.severity} · ${finding.path}:${finding.line} · ${finding.title}: ${finding.body}`);
 			if (finding.rejection) rows.push(`Rejected: ${finding.rejection}`);

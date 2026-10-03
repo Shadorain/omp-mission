@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { readFile, realpath, lstat, readlink } from 'node:fs/promises';
+import { mkdir, readFile, realpath, lstat, readlink } from 'node:fs/promises';
 import { resolve, relative, isAbsolute } from 'node:path';
 import { inScope } from './scope';
 import { AgentRegistry, createAgentSession, SessionManager, Settings, settings, type AgentSession, type ExtensionContext } from '@oh-my-pi/pi-coding-agent';
@@ -153,10 +153,14 @@ export async function scopeHash(cwd: string, files: readonly string[]): Promise<
 }
 export type ReviewSession = Pick<AgentSession, 'prompt' | 'dispose' | 'state'>;
 type Model = NonNullable<ExtensionContext['model']>;
-export type ReviewOpener = (m: Mission, ctx: ExtensionContext, model: Model, contextFiles: Array<{ path: string; content: string }> | undefined, note: string, budgetMs?: number) => Promise<{ session: ReviewSession }>;
+export type ReviewAgent = { id: string; label: string };
+export type ReviewOpener = (m: Mission, ctx: ExtensionContext, model: Model, contextFiles: Array<{ path: string; content: string }> | undefined, note: string, budgetMs?: number, agent?: ReviewAgent) => Promise<{ session: ReviewSession; file?: string }>;
+/** Where reviewer transcripts go and who hears about each reviewer. Without a dir the session stays in memory. */
+export interface ReviewWatch { sessionDir?: (m: Mission) => string; progress?: (event: { label: string; state: 'running' | 'closed' | 'error' }) => void }
+const reviewAgent = (label: string): ReviewAgent => ({ id: `review-${label}-${crypto.randomUUID().slice(0, 8)}`, label });
 export class Reviewer {
  private sessions = new Set<ReviewSession>();
- constructor(private readonly opener?: ReviewOpener) {}
+ constructor(private readonly opener?: ReviewOpener, private readonly watch: ReviewWatch = {}) {}
  async dispose(): Promise<void> {const all=[...this.sessions];this.sessions.clear();await Promise.all(all.map(session=>session.dispose().catch(()=>{})));}
  /**
   * One reviewer per bead in parallel, plus one integration pass on the first round. A later round
@@ -176,7 +180,7 @@ export class Reviewer {
   const changed=targets.filter(target=>first||previous!.beads![target.id]!==hashes[target.id]);
   const integrate=first||changed.length===0;
   const from=await diffBase(m,run);
-  const jobs:Array<Promise<{label:string;beadId?:string;result:Pick<ReviewRound,'summary'|'findings'>}>>=[];
+  const jobs:Array<Promise<{label:string;beadId?:string;result:Pick<ReviewRound,'summary'|'findings'>&{file?:string}}>>=[];
   for(const target of changed){
    const files=owned(target);
    jobs.push((async()=>{
@@ -211,18 +215,26 @@ export class Reviewer {
    findings.push({...finding,id:`${outcome.label}:${finding.id}`,...(outcome.beadId?{beadId:outcome.beadId}:{})});
   }
   const summary=validateReviewSummary(outcomes.map(outcome=>`[${outcome.label}] ${outcome.result.summary}`).join('\n').slice(0,49_000));
-  return {round:m.round,revision:captured.revision,model:`${model.provider}/${model.id}`,summary,findings,at:new Date().toISOString(),beads:hashes};
+  const transcripts=Object.fromEntries(outcomes.flatMap(outcome=>outcome.result.file?[[outcome.label,outcome.result.file]]:[]));
+  return {round:m.round,revision:captured.revision,model:`${model.provider}/${model.id}`,summary,findings,at:new Date().toISOString(),beads:hashes,...(Object.keys(transcripts).length?{transcripts}:{})};
  }
- async #review(m: Mission, ctx: ExtensionContext, model: Model, contextFiles: Array<{ path: string; content: string }> | undefined, note: string, payload: string, revision: string, changedFiles: number, label: string): Promise<Pick<ReviewRound,'summary'|'findings'>> {
-  const opened=await (this.opener??((...args)=>this.#open(...args)))(m,ctx,model,contextFiles,note,reviewBudgetMs(changedFiles));const session=opened.session;this.sessions.add(session);
+ async #review(m: Mission, ctx: ExtensionContext, model: Model, contextFiles: Array<{ path: string; content: string }> | undefined, note: string, payload: string, revision: string, changedFiles: number, label: string): Promise<Pick<ReviewRound,'summary'|'findings'>&{file?:string}> {
+  this.watch.progress?.({label,state:'running'});
+  let state:'closed'|'error'='error';let session:ReviewSession|undefined;let file:string|undefined;
   try{
+   const opened=await (this.opener??((...args)=>this.#open(...args)))(m,ctx,model,contextFiles,note,reviewBudgetMs(changedFiles),reviewAgent(label));session=opened.session;file=opened.file;this.sessions.add(session);
    await session.prompt(payload,{expandPromptTemplates:false});
    const {summary,findings}=await collectReview(session,revision);
-   return {summary,findings};
+   state='closed';
+   return {summary,findings,...(file?{file}:{})};
   }catch(error){throw new Error(`[${label}] ${error instanceof Error?error.message:String(error)}`);}
-  finally{this.sessions.delete(session);await session.dispose();}
+  finally{if(session){this.sessions.delete(session);await session.dispose();}this.watch.progress?.({label,state});}
  }
- async #open(m: Mission, ctx: ExtensionContext, model: Model, contextFiles: Array<{ path: string; content: string }> | undefined, note: string, budgetMs = reviewBudgetMs(0)) {
+ async #open(m: Mission, ctx: ExtensionContext, model: Model, contextFiles: Array<{ path: string; content: string }> | undefined, note: string, budgetMs = reviewBudgetMs(0), agent: ReviewAgent = reviewAgent('review')) {
+  const dir=this.watch.sessionDir?.(m);
+  if(dir)await mkdir(dir,{recursive:true});
+  const manager=dir?SessionManager.create(m.workspace.cwd,dir):SessionManager.inMemory();
+  await manager.setSessionName(`mission review ${agent.label} · ${m.source.id.replace(/^[a-z]+:/i,'')}`,'user');
   const opened=await createAgentSession({
    cwd: m.workspace.cwd, authStorage: ctx.modelRegistry.authStorage,
    modelRegistry: ctx.modelRegistry, model, ...(contextFiles ? { contextFiles } : {}),
@@ -232,27 +244,30 @@ export class Reviewer {
    toolNames: ['read', 'grep', 'glob', 'find'], restrictToolNames: true,
    requireYieldTool: false, customTools: [], skills: [], rules: [],
    promptTemplates: [], slashCommands: [],
-   sessionManager: SessionManager.inMemory(),
+   sessionManager: manager,
    settings: Settings.isolated({'advisor.enabled':false,'autolearn.enabled':false,'compaction.enabled':false,'retry.enabled':true}),
-   agentId: `mission-review-${crypto.randomUUID()}`,
-   agentDisplayName: 'Mission independent review', agentRegistry: new AgentRegistry(),
+   // A subagent of the main session in the global registry, like a bead worker, so Agent Hub lists it while it runs.
+   agentId: agent.id, agentDisplayName: `mission review ${agent.label}`, parentAgentId: 'Main', taskDepth: 1, agentRegistry: AgentRegistry.global(),
    deadline: Date.now() + budgetMs,
   });
-  return opened;
+  return {session:opened.session,file:dir?manager.getSessionFile():undefined};
  }
  async run(m: Mission, ctx: ExtensionContext, run: Run, role = 'default', contextFiles?: Array<{ path: string; content: string }>): Promise<ReviewRound> {
   if(!ctx.model||!ctx.modelRegistry)throw new Error('Coordinator model/registry unavailable');
   const model = pickRoleModel(roleModelString(role), ctx.modelRegistry.getAvailable()) ?? ctx.model;
   const captured=await captureRevision(m,run);
   if(m.evidence.verify?.revision!==captured.revision)throw new Error('Files changed since verification; reverify before review');
-  const {session} = await this.#open(m,ctx,model,contextFiles,'',reviewBudgetMs(countDiffFiles(captured.diff)));
-  this.sessions.add(session);
+  const label='review';this.watch.progress?.({label,state:'running'});
+  let state:'closed'|'error'='error';let session:ReviewSession|undefined;let file:string|undefined;
   try{
+   const opened=await this.#open(m,ctx,model,contextFiles,'',reviewBudgetMs(countDiffFiles(captured.diff)),reviewAgent(label));session=opened.session;file=opened.file;
+   this.sessions.add(session);
    const bounded=boundDiff(captured.diff);
    await session.prompt(JSON.stringify({reviewedRevision:captured.revision,source:m.source,workspace:m.workspace,scopes:m.scopes,verification:m.evidence.verify,files:captured.files,diff:bounded.diff,...(bounded.omitted.length?{omittedDiffs:bounded.omitted}:{}),previousFindings:m.reviews.at(-1)?.findings}),{expandPromptTemplates:false});
    const result=await collectReview(session,captured.revision);
    const after=await captureRevision(m,run);if(after.revision!==captured.revision)throw new Error('Revision changed during review; result invalidated');
-   return {...result,round:m.round,model:`${model.provider}/${model.id}`,at:new Date().toISOString()};
-  }finally{this.sessions.delete(session);await session.dispose();}
+   state='closed';
+   return {...result,round:m.round,model:`${model.provider}/${model.id}`,at:new Date().toISOString(),...(file?{transcripts:{[label]:file}}:{})};
+  }finally{if(session){this.sessions.delete(session);await session.dispose();}this.watch.progress?.({label,state});}
  }
 }

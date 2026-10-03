@@ -1,5 +1,6 @@
 import { realpath } from 'node:fs/promises';
-import { isAbsolute } from 'node:path';
+import { isAbsolute, join } from 'node:path';
+import { homedir } from 'node:os';
 import { matchesKey } from '@oh-my-pi/pi-tui';
 import { z } from '@oh-my-pi/pi-coding-agent';
 import type { ExtensionAPI, ExtensionContext } from '@oh-my-pi/pi-coding-agent';
@@ -41,7 +42,10 @@ export default async function missionExtension(pi: ExtensionAPI) {
  let generation=0;let refreshing=false;let lastPoll=0;let lastWake='';let autoBlocked='';let quiet=false;let expanded=false;let outlineOffset=0;let selected:string|undefined;let history:Projection['history'];let timer:Timer|undefined;let overlayAbort:AbortController|undefined;let operation=false;let terminalInputDispose:(()=>void)|undefined;let subagents:SubagentRow[]=[];
  let lifetime=new AbortController();let operationSignal:AbortSignal|undefined;
  let inspectionIntent:{mode?:Mode;reviewRequested?:boolean}={};
- const reviewer=new Reviewer();
+ let reviewRows:SubagentRow[]=[];
+ // Reviewers are in-process sessions: list them in the mission outline while they run, and keep their transcripts (also in Agent Hub) so a finished review can be inspected.
+ const reviewDir=(m:Mission)=>join(agentDir,'missions',m.workspace.key,'reviews',m.id);
+ const reviewer=new Reviewer(undefined,{sessionDir:reviewDir,progress:({label,state})=>{const id=`review:${label}`;reviewRows=[...reviewRows.filter(row=>row.id!==id),{id,name:label==='review'?'review':`review ${label}`,kind:'task',state}];void render();}});
  const run:Run=async(command,args,cwd,env)=>{
   const epoch=generation;const signal=operationSignal?AbortSignal.any([lifetime.signal,operationSignal]):lifetime.signal;signal.throwIfAborted();
   const mutating=(command==='orca'&&args[0]==='terminal'&&['create','send','close'].includes(args[1]??''))||(command==='herdr'&&((args[0]==='tab'&&['create','close'].includes(args[1]??''))||(args[0]==='agent'&&['start','prompt'].includes(args[1]??''))))||command==='bash'||(command==='kill'&&args[0]!=='-0');
@@ -60,7 +64,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
    ownershipError, selected, history, expanded, outlineOffset,
    nativePlan: ctx ? nativePlan(ctx) : false,
    step: ctx ? currentStep(ctx) : undefined,
-   frontend: config.frontend, expandKey: config.keys.expand, subagents,
+   frontend: config.frontend, expandKey: config.keys.expand, subagents: [...subagents,...reviewRows],
   };
  };
  // A pending mission has no saved action yet; a saved one asks the controller what a person can do now.
@@ -117,7 +121,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
  }
  async function acquire(){if(!mission||!path)throw new Error('No saved mission');if(ownership){await ownership.assertOwned();return;}ownershipError=undefined;ownership=await acquireOwnership(path,mission,error=>{ownershipError=`Controller lost: ${error.message}`;resumeHold=true;lastWake='';void reviewer.dispose();void render();});mission=ownership.mission;mission.controllerNonce=ownership.nonce;}
  async function release(){const current=ownership;ownership=undefined;await current?.release();}
- async function detach(context?:ExtensionContext){generation++;lifetime.abort();lifetime=new AbortController();terminalInputDispose?.();terminalInputDispose=undefined;overlayAbort?.abort();overlayAbort=undefined;if(timer&&ctx)ctx.clearTimer(timer);timer=undefined;await reviewer.dispose();await workerAgents.abortAll();await release();ctx?.ui.setWidget('mission',undefined);ctx=context;mission=undefined;pending=undefined;path=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;lastWake='';guided='';selected=undefined;history=undefined;lastPoll=0;outlineOffset=0;inspectionIntent={};subagents=[];}
+ async function detach(context?:ExtensionContext){generation++;lifetime.abort();lifetime=new AbortController();terminalInputDispose?.();terminalInputDispose=undefined;overlayAbort?.abort();overlayAbort=undefined;if(timer&&ctx)ctx.clearTimer(timer);timer=undefined;await reviewer.dispose();await workerAgents.abortAll();await release();ctx?.ui.setWidget('mission',undefined);ctx=context;mission=undefined;pending=undefined;path=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;lastWake='';guided='';selected=undefined;history=undefined;lastPoll=0;outlineOffset=0;inspectionIntent={};subagents=[];reviewRows=[];}
  async function attach(file:string,context:ExtensionContext,announce=true){await release();mission=await loadMission(file);path=file;pending=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;ctx=context;await refresh(false);await render();
   const step=announce?currentStep(context):undefined;
   if(step)context.ui.notify(`${displaySourceId(mission.source)} · ${phaseLabel(mission.phase)}. ${step.command?`Next: ${step.command} — `:''}${step.text}. /mission opens the action menu.`,'info');
@@ -239,9 +243,10 @@ export default async function missionExtension(pi: ExtensionAPI) {
   void control({operation:'run_review'},context).then(()=>{
    const round=mission?.reviews.at(-1);const open=round?.findings.filter(finding=>!finding.rejection).length??0;
    const took=`${Math.round((Date.now()-startedAt)/1000)}s`;
+   const transcripts=mission?.reviews.at(-1)?.transcripts?` Reviewer transcripts: ${Object.keys(mission.reviews.at(-1)!.transcripts!).join(', ')} (paths in /mission show, evidence view; open one with omp --resume <path>).`:'';
    // A bare "passed" proves nothing happened; say what the reviewers reported, and where the full text is.
    const checked=round?.summary.replace(/\s+/g,' ').trim();const excerpt=checked?` ${checked.length>280?`${checked.slice(0,280)}…`:checked} (full text: /mission show, evidence view)`:'';
-   context.ui.notify(round?(open?`Independent review found ${open} issue${open===1?'':'s'} in ${took}. /mission shows the next step.`:`Independent review passed with no findings in ${took}.${excerpt}`):'Independent review finished.','info');
+   context.ui.notify(round?(open?`Independent review found ${open} issue${open===1?'':'s'} in ${took}. /mission shows the next step.${transcripts}`:`Independent review passed with no findings in ${took}.${excerpt}${transcripts}`):'Independent review finished.','info');
   },error=>{reviewBlocked=signature;context.ui.notify(`Review failed: ${error instanceof Error?error.message:String(error)}. /mission review retries it.`,'error');});
   return true;
  }
@@ -432,7 +437,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
      // The review diff is measured from the PR's real base; the mission's guess (e.g. the repo default branch) is wrong for stacked or integration-branch PRs.
      if(mission.workspace.delivery==='pr'&&mission.workspace.commonDir){const pr=await run('gh',['pr','view','--json','baseRefName'],mission.workspace.cwd);let prBase:unknown;try{prBase=pr.code===0?JSON.parse(pr.stdout).baseRefName:undefined;}catch{/* no PR yet: keep the recorded base */}if(typeof prBase==='string'&&prBase&&prBase!==mission.workspace.base)mission.workspace.base=prBase;}
      const revision=(await captureRevision(mission,run)).revision;if(revision!==mission.evidence.verify.revision)throw new Error('Revision changed since verification');
-     enforceGate(mission,revisionGate(mission,'review',revision));mission.phase='review';mission.evidence.review={outcome:'active',detail:'Independent reviewer running',revision,at:new Date().toISOString()};await persist(mission);reviewStarted=true;await render();
+     enforceGate(mission,revisionGate(mission,'review',revision));mission.phase='review';mission.evidence.review={outcome:'active',detail:'Independent reviewer running',revision,at:new Date().toISOString()};await persist(mission);reviewStarted=true;reviewRows=[];await render();
      const reviewFiles=await contextFilesFor(config.reviewContext,mission.workspace.cwd,agentDir);const targets=config.frontend==='subagent'&&mission.graph==='beads'&&snapshot?snapshot.leaves.filter(b=>mission!.scopes[b.id]?.length).map(b=>({id:b.id,title:b.title,text:beadTask(b)??b.title,files:mission!.scopes[b.id]!})):[];const result=targets.length>1?await reviewer.runPerBead(mission,context,run,config.modelRole,reviewFiles,targets):await reviewer.run(mission,context,run,config.modelRole,reviewFiles);if(epoch!==generation)throw new Error('Session changed during review');
      consumeGate(mission);
      mission.reviews.push(result);

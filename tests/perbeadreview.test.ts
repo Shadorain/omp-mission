@@ -188,3 +188,25 @@ test('per-bead hashes and finding bead ids survive saving the mission, so the ne
   expect(reloaded.reviews[0]!.beads).toEqual(round.beads);
   expect(reloaded.reviews[0]!.findings.some(f => f.beadId === 'bd-a')).toBe(true);
 });
+
+test('each reviewer is reported as running then closed, and its transcript file is recorded on the round', async () => {
+  const m = await missionAt();
+  const events: string[] = [];
+  const withFile: ReviewOpener = async (...args) => ({ ...(await opener([], () => ({ summary: 'ok', findings: [] }))(...args)), file: `/transcripts/${args[6]?.label}.jsonl` });
+  const round = await new Reviewer(withFile, { progress: event => events.push(`${event.label}:${event.state}`) }).runPerBead(m, ctx, real, 'default', undefined, targets);
+  expect(round.transcripts).toEqual({ 'bd-a': '/transcripts/bd-a.jsonl', 'bd-b': '/transcripts/bd-b.jsonl', integration: '/transcripts/integration.jsonl' });
+  for (const label of ['bd-a', 'bd-b', 'integration']) expect(events.filter(event => event.startsWith(`${label}:`))).toEqual([`${label}:running`, `${label}:closed`]);
+});
+
+test('a reviewer that fails is reported as error', async () => {
+  const m = await missionAt();
+  const events: string[] = [];
+  const failing: ReviewOpener = async (...args) => {
+    const session = await opener([], () => ({ summary: 's', findings: [] }))(...args);
+    if (args[6]?.label === 'bd-b') (session.session as { prompt: unknown }).prompt = async () => { throw new Error('model unavailable'); };
+    return session;
+  };
+  await expect(new Reviewer(failing, { progress: event => events.push(`${event.label}:${event.state}`) }).runPerBead(m, ctx, real, 'default', undefined, targets)).rejects.toThrow(/\[bd-b\] model unavailable/);
+  expect(events).toContain('bd-b:error');
+  expect(events).toContain('bd-a:closed');
+});

@@ -12,7 +12,7 @@
 |`src/isolate.ts`|Checkout reuse or worktree creation, bead database discovery. Used by `bind_workspace` when arguments are omitted.|
 |`src/beads.ts`|Reads the bead graph and history through `bd`.|
 |`src/sources.ts`|Parses `/mission` input, fetches ticket source, inspects the workspace.|
-|`src/review.ts`|Revision fingerprint and the independent reviewer session. `runPerBead` runs one reviewer per bead in parallel plus an integration pass, and re-reviews only beads whose owned files changed.|
+|`src/review.ts`|Revision fingerprint and the independent reviewer session. `runPerBead` runs one reviewer per bead in parallel plus an integration pass, and re-reviews only beads whose owned files changed. Reviewers are registered as subagents of Main (global registry, `taskDepth: 1`), emit progress events, and persist transcripts that `ReviewRound.transcripts` points at.|
 |`src/prompts.ts`|Coordinator and worker prompts, plus per-step guides.|
 |`src/status.ts`|Model-facing views of mission and graph state.|
 |`src/ui.ts`, `src/completions.ts`, `src/config.ts`|Widget and inspector, argument completion, `mission.json`.|
