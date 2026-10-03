@@ -116,6 +116,43 @@ test('one failed reviewer fails the whole round instead of passing a partial rev
   await expect(new Reviewer(failing).runPerBead(m, ctx, real, 'default', undefined, targets)).rejects.toThrow(/model unavailable/);
 });
 
+/** A reviewer whose first reply echoes a slipped revision; when told the reply was rejected it answers correctly, or stays wrong if stubborn. */
+function slipping(stubborn: boolean, prompts: string[]): ReviewOpener {
+  return async () => {
+    const messages: unknown[] = [];
+    let revision = '';
+    const say = (reviewedRevision: string) => messages.push({ role: 'assistant', content: [{ type: 'text', text: JSON.stringify({ reviewedRevision, summary: 'ok', findings: [] }) }] });
+    return {
+      session: {
+        state: { messages } as never,
+        async prompt(text: string) {
+          prompts.push(text);
+          if (text.startsWith('Your reply was rejected')) return say(stubborn ? 'still-wrong' : revision);
+          revision = String((JSON.parse(text) as Record<string, unknown>).reviewedRevision);
+          say(`${revision.slice(0, 8)}-slipped`);
+        },
+        async dispose() {},
+      } as never,
+    };
+  };
+}
+
+test('a reply that fails to parse is corrected once in the same session instead of failing the round', async () => {
+  const m = await missionAt();
+  const prompts: string[] = [];
+  const round = await new Reviewer(slipping(false, prompts)).runPerBead(m, ctx, real, 'default', undefined, targets);
+  expect(round.summary).toContain('[bd-a] ok');
+  const corrections = prompts.filter(text => text.startsWith('Your reply was rejected'));
+  expect(corrections).toHaveLength(3);
+  expect(corrections[0]).toContain('does not match the revision under review');
+  expect(corrections[0]).toContain(round.revision);
+});
+
+test('a reply that stays invalid fails the round and names the reviewer and the reason', async () => {
+  const m = await missionAt();
+  await expect(new Reviewer(slipping(true, [])).runPerBead(m, ctx, real, 'default', undefined, targets)).rejects.toThrow(/^\[(bd-a|bd-b|integration)\] reviewedRevision "still-wrong" does not match the revision under review \(the reviewer was asked once to correct/);
+});
+
 test('files edited during review invalidate the round', async () => {
   const m = await missionAt();
   const sneaky = opener([], () => ({ summary: 's', findings: [] }));

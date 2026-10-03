@@ -233,11 +233,15 @@ export default async function missionExtension(pi: ExtensionAPI) {
   const m=mission;if(!m||action.kind!=='review'||action.gate||!m.reviewRequested)return false;
   const signature=JSON.stringify([m.id,m.round,m.evidence.verify?.revision,m.reviews.length]);
   if(signature===reviewBlocked)return false;
+  const startedAt=Date.now();
   context.ui.notify('Independent review started in its own session. It can take several minutes; the result is reported here.','info');
   // Fire and forget: a review can outlast the command handler, and every outcome is reported through notify.
   void control({operation:'run_review'},context).then(()=>{
    const round=mission?.reviews.at(-1);const open=round?.findings.filter(finding=>!finding.rejection).length??0;
-   context.ui.notify(round?(open?`Independent review found ${open} issue${open===1?'':'s'}. /mission shows the next step.`:'Independent review passed with no findings.'):'Independent review finished.','info');
+   const took=`${Math.round((Date.now()-startedAt)/1000)}s`;
+   // A bare "passed" proves nothing happened; say what the reviewers reported, and where the full text is.
+   const checked=round?.summary.replace(/\s+/g,' ').trim();const excerpt=checked?` ${checked.length>280?`${checked.slice(0,280)}…`:checked} (full text: /mission show, evidence view)`:'';
+   context.ui.notify(round?(open?`Independent review found ${open} issue${open===1?'':'s'} in ${took}. /mission shows the next step.`:`Independent review passed with no findings in ${took}.${excerpt}`):'Independent review finished.','info');
   },error=>{reviewBlocked=signature;context.ui.notify(`Review failed: ${error instanceof Error?error.message:String(error)}. /mission review retries it.`,'error');});
   return true;
  }

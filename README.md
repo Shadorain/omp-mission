@@ -111,6 +111,8 @@ The review diff is measured from the merge-base of `HEAD` and the base branch (p
 
 A requested review starts in the extension, with no coordinator model turn, as soon as it is ready: typing `/mission review`, a Force mission reaching review, a review request replayed by `/mission continue`, or `/mission approve` at the review gate in Pause. Progress and the outcome are reported as notices. If the start fails, the same request is handed to the coordinator once and `/mission review` retries it.
 
+A reviewer reply that fails to parse (stale `reviewedRevision`, missing `summary` or `findings`, not JSON) is sent back once in the same session with the reason, because one slip would otherwise discard every other reviewer's finished work. A reply that is still invalid fails the round with `[bead-id] <reason>`. The outcome notice reports the elapsed time and what the reviewers said (an excerpt of the summary); the full text is in the inspector's evidence view.
+
 `/mission approve` also runs the step it approves: at a wave gate it dispatches the wave, and at a repairs gate it accepts the repairs. Judgement stays with the coordinator: graph scopes, verification, delivery, repair work and rejecting findings.
 
 Accepting local repairs advances the review round and clears earlier verification and delivery evidence. Passing verification requires changed output while actionable findings remain. Beads repairs advance the round when their finding-linked graph is bound; verification requires a nonempty graph whose implementation leaves are completed (`closed` or `done`).

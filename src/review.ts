@@ -50,8 +50,14 @@ export async function captureRevision(m: Mission, run: Run): Promise<RevisionCap
  return {revision:hash.digest('hex'),diff,files};
 }
 export function parseReview(text: string, revision: string): Pick<ReviewRound,'revision'|'summary'|'findings'> {
- const raw: unknown = JSON.parse(text.replace(/^```(?:json)?\s*\n?/, '').replace(/\n?```\s*$/, ''));
- if(!isRecord(raw) || raw.reviewedRevision!==revision || typeof raw.summary!=='string'||!Array.isArray(raw.findings))throw new Error('Invalid review response or revision');
+ const quote=(value:string)=>JSON.stringify(value.length>160?`${value.slice(0,160)}…`:value);
+ let raw: unknown;
+ try{raw=JSON.parse(text.replace(/^```(?:json)?\s*\n?/, '').replace(/\n?```\s*$/, ''));}
+ catch{throw new Error(`Reply is not a JSON object (it starts ${quote(text.trim())})`);}
+ if(!isRecord(raw))throw new Error(`Reply is not a JSON object (it starts ${quote(text.trim())})`);
+ if(raw.reviewedRevision!==revision)throw new Error(`reviewedRevision ${typeof raw.reviewedRevision==='string'?quote(raw.reviewedRevision):'is missing'} does not match the revision under review`);
+ if(typeof raw.summary!=='string')throw new Error('summary must be a string');
+ if(!Array.isArray(raw.findings))throw new Error('findings must be an array');
  const summary = validateReviewSummary(raw.summary);
  const ids=new Set<string>();
  const findings: Finding[] = [];
@@ -63,6 +69,20 @@ export function parseReview(text: string, revision: string): Pick<ReviewRound,'r
   findings.push(actionable);
  }
  return {revision,summary,findings};
+}
+/**
+ * The reviewer's verdict. A reply that fails to parse gets one correction in the same session (its context is warm, so it costs
+ * seconds): one slipped hash or missing key would otherwise discard every other reviewer's finished work. Transport failures
+ * (aborted, errored, empty) are not corrected; they throw their real cause from finalText.
+ */
+async function collectReview(session: ReviewSession, revision: string): Promise<Pick<ReviewRound,'revision'|'summary'|'findings'>> {
+ try{return parseReview(finalText(session),revision);}
+ catch(first){
+  if(!(first instanceof Error)||first.message.startsWith('Reviewer '))throw first;
+  await session.prompt(`Your reply was rejected: ${first.message}. Reply again with only the JSON object, using "reviewedRevision":"${revision}" exactly.`,{expandPromptTemplates:false});
+  try{return parseReview(finalText(session),revision);}
+  catch(second){throw new Error(`${second instanceof Error?second.message:String(second)} (the reviewer was asked once to correct: ${first.message})`);}
+ }
 }
 const LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'auto']);
 type ModelRef = { provider: string; id: string };
@@ -164,7 +184,7 @@ export class Reviewer {
     if(diff?.code)throw new Error(diff.stderr||`Cannot diff ${target.id}`);
     const bounded=boundDiff(diff?.stdout??'');
     const payload=JSON.stringify({reviewedRevision:captured.revision,bead:{id:target.id,title:target.title,task:target.text},source:{title:m.source.title},files,diff:bounded.diff,...(bounded.omitted.length?{omittedDiffs:bounded.omitted}:{}),previousFindings:previous?.findings.filter(finding=>finding.beadId===target.id)});
-    const parsed=await this.#review(m,ctx,model,contextFiles,BEAD_NOTE,payload,captured.revision,files.length);
+    const parsed=await this.#review(m,ctx,model,contextFiles,BEAD_NOTE,payload,captured.revision,files.length,target.id);
     return {label:target.id,beadId:target.id,result:parsed};
    })());
   }
@@ -172,7 +192,7 @@ export class Reviewer {
    jobs.push((async()=>{
     const bounded=boundDiff(captured.diff);
     const payload=JSON.stringify({reviewedRevision:captured.revision,source:m.source,workspace:m.workspace,beads:targets.map(target=>({id:target.id,title:target.title,files:target.files})),verification:m.evidence.verify,files:captured.files,diff:bounded.diff,...(bounded.omitted.length?{omittedDiffs:bounded.omitted}:{}),previousFindings:previous?.findings.filter(finding=>!finding.beadId)});
-    const parsed=await this.#review(m,ctx,model,contextFiles,INTEGRATION_NOTE,payload,captured.revision,countDiffFiles(captured.diff));
+    const parsed=await this.#review(m,ctx,model,contextFiles,INTEGRATION_NOTE,payload,captured.revision,countDiffFiles(captured.diff),'integration');
     return {label:'integration',result:parsed};
    })());
   }
@@ -193,13 +213,14 @@ export class Reviewer {
   const summary=validateReviewSummary(outcomes.map(outcome=>`[${outcome.label}] ${outcome.result.summary}`).join('\n').slice(0,49_000));
   return {round:m.round,revision:captured.revision,model:`${model.provider}/${model.id}`,summary,findings,at:new Date().toISOString(),beads:hashes};
  }
- async #review(m: Mission, ctx: ExtensionContext, model: Model, contextFiles: Array<{ path: string; content: string }> | undefined, note: string, payload: string, revision: string, changedFiles: number): Promise<Pick<ReviewRound,'summary'|'findings'>> {
+ async #review(m: Mission, ctx: ExtensionContext, model: Model, contextFiles: Array<{ path: string; content: string }> | undefined, note: string, payload: string, revision: string, changedFiles: number, label: string): Promise<Pick<ReviewRound,'summary'|'findings'>> {
   const opened=await (this.opener??((...args)=>this.#open(...args)))(m,ctx,model,contextFiles,note,reviewBudgetMs(changedFiles));const session=opened.session;this.sessions.add(session);
   try{
    await session.prompt(payload,{expandPromptTemplates:false});
-   const {summary,findings}=parseReview(finalText(session),revision);
+   const {summary,findings}=await collectReview(session,revision);
    return {summary,findings};
-  }finally{this.sessions.delete(session);await session.dispose();}
+  }catch(error){throw new Error(`[${label}] ${error instanceof Error?error.message:String(error)}`);}
+  finally{this.sessions.delete(session);await session.dispose();}
  }
  async #open(m: Mission, ctx: ExtensionContext, model: Model, contextFiles: Array<{ path: string; content: string }> | undefined, note: string, budgetMs = reviewBudgetMs(0)) {
   const opened=await createAgentSession({
@@ -229,7 +250,7 @@ export class Reviewer {
   try{
    const bounded=boundDiff(captured.diff);
    await session.prompt(JSON.stringify({reviewedRevision:captured.revision,source:m.source,workspace:m.workspace,scopes:m.scopes,verification:m.evidence.verify,files:captured.files,diff:bounded.diff,...(bounded.omitted.length?{omittedDiffs:bounded.omitted}:{}),previousFindings:m.reviews.at(-1)?.findings}),{expandPromptTemplates:false});
-   const result=parseReview(finalText(session),captured.revision);
+   const result=await collectReview(session,captured.revision);
    const after=await captureRevision(m,run);if(after.revision!==captured.revision)throw new Error('Revision changed during review; result invalidated');
    return {...result,round:m.round,model:`${model.provider}/${model.id}`,at:new Date().toISOString()};
   }finally{this.sessions.delete(session);await session.dispose();}
