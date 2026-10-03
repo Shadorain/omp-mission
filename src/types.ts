@@ -4,7 +4,7 @@ export const phases: Phase[] = ['plan','isolate','graph','execute','verify','del
 export interface Source { kind: 'linear' | 'github' | 'freeform'; id: string; title: string; body: string; url?: string; comments: string; extra: string; repo?: string; number?: number }
 export interface ParsedInput { force: boolean; pause: boolean; keep: boolean; source?: string; freeform?: string; extra: string }
 export interface Workspace { key: string; cwd: string; commonDir?: string; branch?: string; base?: string; beadsDir?: string; delivery: 'pr' | 'local' }
-export interface Evidence { outcome: 'pending' | 'active' | 'passed' | 'failed' | 'skipped'; detail: string; revision?: string; at: string }
+export interface Evidence { outcome: 'pending' | 'active' | 'passed' | 'failed' | 'skipped'; detail: string; revision?: string; /** File-content fingerprint without HEAD (verification only): lets delivery accept the verified files committed on a new HEAD. */ tree?: string; at: string }
 export interface Gate { kind: 'wave' | 'review' | 'repairs'; token: string; detail: string; approved: boolean }
 export interface Worker { beadId: string; attempt: string; cwd: string; files: string[]; state: 'reserved' | 'starting' | 'awaiting-claim' | 'running' | 'missing' | 'closed'; handle?: string; incarnationId?: string; assignment: string; error?: string; frontend?: Frontend; launchedAt?: string }
 export interface Finding { id: string; severity: 'critical' | 'high' | 'medium' | 'low'; path: string; line: number; title: string; body: string; rejection?: string; beadId?: string }

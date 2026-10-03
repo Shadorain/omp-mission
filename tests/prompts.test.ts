@@ -1,4 +1,8 @@
 import { expect, test } from 'bun:test';
+import { rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { copyPlanFile, planFilePath } from '../src/hosts';
 import { beadTask, workerPrompt } from '../src/prompts';
 import { createWorkerDriver } from '../src/workers';
 import type { Bead, Mission, Worker } from '../src/types';
@@ -29,4 +33,20 @@ test('dispatch hands the bead text to the prompt builder and keeps the assignmen
   const [started] = await driver.dispatch(m, [{ beadId: 'b1', cwd: '/tmp', files: ['a.ts'], task: 'the task' }]);
   expect(seen).toEqual(['the task']);
   expect(started!.assignment).toBe('prompt for b1: the task');
+});
+
+test('workers are pointed at a shared copy of the plan only when one exists', async () => {
+  const m = { ...mission(), id: `plan-note-${process.pid}` };
+  const source = join(tmpdir(), `${m.id}-source.md`);
+  try {
+    expect(workerPrompt(m, worker, 'orca')).not.toContain('approved plan');
+    await writeFile(source, '# plan');
+    await copyPlanFile(m, source);
+    const prompt = workerPrompt(m, worker, 'orca');
+    expect(prompt).toContain(`The approved plan is in ${planFilePath(m)}`);
+    expect(prompt).toContain('local://');
+  } finally {
+    await rm(source, { force: true });
+    await rm(planFilePath(m), { force: true });
+  }
 });

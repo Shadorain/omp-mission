@@ -117,6 +117,8 @@ Reviewers are visible while they run and inspectable afterwards. Each one is an 
 
 `/mission approve` also runs the step it approves: at a wave gate it dispatches the wave, and at a repairs gate it accepts the repairs. Judgement stays with the coordinator: graph scopes, verification, delivery, repair work and rejecting findings.
 
+When the latest independent review of the verified revision is clean, the extension marks the mission complete without a model turn. `record_delivery` accepts a commit of the verified files (same contents, new HEAD); any other edit after `record_verification` means verifying again. Workers get the approved plan as a file (`omp-mission-workers/<mission-id>.plan.md`) and are told to read only their slice.
+
 Accepting local repairs advances the review round and clears earlier verification and delivery evidence. Passing verification requires changed output while actionable findings remain. Beads repairs advance the round when their finding-linked graph is bound; verification requires a nonempty graph whose implementation leaves are completed (`closed` or `done`).
 
 Repair evidence becomes passed or failed with verification, rather than staying active through delivery. Explicitly rejecting every accepted finding skips repair evidence and allows unchanged output to be reverified. Delivery and independent rereview remain required for changed output.

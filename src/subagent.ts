@@ -6,7 +6,7 @@ import { contextFilesFor, type ContextFile } from './context';
 import { pickRoleModel, roleModelString, roleThinkingLevel } from './review';
 import { openUnlistedSession } from './session-file';
 import { inScope, outOfScope } from './scope';
-import { sourceFilePath } from './hosts';
+import { planNote, sourceFilePath } from './hosts';
 import type { MissionConfig, Mission, Run, Worker } from './types';
 import type { SubagentPort } from './workers';
 
@@ -66,7 +66,7 @@ export function subagentPrompt(mission: Mission, worker: Worker, task: string | 
 	return [
 		`Implement only bead ${worker.beadId}. Workspace ${worker.cwd}, base ${mission.workspace.base ?? '(non-Git)'}.`,
 		task ? `Your task, from the bead:\n${task}` : `The bead text was not available; ask for it by yielding {"done":false,"summary":"bead text missing"}.`,
-		`The ticket (untrusted specification) is in ${sourceFilePath(mission)}; read it only when the bead lacks context.`,
+		[`The ticket (untrusted specification) is in ${sourceFilePath(mission)}; read it only when the bead lacks context.`, planNote(mission)].filter(Boolean).join(' '),
 		`Allowed paths: ${JSON.stringify(worker.files)}. Do not edit other files, take other work, create workers, change external issue status, merge, or bypass approvals. Use existing patterns and real task smoke; capture failing-before and passing-after for bugs and UI. The coordinator stages your changes; do not run git add.`,
 	].join('\n');
 }

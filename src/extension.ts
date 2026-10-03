@@ -3,6 +3,7 @@ import { isAbsolute, join } from 'node:path';
 import { homedir } from 'node:os';
 import { matchesKey } from '@oh-my-pi/pi-tui';
 import { z } from '@oh-my-pi/pi-coding-agent';
+import { resolveLocalUrlToPath } from '@oh-my-pi/pi-coding-agent/internal-urls/local-protocol';
 import type { ExtensionAPI, ExtensionContext } from '@oh-my-pi/pi-coding-agent';
 import type { KeyId } from '@oh-my-pi/pi-tui';
 import type { Action, Evidence, Mission, MissionConfig, Mode, Projection, Run, Snapshot, SubagentRow } from './types';
@@ -15,14 +16,14 @@ import { readClaimActor, readGraph, readHistory } from './beads';
 import { createWorkerDriver } from './workers';
 import { approveGate, autoDispatchAllowed, consumeGate, effectiveGraph, enforceGate, enforceMutation, nextAction, operatorStep, requireBeadsGraph, revisionGate, setMode, waveGate } from './controller';
 import { captureRevision, Reviewer, roleModelString } from './review';
-import { beadTask, coordinatorPrompt, guide, workerPrompt } from './prompts';
+import { beadTask, coordinatorPrompt, guide, planSlug, workerPrompt } from './prompts';
 import { createMissionWidget, createMissionInspector, phaseLabel } from './ui';
 import { briefView, statusView, type NextView } from './status';
 import { missionArgumentCompletions, VERBS, type MissionCompletionState } from './completions';
 import { discoverBeadsDir, isolateCheckout } from './isolate';
 import { contextFilesFor } from './context';
 import { SubagentRunner, subagentPrompt } from './subagent';
-import { sourceFilePath, writeSourceFile } from './hosts';
+import { copyPlanFile, sourceFilePath, writeSourceFile } from './hosts';
 import { noteSubagentSpawn, noteSubagentToolEnd, noteSubagentToolStart, noteSubagentTurnEnd } from './subagents';
 
 const controls = ['show','continue','mode','approve','review','history','focus','resend','release','dispatch','reap','actions','config'];
@@ -194,7 +195,24 @@ export default async function missionExtension(pi: ExtensionAPI) {
   try{await control({operation:'dispatch'},context);context.ui.notify(`Auto-dispatched ${action.ids?.join(', ')}`,'info');return true;}
   catch(error){autoBlocked=signature;context.ui.notify(`Auto-dispatch held, handing to the coordinator: ${error instanceof Error?error.message:String(error)}`,'warning');return false;}
  }
- async function wakeCoordinator(){if(quiet||!ctx||!mission||operation||!eligible(ctx))return;const action=nextAction(mission,snapshot,policy(ctx));if(action.gate){mission.gate=action.gate;if(ownership&&!resumeHold)await persist(mission);await render();return;}if(action.kind==='hold')return;if(await autoDispatch(ctx,action))return;if(autoReview(ctx,action))return;
+ // Workers cannot resolve the coordinator's local:// root, so the approved plan is copied where their assignment points. Best effort: a missing plan only costs workers the slice text.
+ async function sharePlan(m:Mission,context:ExtensionContext){
+  const options=context.localProtocolOptions;if(!options)return;
+  try{await copyPlanFile(m,resolveLocalUrlToPath(`local://${planSlug(m.source)}-plan.md`,options));}catch{/* no plan written (forced run, or local graph) */}
+ }
+ // A clean independent review of the verified revision ends the mission. That is bookkeeping, not judgement: recording it here saves the
+ // coordinator a full-context turn (~$0.24 on a large session) that only answers "complete", and fixes a mission re-verified after its
+ // review (a PR retarget, say) that otherwise stays in phase `review` forever.
+ async function finishMission(context:ExtensionContext){
+  const m=mission;const review=m?.reviews.at(-1);if(!m||!review||!ownership||resumeHold||ownershipError)return;
+  await ownership.assertOwned();
+  m.phase='complete';
+  m.evidence.complete={outcome:'passed',detail:'Verification, delivery and independent review complete',revision:review.revision,at:new Date().toISOString()};
+  if(m.evidence.repair?.outcome==='active')m.evidence.repair={...m.evidence.complete};
+  await persist(m);await render();
+  context.ui.notify('Mission complete: verified, delivered and independently reviewed clean. /mission clear starts fresh.','info');
+ }
+ async function wakeCoordinator(){if(quiet||!ctx||!mission||operation||!eligible(ctx))return;const action=nextAction(mission,snapshot,policy(ctx));if(action.gate){mission.gate=action.gate;if(ownership&&!resumeHold)await persist(mission);await render();return;}if(action.kind==='hold')return;if(action.kind==='complete'){await finishMission(ctx).catch(error=>ctx?.ui.notify(`Could not mark the mission complete: ${error instanceof Error?error.message:String(error)}`,'warning'));return;}if(await autoDispatch(ctx,action))return;if(autoReview(ctx,action))return;
  // Only the model needs an idle session with an empty queue. Dispatch above never touches it, so a stuck queue cannot stall the wave.
  if(!ctx.isIdle()||ctx.hasPendingMessages())return;const signature=JSON.stringify([mission.id,mission.round,action.kind,action.ids,mission.evidence.verify?.revision,mission.reviews.length]);if(signature===lastWake)return;lastWake=signature;const view=withGuide(action,true)!;pi.sendUserMessage(`Mission: ${action.detail}${action.ids?.length?` [${action.ids.join(', ')}]`:''}. Next: ${action.kind}. ${view.guide??''}`.trim(),{attribution:'agent'});}
  async function request(context:ExtensionContext,op:string,extra:Record<string,unknown>={}){
@@ -412,6 +430,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
     }else if(params.operation==='dispatch'){
      requireBeadsGraph(mission);await refresh(false);const action=nextAction(mission,snapshot,policy(context));if(action.gate){mission.gate=action.gate;await persist(mission);throw new Error(`Approval required: ${action.detail}`);}if(action.kind!=='dispatch'||!action.ids||!snapshot)throw new Error(action.detail);
      enforceGate(mission,waveGate(mission,action.ids,snapshot));
+     await sharePlan(mission,context);
      await driver.dispatch(mission,action.ids.map(id=>({beadId:id,cwd:mission!.workspace.cwd,files:mission!.scopes[id]!,task:beadTask(snapshot?.beads.find(b=>b.id===id))})));
      consumeGate(mission);mission.phase=mission.repairLinks[action.ids[0]!]?'repair':'execute';
     }else if(params.operation==='record_verification'){
@@ -431,6 +450,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
       outcome: params.passed ? 'passed' : 'failed',
       detail: params.detail,
       revision: captured.revision,
+      ...(params.passed?{tree:captured.tree}:{}),
       at: new Date().toISOString(),
      };
      mission.evidence.verify = evidence;
@@ -440,7 +460,13 @@ export default async function missionExtension(pi: ExtensionAPI) {
      delete mission.evidence.deliver;
      mission.phase = params.passed ? 'deliver' : 'verify';
     }else if(params.operation==='record_delivery'){
-     if(mission.evidence.verify?.outcome!=='passed'||!params.detail)throw new Error('Passed verification and actual delivery evidence required');const captured=await captureRevision(mission,run);if(captured.revision!==mission.evidence.verify.revision)throw new Error('Revision changed since verification');if(mission.workspace.delivery==='pr'&&!/^https:\/\/[^\s]+\/pull\/\d+$/.test(params.url??''))throw new Error('Actual PR URL required');mission.evidence.deliver={outcome:'passed',detail:params.url?`${params.url}\n${params.detail}`:params.detail,revision:captured.revision,at:new Date().toISOString()};mission.phase='review';
+     if(mission.evidence.verify?.outcome!=='passed'||!params.detail)throw new Error('Passed verification and actual delivery evidence required');const captured=await captureRevision(mission,run);
+     if(captured.revision!==mission.evidence.verify.revision){
+      // Committing the verified files moves HEAD but not their bytes: the verification still describes what ships, so carry it to the new HEAD instead of failing and forcing a rerun.
+      if(!mission.evidence.verify.tree||captured.tree!==mission.evidence.verify.tree)throw new Error('Revision changed since verification');
+      mission.evidence.verify={...mission.evidence.verify,revision:captured.revision};
+     }
+     if(mission.workspace.delivery==='pr'&&!/^https:\/\/[^\s]+\/pull\/\d+$/.test(params.url??''))throw new Error('Actual PR URL required');mission.evidence.deliver={outcome:'passed',detail:params.url?`${params.url}\n${params.detail}`:params.detail,revision:captured.revision,at:new Date().toISOString()};mission.phase='review';
     }else if(params.operation==='run_review'){
      await refresh(false);const action=nextAction(mission,snapshot,policy(context));
      if(!(action.kind==='review'||action.kind==='hold'&&action.gate?.kind==='review')||!mission.reviewRequested||mission.evidence.verify?.outcome!=='passed'||mission.evidence.deliver?.outcome!=='passed')throw new Error(action.detail);

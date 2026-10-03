@@ -7,7 +7,8 @@ import { openUnlistedSession } from './session-file';
 import type { Finding, Mission, ReviewRound, Run } from './types';
 import { isRecord } from './guards';
 import { validateFinding, validateReviewSummary } from './store';
-export interface RevisionCapture { revision: string; diff: string; files: string[] }
+/** `tree` fingerprints file contents only, so committing the verified files (a new HEAD, same bytes) leaves it unchanged. */
+export interface RevisionCapture { revision: string; tree: string; diff: string; files: string[] }
 /**
  * The commit the change is measured from: the merge-base of HEAD and the base branch, preferring origin/<base>.
  * A stale local base branch (or a base that has moved on) would drag unrelated changes into the review diff.
@@ -24,7 +25,8 @@ const countDiffFiles=(diff:string)=>(diff.match(/^diff --git /gm)??[]).length;
 /** Reviewer time budget: 5 minutes plus 15 seconds per changed file, capped at 30 minutes. A fixed 5 minutes aborted large PRs with nothing to show. */
 export const reviewBudgetMs=(changedFiles:number)=>Math.min(30*60_000,300_000+changedFiles*15_000);
 export async function captureRevision(m: Mission, run: Run): Promise<RevisionCapture> {
- const cwd=m.workspace.cwd; const hash=createHash('sha256'); let files:string[];let diff='';
+ const cwd=m.workspace.cwd; const hash=createHash('sha256'); const treeHash=createHash('sha256'); let files:string[];let diff='';
+ const both=(chunk:string|Buffer)=>{hash.update(chunk);treeHash.update(chunk);};
  if(m.workspace.commonDir){
   const head=await run('git',['rev-parse','HEAD'],cwd); if(head.code)throw new Error(head.stderr||'Cannot read HEAD');hash.update(head.stdout);
   const listed=await run('git',['ls-files','-z','--cached','--others','--exclude-standard'],cwd);if(listed.code)throw new Error(listed.stderr);
@@ -40,15 +42,15 @@ export async function captureRevision(m: Mission, run: Run): Promise<RevisionCap
   const key = Buffer.from(file).length + ":" + file;
   try{
    const st=await lstat(path);
-   if(st.isDirectory()){hash.update(`${key}\0dir\0`);}
-   else if(st.isSymbolicLink()){const link=await readlink(path);hash.update(`${key}\0symlink\0${Buffer.from(link).length}:${link}`);}
-   else{const content=await readFile(path);hash.update(`${key}\0file\0${st.mode}\0${content.length}:`);hash.update(content);}
+   if(st.isDirectory()){both(`${key}\0dir\0`);}
+   else if(st.isSymbolicLink()){const link=await readlink(path);both(`${key}\0symlink\0${Buffer.from(link).length}:${link}`);}
+   else{const content=await readFile(path);both(`${key}\0file\0${st.mode}\0${content.length}:`);both(content);}
   }catch(error){
    if(!isRecord(error)||error.code!=='ENOENT')throw error;
-   hash.update(`${key}\0missing\0`);
+   both(`${key}\0missing\0`);
   }
  }
- return {revision:hash.digest('hex'),diff,files};
+ return {revision:hash.digest('hex'),tree:treeHash.digest('hex'),diff,files};
 }
 export function parseReview(text: string, revision: string): Pick<ReviewRound,'revision'|'summary'|'findings'> {
  const quote=(value:string)=>JSON.stringify(value.length>160?`${value.slice(0,160)}…`:value);

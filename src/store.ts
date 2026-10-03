@@ -90,7 +90,7 @@ export function validateMission(value: unknown): Mission {
     if (!PHASES.includes(key as Phase)) invalid(`unsupported evidence phase ${key}`);
     const item = object(raw, `evidence.${key}`);
     if (!(EVIDENCE_OUTCOMES as readonly unknown[]).includes(item.outcome)) invalid(`evidence.${key}.outcome is unsupported`);
-    evidence[key as Phase] = { outcome: item.outcome as Evidence["outcome"], detail: content(item.detail, `evidence.${key}.detail`, 50_000), at: text(item.at, `evidence.${key}.at`, 100), ...(item.revision === undefined ? {} : { revision: text(item.revision, `evidence.${key}.revision`, 1000) }) };
+    evidence[key as Phase] = { outcome: item.outcome as Evidence["outcome"], detail: content(item.detail, `evidence.${key}.detail`, 50_000), at: text(item.at, `evidence.${key}.at`, 100), ...(item.revision === undefined ? {} : { revision: text(item.revision, `evidence.${key}.revision`, 1000) }), ...(item.tree === undefined ? {} : { tree: text(item.tree, `evidence.${key}.tree`, 200) }) };
   }
   const scopesRow = object(row.scopes, "scopes");
   const scopes: Record<string, string[]> = {};

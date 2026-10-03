@@ -23,6 +23,22 @@ test('the review diff is measured from the merge-base of the freshest base ref',
   expect(diffs.map(args=>args[1])).toEqual(['fresh123','stale456']);
  }finally{await rm(cwd,{recursive:true,force:true});}
 });
+test('the tree fingerprint survives a new HEAD but not a content change',async()=>{
+ const cwd=await mkdtemp(join(tmpdir(),'mission-tree-'));
+ try{
+  await writeFile(join(cwd,'a.ts'),'verified');
+  const m=mission(cwd);m.workspace={key:'key',cwd,commonDir:cwd,base:'main',delivery:'pr'};
+  let head='commit-one';
+  const run:Run=async(cmd,args)=>args[0]==='rev-parse'?{code:0,stdout:head,stderr:''}:args[0]==='ls-files'?{code:0,stdout:'a.ts\0',stderr:''}:{code:0,stdout:'',stderr:''};
+  const verified=await captureRevision(m,run);
+  head='commit-two';
+  const committed=await captureRevision(m,run);
+  expect(committed.revision).not.toBe(verified.revision);
+  expect(committed.tree).toBe(verified.tree);
+  await writeFile(join(cwd,'a.ts'),'edited after verification');
+  expect((await captureRevision(m,run)).tree).not.toBe(verified.tree);
+ }finally{await rm(cwd,{recursive:true,force:true});}
+});
 test('reviewer time budget grows with the change and is capped',()=>{
  expect(reviewBudgetMs(0)).toBe(5*60_000);
  expect(reviewBudgetMs(10)).toBe(5*60_000+150_000);

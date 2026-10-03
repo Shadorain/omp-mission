@@ -15,7 +15,7 @@ type Execute = (id: string, params: Params, signal: undefined, update: undefined
 type EventHandler = (event: unknown, context: ExtensionContext) => Promise<void>;
 const noRun: Run = async () => { throw new Error('Unexpected command'); };
 
-async function fixture(graph: Graph, leaves = true, host: { idle?: boolean; pending?: boolean; resumed?: boolean; unreviewed?: boolean } = {}) {
+async function fixture(graph: Graph, leaves = true, host: { idle?: boolean; pending?: boolean; resumed?: boolean; unreviewed?: boolean; clean?: boolean } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'mission-lifecycle-'));
   const cwd = join(root, 'workspace');
   await mkdir(cwd);
@@ -33,7 +33,7 @@ async function fixture(graph: Graph, leaves = true, host: { idle?: boolean; pend
     mission.phase = 'review';
     mission.evidence.verify = { outcome: 'passed', revision, detail: 'before', at: 'now' };
     mission.evidence.deliver = { outcome: 'passed', revision, detail: 'before', at: 'now' };
-    mission.reviews = host.unreviewed ? [] : [{ round: 1, revision, summary: 'Defect', model: 'test', at: 'now', findings: [{ id: 'f', severity: 'high', path: 'task.txt', line: 1, title: 'Defect', body: 'Fix task.txt' }] }];
+    mission.reviews = host.unreviewed ? [] : [{ round: 1, revision, summary: host.clean ? 'Clean' : 'Defect', model: 'test', at: 'now', findings: host.clean ? [] : [{ id: 'f', severity: 'high', path: 'task.txt', line: 1, title: 'Defect', body: 'Fix task.txt' }] }];
   }
   const path = missionPath(root, mission);
   await saveMission(path, mission);
@@ -184,6 +184,17 @@ test('/mission review in a resumed session says to run /mission continue instead
     await mission.command('review');
     expect(mission.notices.some(notice => notice.includes('/mission continue'))).toBe(true);
     expect(mission.sent).toEqual([]);
+  } finally { await mission.dispose(); }
+});
+
+test('a clean review of the verified revision completes the mission in the extension, without a model turn', async () => {
+  const mission = await fixture('local', true, { idle: true, clean: true });
+  try {
+    expect(await mission.noticeCount('Mission complete', 1)).toContain('/mission clear');
+    expect(mission.sent).toEqual([]);
+    const saved = await mission.state();
+    expect(saved.phase).toBe('complete');
+    expect(saved.evidence.complete?.outcome).toBe('passed');
   } finally { await mission.dispose(); }
 });
 

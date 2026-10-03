@@ -1,4 +1,5 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { copyFile, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Mission, Run, Source, Worker } from "./types.ts";
@@ -86,6 +87,20 @@ export async function writeSourceFile(mission: Pick<Mission, "id" | "source">): 
 	const file = sourceFilePath(mission);
 	await writeFile(file, renderSource(mission.source), { mode: 0o600 });
 	return file;
+}
+
+// The coordinator writes the approved plan under its own session's local:// root, which workers cannot resolve. They were told
+// "plan slice S2 in local://…-plan.md", failed to read it, and (when a copy existed) each read the whole 40 KB plan.
+export function planFilePath(mission: Pick<Mission, "id">): string {
+	return join(WORKER_DIR, `${mission.id}.plan.md`);
+}
+export async function copyPlanFile(mission: Pick<Mission, "id">, from: string): Promise<void> {
+	await mkdir(WORKER_DIR, { recursive: true, mode: 0o700 });
+	await copyFile(from, planFilePath(mission));
+}
+/** One sentence for a worker's assignment, or nothing when no plan was shared. */
+export function planNote(mission: Pick<Mission, "id">): string {
+	return existsSync(planFilePath(mission)) ? `The approved plan is in ${planFilePath(mission)} (long: grep it for your bead id or slice name and read only that section). A bead that cites local://…-plan.md means this file.` : "";
 }
 
 export async function spawnHerdr(run: Run, mission: Mission, worker: Worker, agentDir?: string, model?: string): Promise<SpawnedSession> {
