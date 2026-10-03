@@ -85,7 +85,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
  // A guide is sent once per step: with the wake message, or with the first result that reaches that step.
  let guided='';
  function withGuide(next:Action|undefined,always:boolean):NextView|undefined{if(!next)return undefined;const text=guide(next.kind);if(!text||(!always&&guided===next.kind))return next;guided=next.kind;return {...next,guide:text};}
- function status(context:ExtensionContext,brief=false){const next=withGuide(mission?nextAction(mission,snapshot,policy(context)):undefined,!brief);return (brief?briefView:statusView)({mission,pending,snapshot,resumeHold,ownershipError,next});}
+ function status(context:ExtensionContext,brief=false){const action=mission?nextAction(mission,snapshot,policy(context)):undefined;const running=action?extensionRuns(context,action):undefined;const next=withGuide(running?{kind:'hold',detail:`The extension is running ${running==='review'?'the review':'the wave'} itself and wakes you when it ends. Do not call ${running==='review'?'run_review':'dispatch'}; wait.`}:action,!brief);return (brief?briefView:statusView)({mission,pending,snapshot,resumeHold,ownershipError,next});}
  function bindTerminalInput(context:ExtensionContext){
   terminalInputDispose?.();
   terminalInputDispose=undefined;
@@ -177,9 +177,19 @@ export default async function missionExtension(pi: ExtensionAPI) {
   }catch(error){if(epoch===generation){snapshot=snapshot?{...snapshot,error:String(error)}:{beads:[],leaves:[],ready:[],closed:0,active:0,blocked:0,fetchedAt:0,error:String(error)};await render();}}
   finally{refreshing=false;}
  }
+ const dispatchSignature=(m:Mission,action:Action)=>JSON.stringify([m.id,m.round,action.ids,m.workers.length]);
+ const reviewSignature=(m:Mission)=>JSON.stringify([m.id,m.round,m.evidence.verify?.revision,m.reviews.length]);
+ // The step the extension starts by itself once the current operation ends. A control result must not tell the coordinator to run it too:
+ // the model's own call raced the extension's and failed ("Workers running", "Mission operation already running").
+ function extensionRuns(context:ExtensionContext,action:Action):'dispatch'|'review'|undefined{
+  const m=mission;if(!m)return undefined;
+  if(autoDispatchAllowed(m,action,config.autoDispatch,policy(context))&&dispatchSignature(m,action)!==autoBlocked)return 'dispatch';
+  if(action.kind==='review'&&!action.gate&&m.reviewRequested&&reviewSignature(m)!==reviewBlocked)return 'review';
+  return undefined;
+ }
  async function autoDispatch(context:ExtensionContext,action:Action):Promise<boolean>{
   const m=mission;if(!m||!autoDispatchAllowed(m,action,config.autoDispatch,policy(context)))return false;
-  const signature=JSON.stringify([m.id,m.round,action.ids,m.workers.length]);
+  const signature=dispatchSignature(m,action);
   if(signature===autoBlocked)return false;
   try{await control({operation:'dispatch'},context);context.ui.notify(`Auto-dispatched ${action.ids?.join(', ')}`,'info');return true;}
   catch(error){autoBlocked=signature;context.ui.notify(`Auto-dispatch held, handing to the coordinator: ${error instanceof Error?error.message:String(error)}`,'warning');return false;}
@@ -235,7 +245,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
  let reviewBlocked='';
  function autoReview(context:ExtensionContext,action:Action):boolean{
   const m=mission;if(!m||action.kind!=='review'||action.gate||!m.reviewRequested)return false;
-  const signature=JSON.stringify([m.id,m.round,m.evidence.verify?.revision,m.reviews.length]);
+  const signature=reviewSignature(m);
   if(signature===reviewBlocked)return false;
   const startedAt=Date.now();
   context.ui.notify('Independent review started in its own session. It can take several minutes; the result is reported here.','info');

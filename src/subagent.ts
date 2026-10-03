@@ -1,9 +1,10 @@
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
-import { AgentRegistry, createAgentSession, SessionManager, Settings, type ExtensionContext } from '@oh-my-pi/pi-coding-agent';
+import { AgentRegistry, createAgentSession, Settings, type ExtensionContext } from '@oh-my-pi/pi-coding-agent';
 import { contextFilesFor, type ContextFile } from './context';
 import { pickRoleModel, roleModelString, roleThinkingLevel } from './review';
+import { openUnlistedSession } from './session-file';
 import { inScope, outOfScope } from './scope';
 import { sourceFilePath } from './hosts';
 import type { MissionConfig, Mission, Run, Worker } from './types';
@@ -133,7 +134,8 @@ export function changedSince(before: Record<string, string>, after: Record<strin
 
 const defaultFactory: SessionFactory = async request => {
 	const { ctx, model } = request;
-	const manager = request.resumeFile ? await SessionManager.open(request.resumeFile) : SessionManager.create(request.worker.cwd, request.sessionDir);
+	// Unlisted: a worker session must never become what `omp -c` resumes in the coordinator's terminal.
+	const manager = await openUnlistedSession(request.worker.cwd, request.sessionDir, request.resumeFile);
 	const { session } = await createAgentSession({
 		cwd: request.worker.cwd, authStorage: ctx.modelRegistry.authStorage, modelRegistry: ctx.modelRegistry, model, ...(request.thinkingLevel ? { thinkingLevel: request.thinkingLevel as never } : {}),
 		...(request.contextFiles ? { contextFiles: request.contextFiles } : {}),

@@ -95,8 +95,10 @@ async function fixture(graph: Graph, leaves = true, host: { idle?: boolean; pend
   if (!start || !shutdown || !control) throw new Error('Mission extension unavailable');
   await start({}, context);
   const execute = (params: Params) => control('test', params, undefined, undefined, context);
-  if (!host.resumed) await execute({ operation: 'continue' });
+  // Named assertion: the execute seam is typed unknown; the tool result shape is fixed by the extension.
+  const continued = host.resumed ? undefined : await execute({ operation: 'continue' }) as { content: Array<{ text: string }> };
   return {
+    first: continued ? JSON.parse(continued.content[0]!.text) : undefined,
     command: async (args: string) => { await commandHandler!(args, context); }, sent, sentOptions, notices,
     noticeCount: (prefix: string, count: number) => { const { promise, resolve } = Promise.withResolvers<string>(); noticeWaiters.push({ prefix, count, resolve }); settleNoticeWaiters(); return promise; },
     execute, cwd, state: () => loadMission(path),
@@ -211,5 +213,15 @@ test('/mission approve at a repairs gate accepts the repairs in the extension', 
     expect(accepted.evidence.repair?.outcome).toBe('active');
     // The model is woken for the repair work itself, not to relay accept_repairs.
     expect(mission.sent.at(-1)).toContain('Next: verify');
+  } finally { await mission.dispose(); }
+});
+
+test('a control result does not tell the coordinator to run a step the extension is already running', async () => {
+  const mission = await fixture('local', true, { idle: true, unreviewed: true });
+  try {
+    expect(mission.first.next.kind).toBe('hold');
+    expect(mission.first.next.detail).toContain('Do not call run_review');
+    // The fixture has no model, so the extension's start fails; wait for that so teardown does not race the review.
+    await mission.noticeCount('Review failed', 1);
   } finally { await mission.dispose(); }
 });

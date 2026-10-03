@@ -3,6 +3,7 @@ import { mkdir, readFile, realpath, lstat, readlink } from 'node:fs/promises';
 import { resolve, relative, isAbsolute } from 'node:path';
 import { inScope } from './scope';
 import { AgentRegistry, createAgentSession, SessionManager, Settings, settings, type AgentSession, type ExtensionContext } from '@oh-my-pi/pi-coding-agent';
+import { openUnlistedSession } from './session-file';
 import type { Finding, Mission, ReviewRound, Run } from './types';
 import { isRecord } from './guards';
 import { validateFinding, validateReviewSummary } from './store';
@@ -233,7 +234,7 @@ export class Reviewer {
  async #open(m: Mission, ctx: ExtensionContext, model: Model, contextFiles: Array<{ path: string; content: string }> | undefined, note: string, budgetMs = reviewBudgetMs(0), agent: ReviewAgent = reviewAgent('review')) {
   const dir=this.watch.sessionDir?.(m);
   if(dir)await mkdir(dir,{recursive:true});
-  const manager=dir?SessionManager.create(m.workspace.cwd,dir):SessionManager.inMemory();
+  const manager=dir?await openUnlistedSession(m.workspace.cwd,dir):SessionManager.inMemory();
   await manager.setSessionName(`mission review ${agent.label} · ${m.source.id.replace(/^[a-z]+:/i,'')}`,'user');
   const opened=await createAgentSession({
    cwd: m.workspace.cwd, authStorage: ctx.modelRegistry.authStorage,
