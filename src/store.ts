@@ -1,7 +1,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { chmod, mkdir, open, readFile, readdir, realpath, rename, rm, stat } from "node:fs/promises";
 import { basename, dirname, resolve, join } from "node:path";
-import { lock } from "proper-lockfile";
+import { lock } from "./lock";
 import { isRecord, isNonNegativeSafeInteger, isPositiveSafeInteger } from "./guards";
 import type { Evidence, Finding, Frontend, Mission, Mode, Phase, Source, Workspace } from "./types";
 

@@ -6,6 +6,16 @@ Plan and run a ticket or task through verification and review. The row above the
 
 OMP 18.4.4 or later. Restart OMP after install.
 
+## Prerequisites
+
+- **OMP**: `18.4.4` or later.
+- **Runtime**: Self-contained with zero runtime dependencies. Installs cleanly via marketplace or git clone without needing a build step or `bun install`.
+- **System Tools** (workflow-dependent):
+  - **Beads (`bd`)**: Required when using `graph beads` (default is `local`; beads is recommended for durable task isolation and multi-worker execution). Install via `brew install beads` or `curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/install.sh | bash`.
+  - **GitHub CLI (`gh`)**: Required for GitHub issue/PR resolution and PR delivery (`gh pr list`, `gh pr view`).
+  - **Linear CLI (`lin`)**: Required if resolving Linear tickets and updating issue states.
+  - **Terminal Frontends (`orca` / `herdr`)**: Optional for multi-tab worker management; the built-in `subagent` frontend runs workers in-process within OMP without external terminal managers.
+
 ## Install
 
 ```text
