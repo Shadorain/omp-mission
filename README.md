@@ -38,7 +38,13 @@ git clone https://github.com/Shadorain/omp-mission.git ~/.omp/agent/extensions/o
 /mission CHR-142 --force --pause --keep
 ```
 
-`--force` starts outside plan mode and requests review. `--pause` waits at each gate. `--keep` leaves worker tabs up.
+| Input | Syntax | Notes |
+| --- | --- | --- |
+| **Freeform task** | `/mission [flags] -- <description>` | **Requires `--`** before the description so words or dashes in your prompt are not parsed as ticket IDs or flags. |
+| **GitHub issue** | `/mission <#num \| owner/repo#num \| url>` | Fetches title, body, and comments via `gh`. |
+| **Linear ticket** | `/mission <TEAM-123>` | Fetches issue details via `lin`. |
+
+`--force` (`-f`) starts outside plan mode and requests review. `--pause` waits at each gate. `--keep` leaves worker tabs up. Place flags before `--` when starting a freeform mission (e.g., `/mission --force -- Fix the session cookie path`).
 
 ```text
 /mission show | continue | mode | approve | review
