@@ -179,6 +179,27 @@ describe("inspectWorkspace", () => {
     expect(ws.base).toBe("staging");
   });
 
+  it("ignores unquoted prose in README.md when resolving base branch", async () => {
+    const dir = await makeTempDir();
+    await runRealGitMockCli("git", ["init", dir], dir);
+    await runRealGitMockCli("git", ["-C", dir, "commit", "--allow-empty", "-m", "initial"], dir);
+    await Bun.write(join(dir, "README.md"), "It stops with the reason when the base branch is unresolved.");
+
+    const ws = await inspectWorkspace(dir, runRealGitMockCli);
+    expect(ws.base).toBeUndefined();
+  });
+
+  it("prioritizes explicitBase over doc scraping and git config", async () => {
+    const dir = await makeTempDir();
+    await runRealGitMockCli("git", ["init", dir], dir);
+    await runRealGitMockCli("git", ["-C", dir, "commit", "--allow-empty", "-m", "initial"], dir);
+    await runRealGitMockCli("git", ["-C", dir, "config", "mission.baseBranch", "configured"], dir);
+    await Bun.write(join(dir, "AGENTS.md"), "The base branch is `develop`.");
+
+    const ws = await inspectWorkspace(dir, runRealGitMockCli, { explicitBase: "release" });
+    expect(ws.base).toBe("release");
+  });
+
   it("handles non-git dir", async () => {
     const dir = await makeTempDir();
     const ws = await inspectWorkspace(dir, runRealGitMockCli);

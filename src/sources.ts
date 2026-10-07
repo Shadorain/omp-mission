@@ -160,24 +160,25 @@ export async function inspectWorkspace(cwd: string, run: Run, options: Workspace
   const commonDir = await realpath(commonPath);
   const branchResult = await run("git", ["branch", "--show-current"], top);
   const branch = branchResult.code === 0 ? branchResult.stdout.trim() : "";
-  let base: string | undefined;
-  for (const name of ["AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md", "README.md"]) {
-    try {
-      const contents = await readFile(join(top, name), "utf8");
-      const declared = contents.match(/(?:base|target|integration)\s+branch\s*(?:is|:|=)\s*[`'"]?([A-Za-z0-9._/-]+)/i);
-      const integration = contents.match(/[`'"]([A-Za-z0-9._/-]+)[`'"]\*{0,2}\s+is\s+(?:the\s+)?(?:[A-Za-z0-9_-]+\s+)?(?:base|target|integration)\s+branch/i);
-      const branchFrom = contents.match(/\bbranch\s+from\s+[`'"]([A-Za-z0-9._/-]+)[`'"]/i);
-      const match = declared ?? integration ?? branchFrom;
-      if (match) { base = match[1]; break; }
-    } catch (error: unknown) {
-      if (error && typeof error === "object" && "code" in error && error.code !== "ENOENT") throw error;
+  let base: string | undefined = options.explicitBase;
+  if (!base) {
+    for (const name of ["AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md", "README.md"]) {
+      try {
+        const contents = await readFile(join(top, name), "utf8");
+        const declared = contents.match(/(?:base|target|integration)\s+branch\s*(?:is|:|=)\s*[`'"]([A-Za-z0-9._/-]+)[`'"]/i);
+        const integration = contents.match(/[`'"]([A-Za-z0-9._/-]+)[`'"]\*{0,2}\s+is\s+(?:the\s+)?(?:[A-Za-z0-9_-]+\s+)?(?:base|target|integration)\s+branch/i);
+        const branchFrom = contents.match(/\bbranch\s+from\s+[`'"]([A-Za-z0-9._/-]+)[`'"]/i);
+        const match = declared ?? integration ?? branchFrom;
+        if (match) { base = match[1]; break; }
+      } catch (error: unknown) {
+        if (error && typeof error === "object" && "code" in error && error.code !== "ENOENT") throw error;
+      }
     }
   }
   if (!base) {
     const configured = await run("git", ["config", "--get", "mission.baseBranch"], top);
     if (configured.code === 0 && configured.stdout.trim()) base = configured.stdout.trim();
   }
-  if (!base) base = options.explicitBase;
   if (!base) {
     let githubRepo = options.githubRepo;
     if (!githubRepo) {

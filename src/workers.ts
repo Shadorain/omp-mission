@@ -26,7 +26,10 @@ export interface WorkerDriver {
 }
 
 export function assertNonOverlapping(assignments: WorkerAssignment[]): void {
-  for (const assignment of assignments) if (assignment.files.length === 0) throw new Error(`worker file scope required: ${assignment.beadId}`);
+  for (const assignment of assignments) {
+    if (assignment.files.length === 0) throw new Error(`worker file scope required: ${assignment.beadId}`);
+    for (const file of assignment.files) normalizeScope(file);
+  }
   for (let i = 0; i < assignments.length; i++) {
     const left = assignments[i]!;
     for (let j = i + 1; j < assignments.length; j++) {

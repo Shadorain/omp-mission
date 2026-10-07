@@ -137,6 +137,7 @@ export type ReviewOpener = (m: Mission, ctx: ExtensionContext, model: Model, con
 export class Reviewer {
  private sessions = new Set<ReviewSession>();
  constructor(private readonly opener?: ReviewOpener) {}
+ get activeSessionsCount(): number { return this.sessions.size; }
  async dispose(): Promise<void> {const all=[...this.sessions];this.sessions.clear();await Promise.all(all.map(session=>session.dispose().catch(()=>{})));}
  /**
   * One reviewer per bead in parallel, plus one integration pass on the first round. A later round
@@ -224,7 +225,8 @@ export class Reviewer {
   const model = pickRoleModel(roleModelString(role), ctx.modelRegistry.getAvailable()) ?? ctx.model;
   const captured=await captureRevision(m,run);
   if(m.evidence.verify?.revision!==captured.revision)throw new Error('Files changed since verification; reverify before review');
-  const {session} = await this.#open(m,ctx,model,contextFiles,'',reviewBudgetMs(countDiffFiles(captured.diff)));
+  const opened=await (this.opener??((...args)=>this.#open(...args)))(m,ctx,model,contextFiles,'',reviewBudgetMs(countDiffFiles(captured.diff)));
+  const session=opened.session;
   this.sessions.add(session);
   try{
    const bounded=boundDiff(captured.diff);
