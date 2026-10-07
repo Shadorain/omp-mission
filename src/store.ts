@@ -139,7 +139,7 @@ export async function workspaceKey(identityPath: string): Promise<string> {
   return createHash("sha256").update(canonical).digest("hex").slice(0, 24);
 }
 export function missionDirectory(agentDir: string, key: string): string {
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(key)) throw new Error("Invalid mission workspace key");
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(key) || key.includes("..")) throw new Error("Invalid mission workspace key");
   return join(agentDir, "missions", key);
 }
 export function missionId(source: Source): string {

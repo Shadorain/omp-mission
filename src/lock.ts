@@ -1,11 +1,12 @@
-import { mkdir, rmdir, stat, utimes } from "node:fs/promises";
+import { mkdir, realpath, rename, rmdir, stat, utimes } from "node:fs/promises";
 import { resolve } from "node:path";
+import { randomUUID } from "node:crypto";
 
 export interface LockOptions {
   stale?: number;
   update?: number;
   realpath?: boolean;
-  retries?: number | { retries?: number };
+  retries?: number | { retries?: number; minTimeout?: number; maxTimeout?: number };
   lockfilePath?: string;
   onCompromised?: (err: Error) => void;
 }
@@ -13,11 +14,20 @@ export interface LockOptions {
 export type ReleaseLock = () => Promise<void>;
 
 export async function lock(file: string, options: LockOptions = {}): Promise<ReleaseLock> {
-  const target = resolve(file);
+  const target = options.realpath ? await realpath(file).catch(() => resolve(file)) : resolve(file);
   const lockfilePath = options.lockfilePath ?? `${target}.lock`;
   const stale = Math.max(options.stale ?? 10_000, 2_000);
   const update = Math.max(Math.min(options.update ?? Math.floor(stale / 2), Math.floor(stale / 2)), 1_000);
   const onCompromised = options.onCompromised ?? ((err: Error) => { throw err; });
+  const retriesOpt = options.retries;
+  const maxRetries = typeof retriesOpt === "number"
+    ? Math.max(0, retriesOpt)
+    : typeof retriesOpt === "object" && retriesOpt !== null && typeof retriesOpt.retries === "number"
+    ? Math.max(0, retriesOpt.retries)
+    : 0;
+  const minTimeout = typeof retriesOpt === "object" && retriesOpt !== null && typeof retriesOpt.minTimeout === "number"
+    ? Math.max(1, retriesOpt.minTimeout)
+    : 25;
 
   async function tryAcquire(): Promise<{ mtime: number }> {
     try {
@@ -32,22 +42,47 @@ export async function lock(file: string, options: LockOptions = {}): Promise<Rel
       try {
         const s = await stat(lockfilePath);
         if (s.mtime.getTime() < Date.now() - stale) {
+          const stalePath = `${lockfilePath}.stale.${randomUUID()}`;
+          let renamed = false;
           try {
-            await rmdir(lockfilePath);
-          } catch (rmErr: unknown) {
-            const rmError = rmErr as NodeJS.ErrnoException;
-            if (rmError.code !== "ENOENT") throw rmError;
+            await rename(lockfilePath, stalePath);
+            renamed = true;
+            await rmdir(stalePath);
+          } catch (renameErr: unknown) {
+            const rError = renameErr as NodeJS.ErrnoException;
+            if (rError.code !== "ENOENT") throw rError;
           }
-          await mkdir(lockfilePath);
-          const fresh = await stat(lockfilePath);
-          return { mtime: fresh.mtime.getTime() };
+          if (renamed) {
+            try {
+              await mkdir(lockfilePath);
+              const fresh = await stat(lockfilePath);
+              return { mtime: fresh.mtime.getTime() };
+            } catch (mkdirErr: unknown) {
+              const mkdirError = mkdirErr as NodeJS.ErrnoException;
+              if (mkdirError.code === "EEXIST") {
+                throw Object.assign(new Error("Lock file is already being held"), { code: "ELOCKED", file: target });
+              }
+              throw mkdirError;
+            }
+          }
         }
       } catch (statErr: unknown) {
         const statError = statErr as NodeJS.ErrnoException;
         if (statError.code === "ENOENT") {
-          await mkdir(lockfilePath);
-          const fresh = await stat(lockfilePath);
-          return { mtime: fresh.mtime.getTime() };
+          try {
+            await mkdir(lockfilePath);
+            const fresh = await stat(lockfilePath);
+            return { mtime: fresh.mtime.getTime() };
+          } catch (mkdirErr: unknown) {
+            const mkdirError = mkdirErr as NodeJS.ErrnoException;
+            if (mkdirError.code === "EEXIST") {
+              throw Object.assign(new Error("Lock file is already being held"), { code: "ELOCKED", file: target });
+            }
+            throw mkdirError;
+          }
+        }
+        if (statError.code === "EEXIST" || (statError as NodeJS.ErrnoException & { code?: string }).code === "ELOCKED") {
+          throw Object.assign(new Error("Lock file is already being held"), { code: "ELOCKED", file: target });
         }
         throw statError;
       }
@@ -56,7 +91,24 @@ export async function lock(file: string, options: LockOptions = {}): Promise<Rel
     }
   }
 
-  const { mtime: initialMtime } = await tryAcquire();
+  async function acquireWithRetries(): Promise<{ mtime: number }> {
+    let attempts = 0;
+    while (true) {
+      try {
+        return await tryAcquire();
+      } catch (err: unknown) {
+        const error = err as NodeJS.ErrnoException;
+        if (error.code === "ELOCKED" && attempts < maxRetries) {
+          attempts++;
+          await new Promise((resolve) => setTimeout(resolve, minTimeout));
+          continue;
+        }
+        throw err;
+      }
+    }
+  }
+
+  const { mtime: initialMtime } = await acquireWithRetries();
 
   let held = true;
   let currentMtime = initialMtime;

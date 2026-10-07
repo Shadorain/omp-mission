@@ -1,12 +1,23 @@
 const GLOB = /[*?[]/;
+const UNSAFE_ENCODED = /%(?:2e|2f|5c|00)/i;
 
 export function normalizeRel(path: string): string {
-	return path.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
+	if (!path || path.includes('\0') || UNSAFE_ENCODED.test(path)) return '';
+	if (path.startsWith('/') || path.startsWith('\\') || /^[A-Za-z]:/.test(path)) return '';
+	const parts = path.replace(/\\/g, '/').split('/');
+	const normalized: string[] = [];
+	for (const part of parts) {
+		if (!part || part === '.') continue;
+		if (part === '..') return '';
+		normalized.push(part);
+	}
+	return normalized.join('/');
 }
 
 /** A scope is a file, a directory (prefix), or a glob such as `crates/platform/src/**`. */
 export function inScope(path: string, scopes: readonly string[]): boolean {
 	const target = normalizeRel(path);
+	if (!target) return false;
 	return scopes.some(raw => {
 		const scope = normalizeRel(raw);
 		if (!scope) return false;
