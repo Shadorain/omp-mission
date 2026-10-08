@@ -143,9 +143,8 @@ export function missionDirectory(agentDir: string, key: string): string {
   return join(agentDir, "missions", key);
 }
 export function missionId(source: Source): string {
-  const hash = createHash("sha256").update(source.id).digest("hex").slice(0, 8);
   const slug = source.id.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60);
-  return slug ? `${slug}-${hash}` : hash;
+  return `${slug || "mission"}-${randomUUID()}`;
 }
 export function missionPath(agentDir: string, mission: Pick<Mission, "id" | "workspace">): string {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(mission.id)) throw new Error("Invalid mission ID");

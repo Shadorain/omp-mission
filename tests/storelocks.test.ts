@@ -362,16 +362,20 @@ describe("acquireOwnership", () => {
 
 // ---------------------------------------------------------------- missionId
 describe("missionId mapping", () => {
-  // BUG (filed): the separator-collapsing slug maps distinct GitHub repos to one
-  // mission id, so two different issues can share one state file. acquireOwnership
-  // only checks id+workspace.key, never source.id, so the second mission silently
-  // adopts the first mission's state.
-  test("distinct sources must not share a mission id", () => {
-    const slug = (id: string) => missionId({ kind: "github", id, title: "t", body: "", comments: "", extra: "" });
-    expect(slug("github:a/b.c#1")).not.toBe(slug("github:a/b-c#1"));
-    expect(slug("github:a/b_c#1")).not.toBe(slug("github:a/b-c#1"));
+  test("a fresh run of the same source preserves the completed run", async () => {
+    const root = mkdtempSync(join(tmpdir(), TMP_PREFIX));
+    try {
+      const completed = mkMission("old");
+      completed.id = missionId(completed.source);
+      completed.phase = "complete";
+      const fresh = { ...completed, id: missionId(completed.source), phase: "plan" as const, evidence: {} };
+      await saveMission(missionPath(root, completed), completed);
+      await saveMission(missionPath(root, fresh), fresh);
+      expect((await loadMission(missionPath(root, completed))).phase).toBe("complete");
+      expect((await loadMission(missionPath(root, fresh))).phase).toBe("plan");
+      expect((await listMissions(root)).map(entry => entry.mission.id).sort()).toEqual([completed.id, fresh.id].sort());
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
-  // observed collision forms test removed because slugs no longer collide
 
 });
 
