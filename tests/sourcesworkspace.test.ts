@@ -3,7 +3,7 @@ import { spawn } from "bun";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { parseMissionInput, fetchSource, inspectWorkspace, inferMissionSource, assertSourceCheckout } from "../src/sources";
+import { parseMissionInput, fetchSource, inspectWorkspace, inferMissionSource, assertSourceCheckout, checkoutMatchesSource } from "../src/sources";
 import type { Run, CommandResult, Workspace, Source } from "../src/types";
 
 const tempDirs: string[] = [];
@@ -172,6 +172,25 @@ describe("inspectWorkspace", () => {
     expect(ws.base).toBe("develop");
   });
 
+  it("uses feature branches start from instructions instead of the hosted default", async () => {
+    const dir = await makeTempDir();
+    await runRealGitMockCli("git", ["init", dir], dir);
+    await Bun.write(join(dir, "AGENTS.md"), "V2 feature branches start from `v2/backend-rewrite`, not `main`; `main` is the stable v1 reference.");
+    const run: Run = (command, args, cwd) => command === "gh"
+      ? Promise.resolve({stdout: JSON.stringify({defaultBranchRef: {name: "main"}}), stderr: "", code: 0})
+      : runRealGitMockCli(command, args, cwd);
+    expect((await inspectWorkspace(dir, run, {githubRepo: "owner/repo"})).base).toBe("v2/backend-rewrite");
+  });
+
+  it("honors an explicit base and repository config over stale written defaults", async () => {
+    const dir = await makeTempDir();
+    await runRealGitMockCli("git", ["init", dir], dir);
+    await Bun.write(join(dir, "AGENTS.md"), "The base branch is `main`.");
+    await runRealGitMockCli("git", ["config", "mission.baseBranch", "v2/backend-rewrite"], dir);
+    expect((await inspectWorkspace(dir, runRealGitMockCli)).base).toBe("v2/backend-rewrite");
+    expect((await inspectWorkspace(dir, runRealGitMockCli, {explicitBase: "release/custom"})).base).toBe("release/custom");
+  });
+
   it("reads base from explicitBase option", async () => {
     const dir = await makeTempDir();
     await runRealGitMockCli("git", ["init", dir], dir);
@@ -196,6 +215,30 @@ describe("inferMissionSource and assertSourceCheckout", () => {
     
     const res = await inferMissionSource(dir, runRealGitMockCli, []);
     expect(res.source).toBe("CHR-142");
+  });
+
+  it("does not treat lowercase title suffixes as additional tickets", async () => {
+    const dir = await makeTempDir();
+    const branch = "chr-143-replace-stringly-and-anyhow-domain-errors-with-thiserror-2";
+    await runRealGitMockCli("git", ["init", dir], dir);
+    await runRealGitMockCli("git", ["-C", dir, "commit", "--allow-empty", "-m", "initial"], dir);
+    await runRealGitMockCli("git", ["-C", dir, "checkout", "-b", branch], dir);
+    const source: Source = { kind: "linear", id: "linear:CHR-143", title: "", body: "", comments: "", extra: "" };
+    const workspace = await inspectWorkspace(dir, runRealGitMockCli);
+    for (const cwd of [dir, join(dir, "chr-143-replace-stringly-and-anyhow-domain-error-2")]) {
+      const checkout = { ...workspace, cwd };
+      expect(() => assertSourceCheckout(source, checkout)).not.toThrow();
+      expect(checkoutMatchesSource(source, checkout)).toBe(true);
+      expect(checkoutMatchesSource({ ...source, id: "linear:ERROR-2" }, checkout)).toBe(false);
+    }
+    expect(await inferMissionSource(dir, runRealGitMockCli, [])).toEqual({ source: "CHR-143", ambiguous: [] });
+    expect(() => assertSourceCheckout({ ...source, id: "linear:CHR-144" }, workspace)).toThrow("This checkout belongs to CHR-143");
+  });
+
+  test.each(["chr-143-chr-144", "chr-143-ABC-2", "chr-143/abc-2"])("retains explicit checkout conflicts in %s", (branch) => {
+    const workspace: Workspace = { key: "a", cwd: "/path", branch, delivery: "pr" };
+    const source: Source = { kind: "linear", id: "linear:CHR-143", title: "", body: "", comments: "", extra: "" };
+    expect(() => assertSourceCheckout(source, workspace)).toThrow(/This checkout belongs to (CHR-144|ABC-2)/);
   });
 
   it("infers GitHub from branch", async () => {

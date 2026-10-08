@@ -88,22 +88,6 @@ describe("mission input and source resolution", () => {
 });
 
 describe("mission configuration", () => {
-  test("resolves linked-worktree identity and repository instructions before local config", async () => {
-    const root = await temp();
-    await mkdir(join(root, ".git"));
-    await writeFile(join(root, "AGENTS.md"), "- **`main`** is the stable v1 behavioral/reference line.\n- **`v2/backend-rewrite`** is the v2 integration branch. All v2 architecture work lands here first.\n- **CHR feature branches created during the rewrite branch from\n  `v2/backend-rewrite`**, not `main`.");
-    const run: Run = async (_command, args) => {
-      if (args[0] === "rev-parse" && args[1] === "--show-toplevel") return { stdout: root, stderr: "", code: 0 };
-      if (args[0] === "rev-parse" && args[1] === "--git-common-dir") return { stdout: ".git", stderr: "", code: 0 };
-      if (args[0] === "branch") return { stdout: "feature/work", stderr: "", code: 0 };
-      if (args[0] === "config") return { stdout: "configured-base", stderr: "", code: 0 };
-      return { stdout: "", stderr: "", code: 1 };
-    };
-    const workspace = await inspectWorkspace(root, run);
-    expect(workspace.base).toBe("v2/backend-rewrite");
-    expect(workspace.key).toBe(await workspaceKey(join(root, ".git")));
-  });
-
   test("reports malformed mission configuration rather than falling back", async () => {
     const root = await temp();
     await writeFile(join(root, "mission.json"), "{");

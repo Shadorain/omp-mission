@@ -160,24 +160,23 @@ export async function inspectWorkspace(cwd: string, run: Run, options: Workspace
   const commonDir = await realpath(commonPath);
   const branchResult = await run("git", ["branch", "--show-current"], top);
   const branch = branchResult.code === 0 ? branchResult.stdout.trim() : "";
-  let base: string | undefined;
-  for (const name of ["AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md", "README.md"]) {
+  let base = options.explicitBase;
+  if (!base) {
+    const configured = await run("git", ["config", "--get", "mission.baseBranch"], top);
+    if (configured.code === 0 && configured.stdout.trim()) base = configured.stdout.trim();
+  }
+  if (!base) for (const name of ["AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md", "README.md"]) {
     try {
       const contents = await readFile(join(top, name), "utf8");
       const declared = contents.match(/(?:base|target|integration)\s+branch\s*(?:is|:|=)\s*[`'"]?([A-Za-z0-9._/-]+)/i);
       const integration = contents.match(/[`'"]([A-Za-z0-9._/-]+)[`'"]\*{0,2}\s+is\s+(?:the\s+)?(?:[A-Za-z0-9_-]+\s+)?(?:base|target|integration)\s+branch/i);
-      const branchFrom = contents.match(/\bbranch\s+from\s+[`'"]([A-Za-z0-9._/-]+)[`'"]/i);
+      const branchFrom = contents.match(/\b(?:branch|start)\s+from\s+[`'"]([A-Za-z0-9._/-]+)[`'"]/i);
       const match = declared ?? integration ?? branchFrom;
       if (match) { base = match[1]; break; }
     } catch (error: unknown) {
       if (error && typeof error === "object" && "code" in error && error.code !== "ENOENT") throw error;
     }
   }
-  if (!base) {
-    const configured = await run("git", ["config", "--get", "mission.baseBranch"], top);
-    if (configured.code === 0 && configured.stdout.trim()) base = configured.stdout.trim();
-  }
-  if (!base) base = options.explicitBase;
   if (!base) {
     let githubRepo = options.githubRepo;
     if (!githubRepo) {
@@ -210,11 +209,20 @@ function linearIdentifiers(texts: string[]): string[] {
   const invalid = new Set(['fix', 'feat', 'chore', 'docs', 'test', 'bug', 'issue', 'pr', 'main', 'master', 'tck', 'gh']);
   const expression = /(^|[^A-Za-z0-9])([A-Za-z]{2,5}-\d{1,5})(?=[^A-Za-z0-9]|$)/g;
   for (const text of texts) {
-    expression.lastIndex = 0;
-    let hit: RegExpExecArray | null;
-    while ((hit = expression.exec(text))) {
-      const id = hit[2]!.toUpperCase();
-      if (!invalid.has(id.split('-')[0]!.toLowerCase())) found.add(id);
+    for (const component of text.split("/")) {
+      expression.lastIndex = 0;
+      let hit: RegExpExecArray | null;
+      let project: string | undefined;
+      while ((hit = expression.exec(component))) {
+        const token = hit[2]!;
+        const id = token.toUpperCase();
+        const prefix = id.split('-')[0]!;
+        if (invalid.has(prefix.toLowerCase())) continue;
+        // Lowercase title words after the ticket are not new project identifiers.
+        if (project && prefix !== project && token !== id) continue;
+        found.add(id);
+        project ??= prefix;
+      }
     }
   }
   return [...found];

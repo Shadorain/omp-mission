@@ -35,6 +35,10 @@ Two graph kinds. `local`: work happens in the coordinator pane, no workers. `bea
 
 Approving the plan is the approval to start. A `before_agent_start` hook sees the synthetic `Plan approved.` prompt (or the first message of a `--force` start) and, before the first execution turn, runs `start`. For a beads graph it also runs `bind_workspace` in reuse-only mode: a checkout whose branch or path already names the ticket is bound, with its bead database; a worktree is never created here. The hook returns one message with the result and the next step's guide, and records the wake signature so the model is not woken twice. Any failure is reported in that message and the model falls back to the manual operation. The hook never changes the system prompt.
 
+`src/sources.ts` shares Linear identifier parsing across source inference, checkout guards, and checkout reuse. Each slash-separated component establishes its project from the first non-reserved identifier. Subsequent lowercase identifiers for different projects are title text; uppercase identifiers and same-project identifiers remain candidates, preserving ambiguity and conflict checks.
+
+Workspace base precedence is explicit `bind_workspace base`, repository `mission.baseBranch`, written branch instructions, hosted default, then `origin/HEAD`. The instruction parser accepts both “branch from” and “start from”; it never treats the current feature branch as the base.
+
 ## Compaction
 
 `session.compacting` pins mission essentials into the summary (ticket file path, phase, epic, checkout, open workers, unfinished beads), because the summarizer is lossy. The ticket file is rewritten at that point if /tmp was cleaned. `session_compact` forgets which guides were sent, so the next result re-teaches the current step.
