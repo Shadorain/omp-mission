@@ -1,6 +1,6 @@
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { basename, join } from 'node:path';
+import { join } from 'node:path';
 import { AgentRegistry, createAgentSession, Settings, type ExtensionContext } from '@oh-my-pi/pi-coding-agent';
 import { contextFilesFor, type ContextFile } from './context';
 import { pickRoleModel, roleModelString, roleThinkingLevel } from './review';
@@ -124,7 +124,7 @@ export function mutationText(messages: readonly unknown[]): string {
 }
 
 function mentions(text: string, path: string): boolean {
-	return text.includes(path) || text.includes(basename(path));
+	return text.includes(path);
 }
 
 export function changedSince(before: Record<string, string>, after: Record<string, string>): string[] {
@@ -283,30 +283,27 @@ export class SubagentRunner implements SubagentPort {
 		const result = extractYield(live.session.state.messages);
 		if (!result) return { ok: false, error: 'worker ended without yielding a result' };
 		if (!result.done) return { ok: false, error: `worker reported it is not done: ${result.summary.slice(0, 400)}` };
-		const allowed = [...worker.files];
-		// Edits inside another dispatched bead's paths are that worker's to answer for (its own check covers them), so a
-		// resumed worker is not blamed for what its siblings did while it was stopped. Only a path nobody owns is a stray.
-		for (const other of mission.workers) if (other.beadId !== worker.beadId) allowed.push(...other.files);
+		const owned = (beadId: string, files: readonly string[]) => [...files, ...(mission.scopes[beadId] ?? [])];
+		const mine = owned(worker.beadId, worker.files);
+		const sibling = mission.workers.filter(other => other.beadId !== worker.beadId).flatMap(other => owned(other.beadId, other.files));
 		const changed = changedSince(live.baseline, await snapshotChanges(this.#o.run, worker.cwd));
-		let stray = outOfScope(changed, allowed);
-		if (stray.length) {
-			// A path nobody owns goes to the worker whose own commands named it. Only blame this worker when it named the
-			// path, or when no other worker did, so a sibling's stray file does not reject an innocent finisher.
-			const mine = mutationText(live.session.state.messages);
-			const others: string[] = [];
-			for (const other of mission.workers) {
-				if (other.beadId === worker.beadId) continue;
-				const running = this.#live.get(other.beadId);
-				others.push(running ? mutationText(running.session.state.messages) : await this.#readMentions(mission, other));
-			}
-			stray = stray.filter(path => mentions(mine, path) || !others.some(text => mentions(text, path)));
+		const mutations = mutationText(live.session.state.messages);
+		const others: string[] = [];
+		for (const other of mission.workers) {
+			if (other.beadId === worker.beadId) continue;
+			const running = this.#live.get(other.beadId);
+			others.push(running ? mutationText(running.session.state.messages) : await this.#readMentions(mission, other));
 		}
-		if (stray.length) return { ok: false, error: `edits outside the allowed paths (${stray.slice(0, 8).join(', ')}${stray.length > 8 ? ', …' : ''}); bead left open for review. If a concurrent worker made them, release or resend this one after cleaning up` };
+		// A sibling scope, including one rebound after dispatch, is that sibling's edit. A shared lockfile in both scopes is neither worker's stray. Basename matches are not attribution: lib.rs is not crates/http/src/lib.rs.
+		const unowned = outOfScope(changed, [...mine, ...sibling]).filter(path => mentions(mutations, path) || !others.some(text => mentions(text, path)));
+		const crossed = outOfScope(changed, mine).filter(path => inScope(path, sibling) && mentions(mutations, path));
+		const stray = [...new Set([...unowned, ...crossed])];
+		if (stray.length) return { ok: false, error: `edits outside the allowed paths (${stray.slice(0, 8).join(', ')}${stray.length > 8 ? ', …' : ''}); bead left open for review` };
 		// Review diffs only see new files once they are staged, and staging is bookkeeping, not judgment: do it here instead of
 		// spending a model call (a full ~10k-token prefix re-read) on it. Only this worker's own paths, never a sibling's work in progress.
-		const mine = changed.filter(path => inScope(path, worker.files));
-		if (mine.length) {
-			const staged = await this.#serial(() => this.#o.run('git', ['add', '-A', '--', ...mine], worker.cwd));
+		const own = changed.filter(path => inScope(path, worker.files));
+		if (own.length) {
+			const staged = await this.#serial(() => this.#o.run('git', ['add', '-A', '--', ...own], worker.cwd));
 			if (staged.code !== 0) return { ok: false, error: `git add failed: ${(staged.stderr || staged.stdout).trim().slice(0, 300)}` };
 		}
 		const reason = [result.summary, result.verification ? `Verified: ${result.verification}` : ''].filter(Boolean).join('\n').slice(0, 4000);

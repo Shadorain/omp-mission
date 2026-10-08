@@ -102,6 +102,43 @@ test('edits outside the allowed paths leave the bead open with the offending fil
   expect(bdCalls.some(call => call.args[0] === 'close')).toBe(false);
 });
 
+test('a worker cannot edit a closed sibling scope and inherit its authorization', async () => {
+ const sibling = worker('bd-old', ['b/**']);
+ sibling.state = 'closed';
+ const w = worker('bd-new', ['a/**']);
+ const f = fake(async ({cwd, messages}) => {
+  messages.push(toolCall('edit', {path: 'b/two.txt'}));
+  await writeFile(join(cwd, 'b', 'two.txt'), 'unauthorized fix');
+  messages.push(yielded({done: true, summary: 'fixed baseline'}));
+ });
+ const {runner, settled} = harness(async () => ({session: f.session, file: join(root, 's.jsonl')}));
+ await runner.launch(mission([sibling, w]), w);
+ await runner.whenDone(w.beadId);
+ expect(settled[0]![1]).toMatchObject({ok: false, error: expect.stringMatching(/outside the allowed paths \(b\/two.txt\)/)});
+ expect(bdCalls.some(call => call.args[0] === 'close')).toBe(false);
+});
+
+test('a worker that mutates a live sibling\'s scope and names the path is rejected, and its bead stays open', async () => {
+  const sibling = worker('bd-live', ['b/**']);
+  const w = worker('bd-mine', ['a/**']);
+  const held = fake(() => {}, true);
+  const f = fake(async ({ cwd, messages }) => {
+    messages.push(toolCall('bash', { command: 'cat b/two.txt && sed -i s/2/x/ b/two.txt' }));
+    await writeFile(join(cwd, 'b', 'two.txt'), 'hijacked');
+    messages.push(yielded({ done: true, summary: 'mine' }));
+  });
+  const sessions = [held, f];
+  let n = 0;
+  const { runner, settled } = harness(async () => ({ session: sessions[n++]!.session, file: join(root, `s${n}.jsonl`) }));
+  const m = mission([sibling, w]);
+  await runner.launch(m, sibling);
+  await runner.launch(m, w);
+  await runner.whenDone('bd-mine');
+  expect(settled.find(([id]) => id === 'bd-mine')![1]).toMatchObject({ ok: false, error: expect.stringMatching(/outside the allowed paths \(b\/two\.txt\)/) });
+  expect(bdCalls.filter(call => call.args[0] === 'close').map(call => call.args[1])).toEqual([]);
+  await runner.abortAll();
+});
+
 test('a file that was already dirty at launch is judged by what the worker changed, not by being dirty', async () => {
   await writeFile(join(cwd, 'b', 'two.txt'), 'dirty before the worker');
   const f = fake(async ({ cwd, messages }) => { await writeFile(join(cwd, 'a', 'one.txt'), 'mine'); messages.push(yielded({ done: true, summary: 'ok' })); });
@@ -279,6 +316,43 @@ test('a stray file is blamed on the worker whose commands named it, not on an in
   release();
   await runner.whenDone('bd-b');
   expect(settled.find(([id]) => id === 'bd-b')![1]).toMatchObject({ ok: false, error: expect.stringMatching(/outside the allowed paths \(verify-output\.txt\)/) });
+});
+
+test('a shared scope file and a sibling edit are not this worker\'s stray, even if a basename appears in its commands', async () => {
+ await writeFile(join(cwd, 'lock.txt'), '1');
+ await git(cwd, 'add', 'lock.txt');
+ await git(cwd, 'commit', '-qm', 'lock');
+ const a = worker('bd-a', ['a/**']);
+ const b = worker('bd-b', ['b/**']);
+ const m = mission([a, b]);
+ m.scopes = { 'bd-a': ['a/**', 'lock.txt'], 'bd-b': ['b/**', 'lock.txt'] };
+ const fa = fake(async ({ cwd: dir }) => { await writeFile(join(dir, 'a', 'one.txt'), 'A'); await writeFile(join(dir, 'lock.txt'), '2'); });
+ const fb = fake(async ({ cwd: dir, messages }) => {
+  await fa.prompted;
+  await writeFile(join(dir, 'b', 'two.txt'), 'B');
+  messages.push(toolCall('bash', { command: 'cargo test lib.rs' }), yielded({ done: true, summary: 'b' }));
+ });
+ const sessions = [fa, fb];
+ let n = 0;
+ const { runner, settled } = harness(async () => ({ session: sessions[n++]!.session, file: join(root, `s${n}.jsonl`) }));
+ await runner.launch(m, a);
+ await runner.launch(m, b);
+ await runner.whenDone('bd-b');
+ expect(settled.find(([id]) => id === 'bd-b')![1]).toEqual({ ok: true, summary: 'b' });
+});
+
+test('a worker that names a sibling path in an edit still fails', async () => {
+ const a = worker('bd-a', ['a/**']);
+ const b = worker('bd-b', ['b/**']);
+ const m = mission([a, b]);
+ const fb = fake(async ({ cwd: dir, messages }) => {
+  await writeFile(join(dir, 'a', 'one.txt'), 'stolen');
+  messages.push(toolCall('edit', { path: 'a/one.txt' }), yielded({ done: true, summary: 'b' }));
+ });
+ const { runner, settled } = harness(async () => ({ session: fb.session, file: join(root, 's.jsonl') }));
+ await runner.launch(m, b);
+ await runner.whenDone('bd-b');
+ expect(settled.find(([id]) => id === 'bd-b')![1]).toMatchObject({ ok: false, error: expect.stringMatching(/a\/one\.txt/) });
 });
 
 test('mutationText keeps only edit, write, and bash arguments', () => {
