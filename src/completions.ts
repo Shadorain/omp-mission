@@ -2,10 +2,15 @@ export interface CompletionSource { id: string; title: string }
 export interface CompletionBead { id: string; title: string; category?: string }
 export interface CompletionWorker { beadId: string; state: string; handle?: boolean; /** A subagent worker that stopped with an error and awaits guidance or release. */ stopped?: boolean }
 export interface MissionCompletionState {
+	/** Unfinished saved sources only; completed runs live in `completed`. */
 	sources: CompletionSource[];
 	beads: CompletionBead[];
 	workers: CompletionWorker[];
-	/** Verb the operator should run now (from the mission's next step); listed first and marked. */
+	/** Commands valid right now (bare verbs or full forms like `history bd-1`); gates the contextual verbs. */
+	available?: string[];
+	/** Completed runs offered by `history`; never suggested as startable sources. */
+	completed?: Array<{ id: string; title: string; runId: string }>;
+	/** Command the operator should run now; its verb is listed first and marked only when visible. */
 	recommended?: string;
 }
 
@@ -14,11 +19,12 @@ export interface CompletionItem { value: string; label: string; description?: st
 /** `description` says when to run it (autocomplete); `short` fits the action menu. */
 export const VERBS: Array<{ name: string; description: string; short: string }> = [
 	{ name: "show", short: "Open the inspector", description: "Open the inspector overlay. Read-only, safe any time" },
+	{ name: "clear", short: "Detach completed mission or discard plan", description: "Clear this session's completed mission or unstarted plan; keep saved history" },
 	{ name: "continue", short: "Take control of a resumed mission", description: "After a restart: take control of the saved mission (needed first)" },
 	{ name: "mode", short: "Switch auto / pause / force", description: "How it runs: auto, pause (you approve each gate) or force" },
 	{ name: "approve", short: "Approve the waiting gate", description: "Pause mode: approve the gate shown in the widget" },
 	{ name: "review", short: "Request or retry independent review", description: "After delivery: request an independent review, or retry one" },
-	{ name: "history", short: "Show a bead's audit log", description: "Beads graph: show the audit log of one bead" },
+	{ name: "history", short: "Browse a completed run", description: "Inspect a completed run by run ID, or a bead's audit log" },
 	{ name: "focus", short: "Jump to a worker session", description: "Beads graph: jump to the session of a bead's worker" },
 	{ name: "resend", short: "Resend assignment or guide a worker", description: "Worker never claimed its bead, or stopped: resend or guide it" },
 	{ name: "release", short: "Hand a bead back for a fresh worker", description: "Worker stuck or stopped: hand its bead back to be retaken" },
@@ -53,7 +59,21 @@ const GRAPHS = [
 	{ name: "local", description: "This pane; subagents are visibility only" },
 	{ name: "beads", description: "Durable bead graph" },
 ];
-const VERB_NAMES = new Set(VERBS.map(verb => verb.name));
+const VERB_NAMES: Record<string, true> = Object.fromEntries(VERBS.map(verb => [verb.name, true]));
+/** Core verbs always suggest; contextual verbs only when `available` allows them; specialists never suggest but still complete when typed. */
+const VISIBILITY: Record<string, "core" | "context" | "specialist"> = {
+	show: "core", history: "core", config: "core",
+	clear: "context", continue: "context", mode: "context", approve: "context", review: "context",
+	focus: "specialist", resend: "specialist", release: "specialist", dispatch: "specialist", reap: "specialist", actions: "specialist",
+};
+
+function suggested(name: string, state: MissionCompletionState): boolean {
+	if (state.recommended === name && state.available?.some(command => command === name || command.startsWith(`${name} `))) return true;
+	const kind = VISIBILITY[name];
+	if (kind === "core") return true;
+	if (kind !== "context") return false;
+	return state.available?.some(command => command === name || command.startsWith(`${name} `)) ?? false;
+}
 
 function item(stem: string, name: string, description?: string, hint?: string): CompletionItem {
 	return { value: stem ? `${stem} ${name} ` : `${name} `, label: name, description, hint };
@@ -150,7 +170,11 @@ function completeVerb(verb: string, rest: string[], partial: string, state: Miss
 	}
 	if (verb === "history") {
 		if (rest.length > 0) return null;
-		const items = beadItems(verb, state.beads, partial);
+		const runs = (state.completed ?? [])
+			.filter(run => matches(run.runId, partial) || matches(run.id, partial) || matches(run.title, partial))
+			.slice(0, 12)
+			.map(run => ({ value: `${verb} ${run.runId} `, label: run.id, description: `${run.title} · ${run.runId}` }));
+		const items = [...runs, ...beadItems(verb, state.beads, partial)];
 		return items.length ? items : null;
 	}
 	if (verb === "focus" || verb === "resend" || verb === "release" || verb === "reap") {
@@ -168,13 +192,14 @@ function completeVerb(verb: string, rest: string[], partial: string, state: Miss
 }
 
 function firstToken(partial: string, state: MissionCompletionState): CompletionItem[] | null {
-	const verbs = VERBS.filter(verb => matches(verb.name, partial))
-		.map(verb => verb.name === state.recommended ? item("", verb.name, `▸ Next: ${verb.description}`) : item("", verb.name, verb.description))
-		.sort((a, b) => Number(b.label === state.recommended) - Number(a.label === state.recommended));
+	const next = state.recommended?.split(/\s+/)[0];
+	const verbs = VERBS.filter(verb => suggested(verb.name, state) && matches(verb.name, partial))
+		.map(verb => verb.name === next ? item("", verb.name, `▸ Next: ${verb.description}`) : item("", verb.name, verb.description))
+		.sort((a, b) => Number(b.label === next) - Number(a.label === next));
 	const flags = partial.startsWith("-") || partial.length === 0
 		? FLAGS.filter(flag => flagMatches(flag, partial)).map(flag => item("", flag.name, flag.description))
 		: [];
-	const sources = partial.startsWith("-")
+	const sources = partial.startsWith("-") || partial.length === 0
 		? []
 		: state.sources.filter(source => matches(source.id, partial) || matches(source.title, partial)).slice(0, 12).map(source => item("", source.id.replace(/^(?:linear|github|freeform):/i, ""), source.title));
 	const items = [...verbs, ...flags, ...sources];
@@ -186,7 +211,7 @@ export function missionArgumentCompletions(prefix: string, state: MissionComplet
 	const { tokens, partial } = split(prefix);
 	if (tokens.includes("--")) return null;
 	const head = tokens[0]?.toLowerCase();
-	if (head && VERB_NAMES.has(head)) return completeVerb(head, tokens.slice(1), partial, state);
+	if (head && VERB_NAMES[head]) return completeVerb(head, tokens.slice(1), partial, state);
 	if (tokens.length === 0) return firstToken(partial, state);
 	const used = new Set(tokens);
 	const stem = tokens.join(" ");
