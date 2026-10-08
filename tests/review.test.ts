@@ -2,7 +2,7 @@ import {test,expect} from 'bun:test';
 import {mkdtemp,writeFile,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {captureRevision,parseReview,reviewBudgetMs} from '../src/review';
+import {alignVerifiedRevision,captureRevision,parseReview,reviewBudgetMs} from '../src/review';
 import type {Mission,Run} from '../src/types';
 import {validateMission} from '../src/store';
 function mission(cwd:string):Mission{return {version:1,id:'review-test',source:{kind:'freeform',id:'test',title:'review',body:'behavior',comments:'',extra:''},workspace:{key:'key',cwd,delivery:'local'},scopes:{a:['a.ts']},phase:'review',mode:'pause',keep:false,reviewRequested:true,evidence:{},workers:[],reviews:[],repairLinks:{},round:1,createdAt:'now',updatedAt:'now'};}
@@ -23,7 +23,7 @@ test('the review diff is measured from the merge-base of the freshest base ref',
   expect(diffs.map(args=>args[1])).toEqual(['fresh123','stale456']);
  }finally{await rm(cwd,{recursive:true,force:true});}
 });
-test('the tree fingerprint survives a new HEAD but not a content change',async()=>{
+test('fingerprints bind content and target base while the tree survives a new HEAD',async()=>{
  const cwd=await mkdtemp(join(tmpdir(),'mission-tree-'));
  try{
   await writeFile(join(cwd,'a.ts'),'verified');
@@ -35,8 +35,25 @@ test('the tree fingerprint survives a new HEAD but not a content change',async()
   const committed=await captureRevision(m,run);
   expect(committed.revision).not.toBe(verified.revision);
   expect(committed.tree).toBe(verified.tree);
+  expect(committed.legacyRevision).not.toBe(verified.legacyRevision);
+  expect(committed.legacyTree).toBe(verified.legacyTree);
+  m.evidence.verify={outcome:'passed',revision:verified.revision,tree:verified.tree,detail:'verified',at:'now'};
+  expect(alignVerifiedRevision(m,committed)).toBe(committed.revision);
+  expect(m.evidence.verify.revision).toBe(committed.revision);
+  m.evidence.verify={outcome:'passed',revision:verified.legacyRevision,tree:verified.legacyTree,detail:'old',at:'now'};
+  m.evidence.deliver={outcome:'passed',revision:verified.legacyRevision,detail:'old',at:'now'};
+  expect(alignVerifiedRevision(m,committed)).toBe(committed.revision);
+  expect(m.evidence.verify).toMatchObject({revision:committed.revision,tree:committed.tree});
+  expect(m.evidence.deliver.revision).toBe(committed.revision);
+  m.workspace.base='v2/backend-rewrite';
+  const retargeted=await captureRevision(m,run);
+  expect(retargeted.revision).not.toBe(committed.revision);
+  expect(retargeted.tree).not.toBe(committed.tree);
+  expect(retargeted.legacyTree).toBe(committed.legacyTree);
+  m.evidence.verify={outcome:'passed',revision:committed.revision,tree:committed.tree,detail:'verified',at:'now'};
+  expect(()=>alignVerifiedRevision(m,retargeted)).toThrow(/Files changed since verification/);
   await writeFile(join(cwd,'a.ts'),'edited after verification');
-  expect((await captureRevision(m,run)).tree).not.toBe(verified.tree);
+  expect((await captureRevision(m,run)).tree).not.toBe(retargeted.tree);
  }finally{await rm(cwd,{recursive:true,force:true});}
 });
 test('reviewer time budget grows with the change and is capped',()=>{

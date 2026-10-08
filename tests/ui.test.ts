@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { visibleWidth } from "@oh-my-pi/pi-tui";
 import type { KeybindingsManager, Theme } from "@oh-my-pi/pi-coding-agent";
-import { MissionInspector, MissionWidget } from "../src/ui.ts";
+import { displayBeads, MissionInspector, MissionWidget } from "../src/ui.ts";
 import type { Bead, Mission, Projection, Snapshot } from "../src/types.ts";
 
 const theme = { fg: (_tone: string, text: string) => text } as Theme;
@@ -27,6 +27,75 @@ function projection(beads: Bead[], expanded = false): Projection {
 	return { mission: makeMission(), snapshot, resumeHold: false, expanded };
 }
 
+test("dependency waiting is not rendered as a failed task", () => {
+	const task = {...bead("waiting-on-domain"), ready: false, category: "waiting" as const};
+	const current = projection([task]);
+	current.snapshot!.ready = [];
+	current.snapshot!.blocked = 1;
+	const widget = new MissionWidget(() => current, () => 40, theme);
+	expect(widget.render(120)[0]).toContain("1 waiting");
+	expect(widget.render(120)[0]).not.toContain("✘");
+	current.snapshot!.leaves[0] = {...task, category: "blocked"};
+	current.snapshot!.beads[0] = current.snapshot!.leaves[0]!;
+	expect(widget.render(120)[0]).toContain("✘ 1");
+	expect(widget.render(120)[0]).not.toContain("waiting");
+});
+
+test("review-ready evidence overrides an old execute label without changing saved state", () => {
+ const current = projection([]);
+ current.mission.evidence.verify = {outcome: "passed", detail: "Smoke passed", revision: "same", at: "now"};
+ current.mission.evidence.deliver = {outcome: "passed", detail: "PR ready", revision: "same", at: "now"};
+ current.step = {command: "/mission review", text: "Request independent review"};
+ const widget = new MissionWidget(() => current, () => 40, theme);
+ expect(widget.render(120)[0]).toContain("Review");
+ expect(widget.render(120)[0]).not.toContain("Execute");
+ expect(current.mission.phase).toBe("execute");
+ delete current.mission.evidence.deliver;
+ expect(widget.render(120)[0]).toContain("Deliver");
+ current.snapshot = projection([bead("new-repair")]).snapshot;
+ expect(widget.render(120)[0]).toContain("Execute");
+ expect(widget.render(120)[0]).not.toContain("Deliver");
+});
+
+test("saved reviewers remain visible after history restore and live rows do not duplicate them", () => {
+	const current = projection([]);
+	current.mission.graph = "local";
+	current.mission.phase = "complete";
+	current.mission.reviews = [
+		{ round: 1, revision: "old", model: "test", summary: "Old review", findings: [], at: "before", transcripts: { integration: "/tmp/old-review.jsonl" } },
+		{ round: 2, revision: "new", model: "test", summary: "Clean", findings: [], at: "now", transcripts: { integration: "/tmp/new-review.jsonl", leaf: "/tmp/leaf-review.jsonl" } },
+	];
+	const inspector = new MissionInspector(() => current, { close() {}, select() {} }, () => 40, theme, keys);
+	expect(inspector.render(120).join("\n")).toContain("review integration");
+	expect(displayBeads(current).map(row => row.id)).toEqual([
+		"subagent:review:0:integration", "subagent:review:1:integration", "subagent:review:1:leaf",
+	]);
+	expect(displayBeads(current).every(row => row.category === "closed")).toBe(true);
+	current.subagents = [{ id: "subagent:review:1:leaf", name: "review leaf", kind: "task", state: "closed" }];
+	expect(displayBeads(current).filter(row => row.id === "subagent:review:1:leaf")).toHaveLength(1);
+	inspector.handleInput("\t");
+	inspector.handleInput("\t");
+	expect(inspector.render(120).join("\n")).toContain("/tmp/new-review.jsonl");
+});
+
+test("incomplete restored review keeps completed, failed and pending targets distinct", () => {
+	const current = projection([]);
+	current.mission.graph = "local";
+	current.mission.phase = "review";
+	current.mission.reviewProgress = {
+		round: 1, revision: "same", model: "test", at: "now",
+		inputs: { completed: "a", failed: "b", pending: "c" },
+		targets: { completed: { summary: "Clean", findings: [], transcript: "/tmp/completed-review.jsonl" } },
+		failures: { failed: "Deadline exceeded" },
+	};
+	expect(displayBeads(current).map(row => [row.id, row.category])).toEqual([
+		["subagent:review:0:completed", "closed"],
+		["subagent:review:0:failed", "blocked"],
+		["subagent:review:0:pending", "waiting"],
+	]);
+	current.subagents = [{ id: "subagent:review:0:failed", name: "review failed", kind: "task", state: "running" }];
+	expect(displayBeads(current).filter(row => row.id === "subagent:review:0:failed").map(row => row.category)).toEqual(["active"]);
+});
 describe("mission UI", () => {
 	test("compact and expanded widgets remain terminal-width and height bounded", () => {
 		const beads = [bead("epic", ["one", "two"]), bead("one", [], "epic"), bead("two", [], "epic")];

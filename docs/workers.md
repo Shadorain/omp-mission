@@ -44,6 +44,12 @@ Code: `src/subagent.ts` (`SubagentRunner`), driven by the worker driver through 
 - **Focus / reap.** No tab. `focus` points at the Agent Hub; `reap` aborts a live session.
 - **Context.** `workerContext` picks the context files (`src/context.ts`); the bead title, description, and acceptance are inlined into the assignment.
 
+## Coordinator boundaries
+
+Beads coordinators create scoped leaves for implementation fixes. Direct writes into the bound checkout, including unbound files, are blocked except evidence under `.artifacts/` that no worker scope owns. Recognized blanket staging and checkout-rewriting Git commands are blocked before execution.
+
+When all workers are closed and no implementation leaf is active, extension hooks fingerprint nonignored Git files plus explicitly scoped literal paths around shell commands. Detected changes fail verification and clear delivery, review, completion evidence and partial review progress. They are reported without rollback. Concurrent-worker windows, ignored generated files and asynchronous commands are not a filesystem sandbox.
+
 ## Cleanup
 
 Close only the exact recorded terminal. NEVER close all terminals or the coordinator's own tab. `--keep` leaves worker tabs up.

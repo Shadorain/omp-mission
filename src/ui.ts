@@ -1,8 +1,8 @@
 import type { Component, TUI } from "@oh-my-pi/pi-tui";
 import { replaceTabs, truncateToWidth, wrapTextWithAnsi, visibleWidth } from "@oh-my-pi/pi-tui";
 import type { KeybindingsManager, Theme, ThemeColor } from "@oh-my-pi/pi-coding-agent";
-import { phases, type Bead, type Evidence, type Mission, type Mode, type Phase, type Projection, type SubagentRow } from "./types.ts";
-import { effectiveGraph } from "./controller.ts";
+import { phases, type Bead, type Evidence, type Mission, type Mode, type Phase, type Projection, type Snapshot, type SubagentRow } from "./types.ts";
+import { displayPhase, effectiveGraph } from "./controller.ts";
 import { displaySourceId } from "./sources.ts";
 
 export interface MissionInspectorCallbacks { close(): void; select(beadId: string): void | Promise<void>; actions?: () => void | Promise<void> }
@@ -11,7 +11,7 @@ export type MissionView = "outline" | "history" | "evidence";
 export const phaseLabel = (phase: Phase) => phase[0]?.toUpperCase() + phase.slice(1);
 const phaseStatus = (mission: Mission, phase: Phase) => {
 	const evidence = mission.evidence[phase];
-	return evidence?.outcome ?? (mission.phase === phase ? "active" : "pending");
+	return evidence?.outcome ?? (displayPhase(mission) === phase ? "active" : "pending");
 };
 const clip = (value: string, width: number) => truncateToWidth(replaceTabs(value), Math.max(1, width));
 const paint = (theme: Theme, tone: ThemeColor, value: string) => theme.fg(tone, value);
@@ -33,6 +33,7 @@ function modeChip(theme: Theme, mode: Mode): string {
 
 function alertChip(projection: Projection, theme: Theme): string {
 	if (projection.ownershipError) return paint(theme, "error", `${glyph(theme, "status.error", "✘")} lock`);
+	if (projection.mission.phase === "complete") return "";
 	if (projection.resumeHold) return paint(theme, "warning", `${glyph(theme, "status.warning", "!")} resume`);
 	if (projection.nativePlan && projection.mission.phase !== "plan") return paint(theme, "warning", `${glyph(theme, "status.warning", "!")} plan`);
 	if (projection.mission.gate && !projection.mission.gate.approved) return paint(theme, "warning", `${glyph(theme, "status.warning", "!")} approve`);
@@ -43,10 +44,16 @@ function alertChip(projection: Projection, theme: Theme): string {
 function countChip(projection: Projection, theme: Theme): string {
 	const snapshot = projection.snapshot;
 	if (!snapshot) return "";
+	let blocked = 0, waiting = 0;
+	for (const bead of snapshot.leaves) {
+		if (bead.category === "blocked") blocked++;
+		else if (bead.category === "waiting") waiting++;
+	}
 	const bits = [
 		snapshot.active ? paint(theme, "success", `${glyph(theme, "status.running", "⟳")} ${snapshot.active}`) : "",
 		snapshot.ready.length ? paint(theme, "accent", `${glyph(theme, "status.pending", "○")} ${snapshot.ready.length}`) : "",
-		snapshot.blocked ? paint(theme, "error", `${glyph(theme, "status.error", "✘")} ${snapshot.blocked}`) : "",
+		blocked ? paint(theme, "error", `${glyph(theme, "status.error", "✘")} ${blocked} blocked`) : "",
+		waiting ? paint(theme, "muted", `${glyph(theme, "status.pending", "○")} ${waiting} waiting`) : "",
 	].filter(Boolean);
 	return bits.join(" ");
 }
@@ -56,7 +63,7 @@ function fitLine(projection: Projection, theme: Theme, width: number): string {
 	const snapshot = projection.snapshot;
 	const required = [
 		paint(theme, "accent", displaySourceId(mission.source)),
-		paint(theme, "text", phaseLabel(mission.phase)),
+		paint(theme, "text", phaseLabel(displayPhase(mission, projection.snapshot))),
 		modeChip(theme, mission.mode),
 	];
 	const runningSubagents = projection.subagents?.filter((row) => row.state === "running").length ?? 0;
@@ -101,8 +108,9 @@ function stepLine(projection: Projection, theme: Theme, width: number): string |
 	return clip(visibleWidth(base) + visibleWidth(hint) <= width ? base + hint : base, width);
 }
 
-function phaseTrack(mission: Mission, theme: Theme, width: number): string {
-	const index = Math.max(0, phases.indexOf(mission.phase));
+function phaseTrack(mission: Mission, theme: Theme, width: number, snapshot?: Snapshot): string {
+	const current = displayPhase(mission, snapshot);
+	const index = Math.max(0, phases.indexOf(current));
 	const slots = phases.length;
 	const barWidth = Math.min(slots, Math.max(4, Math.min(9, width - 18)));
 	const filledCount = Math.round(((index + 1) / slots) * barWidth);
@@ -110,13 +118,13 @@ function phaseTrack(mission: Mission, theme: Theme, width: number): string {
 		+ paint(theme, "dim", glyph(theme, "progress.empty", "─").repeat(Math.max(0, barWidth - filledCount)));
 	const names = phases.map((phase) => {
 		const label = phaseLabel(phase);
-		if (phase === mission.phase) return paint(theme, "accent", label);
+		if (phase === current) return paint(theme, "accent", label);
 		if (phaseStatus(mission, phase) === "passed") return paint(theme, "dim", label);
 		return paint(theme, "muted", label);
 	}).join(" ");
 	const full = `  ${bar}  ${names}`;
 	if (visibleWidth(full) <= width) return full;
-	return clip(`  ${bar}  ${paint(theme, "accent", phaseLabel(mission.phase))}`, width);
+	return clip(`  ${bar}  ${paint(theme, "accent", phaseLabel(current))}`, width);
 }
 
 function beadTone(bead: Bead): ThemeColor {
@@ -137,13 +145,25 @@ function beadMark(bead: Bead, theme: Theme): string {
 	return paint(theme, "muted", glyph(theme, "format.bullet", "•"));
 }
 function subagentBead(row: SubagentRow): Bead {
-	return { id: row.id, title: row.name, status: row.state, issue_type: "subagent", children: [], ready: false, category: row.state === "running" ? "active" : "waiting" };
+	return { id: row.id, title: row.name, status: row.state, issue_type: "subagent", children: [], ready: false, category: row.state === "running" ? "active" : row.state === "closed" ? "closed" : "blocked" };
 }
 
 export function displayBeads(projection: Projection): Bead[] {
-	const extras = (projection.subagents ?? []).map(subagentBead);
-	if (effectiveGraph(projection.mission) === "local") return extras;
-	return [...(projection.snapshot?.beads ?? []), ...extras];
+	const extras = new Map<string, Bead>();
+	for (const [index, review] of projection.mission.reviews.entries()) {
+		for (const label of Object.keys(review.transcripts ?? {})) {
+			const id = `subagent:review:${index}:${label}`;
+			extras.set(id, subagentBead({ id, name: `review ${label} · round ${review.round}`, kind: "task", state: "closed" }));
+		}
+	}
+	const progress = projection.mission.reviewProgress;
+	if (progress) for (const label of Object.keys(progress.inputs)) {
+		const id = `subagent:review:${projection.mission.reviews.length}:${label}`;
+		const state = progress.targets[label] ? "closed" : progress.failures[label] ? "error" : "pending";
+		extras.set(id, { id, title: `review ${label} · round ${progress.round}`, status: state, issue_type: "subagent", children: [], ready: false, category: state === "closed" ? "closed" : state === "error" ? "blocked" : "waiting" });
+	}
+	for (const row of projection.subagents ?? []) extras.set(row.id, subagentBead(row));
+	return [...(effectiveGraph(projection.mission) === "local" ? [] : projection.snapshot?.beads ?? []), ...extras.values()];
 }
 
 function beadLine(bead: Bead, mission: Mission, theme: Theme, width: number): string {
@@ -162,7 +182,7 @@ export function missionWidgetLines(projection: Projection, width: number, expand
 	const title = projection.mission.source.title.replace(/\s+/g, " ").trim();
 	if (title && lines.length < cap) lines.push(clip(paint(theme, "dim", `  ${title}`), width));
 	if (lines.length < cap) lines.push(detailLine(projection, theme, width));
-	if (lines.length < cap) lines.push(phaseTrack(projection.mission, theme, width));
+	if (lines.length < cap) lines.push(phaseTrack(projection.mission, theme, width, projection.snapshot));
 	const beads = displayBeads(projection);
 	const room = cap - lines.length;
 	const hint = beads.length > room && room > 1;
@@ -233,6 +253,12 @@ function evidenceRows(mission: Mission): string[] {
 			if (repairs.length) rows.push(`Repair beads: ${repairs.join(", ")}`);
 		}
 	}
+	const progress = mission.reviewProgress;
+	if (progress) {
+		rows.push(`Incomplete review ${progress.revision} · ${Object.keys(progress.targets).length}/${Object.keys(progress.inputs).length} complete; not a verdict`);
+		for (const [label, result] of Object.entries(progress.targets)) if (result.transcript) rows.push(`Reviewer ${label} · complete · ${result.transcript}`);
+		for (const [label, error] of Object.entries(progress.failures)) rows.push(`Reviewer ${label} · failed · ${error}`);
+	}
 	for (const worker of mission.workers) rows.push(`Worker ${worker.beadId} · ${worker.state} · ${worker.handle ?? "identity missing"} · ${worker.incarnationId ?? "incarnation missing"}${worker.error ? ` · ${worker.error}` : ""}`);
 	return rows;
 }
@@ -290,7 +316,7 @@ export class MissionInspector implements Component {
 		const header = [
 			fitLine(projection, this.theme, width),
 			detailLine(projection, this.theme, width),
-			phaseTrack(projection.mission, this.theme, width),
+			phaseTrack(projection.mission, this.theme, width, projection.snapshot),
 			paint(this.theme, "dim", `${this.view}  j/k  tab  esc${this.callbacks.actions ? "  a" : ""}`),
 		].map((line) => clip(line, width));
 		let body: string[];

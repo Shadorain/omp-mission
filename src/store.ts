@@ -106,6 +106,25 @@ export function validateMission(value: unknown): Mission {
     if (!isPositiveSafeInteger(round) || !Array.isArray(item.findings)) invalid(`reviews[${index}] is invalid`);
     return { round, revision: text(item.revision, "review.revision", 1000), model: text(item.model, "review.model", 1000), summary: text(item.summary, "review.summary", 50_000), findings: item.findings.map(validateFinding), at: text(item.at, "review.at", 100), ...(item.invalidated === undefined ? {} : { invalidated: text(item.invalidated, "review.invalidated", 10_000) }), ...(item.beads === undefined ? {} : { beads: Object.fromEntries(Object.entries(object(item.beads, "review.beads")).map(([id, hash]) => [text(id, "review.beads id", 1000), text(hash, "review.beads hash", 200)])) }), ...(item.transcripts === undefined ? {} : { transcripts: Object.fromEntries(Object.entries(object(item.transcripts, "review.transcripts")).map(([label, file]) => [text(label, "review.transcripts label", 1000), text(file, "review.transcripts file", 4000)])) }) };
   });
+  let reviewProgress: Mission["reviewProgress"];
+  if (row.reviewProgress !== undefined) {
+    const item = object(row.reviewProgress, "reviewProgress");
+    if (!isNonNegativeSafeInteger(item.round)) invalid("reviewProgress.round must be a non-negative integer");
+    const inputsRow = object(item.inputs, "reviewProgress.inputs");
+    const targetsRow = object(item.targets, "reviewProgress.targets");
+    const failuresRow = object(item.failures, "reviewProgress.failures");
+    const inputs: Record<string, string> = {};
+    for (const [label, hash] of Object.entries(inputsRow)) inputs[text(label, "reviewProgress.inputs label", 1000)] = text(hash, "reviewProgress.inputs hash", 200);
+    const targets: NonNullable<Mission["reviewProgress"]>["targets"] = {};
+    for (const [label, rawTarget] of Object.entries(targetsRow)) {
+      const target = object(rawTarget, `reviewProgress.targets[${label}]`);
+      if (!Array.isArray(target.findings)) invalid(`reviewProgress.targets[${label}].findings must be an array`);
+      targets[text(label, "reviewProgress.targets label", 1000)] = { summary: text(target.summary, "reviewProgress.targets summary", 50_000), findings: target.findings.map(validateFinding), ...(target.transcript === undefined ? {} : { transcript: text(target.transcript, "reviewProgress.targets transcript", 4000) }) };
+    }
+    const failures: Record<string, string> = {};
+    for (const [label, reason] of Object.entries(failuresRow)) failures[text(label, "reviewProgress.failures label", 1000)] = text(reason, "reviewProgress.failures reason", 10_000);
+    reviewProgress = { round: item.round, revision: text(item.revision, "reviewProgress.revision", 1000), model: text(item.model, "reviewProgress.model", 1000), inputs, targets, failures, at: text(item.at, "reviewProgress.at", 100) };
+  }
   const repairLinksRow = object(row.repairLinks, "repairLinks");
   const repairLinks: Record<string, string[]> = {};
   for (const [id, linked] of Object.entries(repairLinksRow)) repairLinks[text(id, "repair bead ID", 1000)] = stringArray(linked, `repair links ${id}`, 1000);
@@ -120,6 +139,7 @@ export function validateMission(value: unknown): Mission {
   const missionId = text(row.id, "id", 1000);
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(missionId)) invalid("id contains unsafe path characters");
   const mission: Mission = { version: 1, id: missionId, source: validSource(row.source), workspace: validWorkspace(row.workspace), scopes, phase: row.phase as Phase, evidence, mode: row.mode as Mode, keep: row.keep, reviewRequested: row.reviewRequested, workers, reviews, repairLinks, round, createdAt: text(row.createdAt, "createdAt", 100), updatedAt: text(row.updatedAt, "updatedAt", 100) };
+  if (reviewProgress !== undefined) mission.reviewProgress = reviewProgress;
   const epicId = optionalText(row.epicId, "epicId", 1000);
   const controllerNonce = optionalText(row.controllerNonce, "controllerNonce", 100);
   const blocker = optionalText(row.blocker, "blocker", 20_000);
