@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto';
 import type { Action, Gate, Graph, Mission, Mode, Phase, PolicyContext, Snapshot, Step } from './types';
 export function token(value: unknown): string { return createHash('sha256').update(JSON.stringify(value)).digest('hex'); }
+export const quotaHold = /quota.{0,80}exhausted|insufficient.{0,30}(credits|balance)/i;
 export function reviewFailureStep(detail:string,completed=0,total=0):Step{
  const progress=total?` (${completed}/${total} reviewers complete)`:'';
- if(/quota.{0,80}exhausted|insufficient.{0,30}(credits|balance)/i.test(detail))return {text:`Review blocked by provider quota${progress}. Restore quota or configure a funded review model, then /mission review`};
+ if(quotaHold.test(detail))return {text:`Review blocked by provider quota${progress}. Restore quota or configure a funded review model, then /mission review`};
  if(/deadline exceeded|timed out|timeout/i.test(detail))return {command:'/mission review',text:`Review timed out${progress}.${completed?' Retry only failed reviewers; completed results are retained':' Retry the failed review'}`};
  return {command:'/mission review',text:`Review failed${progress}.${completed?' Retry only failed reviewers; completed results are retained':' Retry it'}`};
 }

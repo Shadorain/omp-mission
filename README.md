@@ -162,6 +162,14 @@ Accepting local repairs advances the round and clears earlier verification and d
 Repair evidence becomes passed or failed with verification, rather than staying active through delivery. Explicitly rejecting every accepted finding skips repair evidence and allows unchanged output to be reverified. Delivery and independent rereview remain required for changed output.
 
 
+## Holotable board
+
+Every session with an active or pending mission publishes a read model at `<agentDir>/missions/<workspace-key>/status/<run-id>.json` (atomic tmp+rename, rewritten only on change). The `omp-holotable` extension joins that file to its board by the worktree path and shows phase, holds, workers, delivery and the next step verbatim.
+
+A pane launched by the board (`OMP_HOLOTABLE_CHILD=1`) also listens on a unix control socket (`<tmpdir>/omp-mission-ctl-<uid>/<hash>.sock`, mode `0600`) advertised in the status file's `ctl` field. It is a newline-delimited JSON protocol, one request per connection: `ping`, or an operator op (`approve`, `continue`, `mode`, `review`, `dispatch`, `resend`, `release`, `reap`, `clear`) with `"operator": true`. Each op runs through the same `control()`/`decision()` path as the slash commands — resume hold, plan mode, Pause gates and ownership are enforced identically, and `approve` may carry `args.gate` to guard against a stale board render (`stale` on mismatch).
+
+Board launches set per-call-site environment overrides instead of config: `OMP_MISSION_AUTOSTART` (the `/mission` arguments run at `session_start`, used with `plan.defaultOnStartup`), `OMP_MISSION_BASE` (explicit base for workspace inspection), `OMP_MISSION_CHECKOUT` + `OMP_MISSION_DELIVERY` (reuse-only `bind_workspace` of the lane at first turn, skipping ticket-name matching), and `OMP_MISSION_GRAPH` (`local`/`beads` for the planned mission). See `docs/holotable-launch.md` for the launch recipe.
+
 ## Develop
 
 ```bash

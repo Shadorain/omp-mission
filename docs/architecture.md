@@ -17,6 +17,7 @@
 |`src/prompts.ts`|Coordinator and worker prompts, plus per-step guides.|
 |`src/status.ts`|Model-facing views of mission and graph state.|
 |`src/ui.ts`, `src/completions.ts`, `src/config.ts`|Widget and inspector, argument completion, `mission.json`.|
+|`src/holotable.ts`|Holotable fleet seam: the `ContactStatus` builder, the status-file publisher, and the operator control socket plus per-call-site env overrides.|
 
 ## Lifecycle
 
@@ -59,6 +60,14 @@ Approving the plan is the approval to start. A `before_agent_start` hook sees th
 Both go through the same enforcement. Add an operation once, in `control()`.
 
 `src/sources.ts` shares Linear identifier parsing across source inference, checkout guards, and checkout reuse. Each slash-separated component establishes its project from the first non-reserved identifier. Subsequent lowercase identifiers for different projects are title text; uppercase identifiers and same-project identifiers remain candidates, preserving ambiguity and conflict checks.
+
+## Operator socket and status file
+
+`src/holotable.ts` implements the fleet contract owned by the `omp-holotable` board extension.
+
+- **Status file.** Every render publishes `missions/<workspace.key>/status/<mission.id>.json` (schema 1): ticket, realpath'd worktree, display phase, progress along the phase rail, hold reason (`plan-approval`, `resume`, `gate`, `blocked`, `quota`), the armed gate's kind and token hash, the next step text, the operator ops legal now, worker and delivery summaries, and `ctl` for the control socket. Writes are atomic (tmp+rename, dir `0700`, file `0600`) and skipped when the serialized content is unchanged. The `status/` directory is deliberate: `listMissions` reads `*.json` directly under `missions/<key>/`, so a status file beside the mission JSON would break it.
+- **Control socket.** Only board-launched children (`OMP_HOLOTABLE_CHILD=1`) listen, at `<tmpdir>/omp-mission-ctl-<uid>/<sha256(missionId)[:16]>.sock` — hashed because mission ids can exceed the unix socket path limit. The dir must be owned by the process uid. One newline-delimited JSON request per connection (64 KiB max line), one reply, then close. `ping` is open; the ops `approve`, `continue`, `mode`, `review`, `dispatch`, `resend`, `release`, `reap`, `clear` require `"operator": true` and call the same `decision()`/`request()`/`control()` paths as slash commands, so resume hold, plan mode, Pause gates and ownership apply unchanged. `approve` accepts `args.gate`, answered `stale` when it is not the current gate id. Reply errors: `bad-request`, `stale`, `busy`, `rejected`, `no-session`. The socket closes on detach/release and `ctl` goes null in the next status write; clearing a pending plan removes its status file.
+- **Env overrides.** Read once per call site, validated: `OMP_MISSION_GRAPH` replaces `config.graph` for the planned mission; `OMP_MISSION_BASE` is the explicit base for `inspectWorkspace` and the auto-bind; `OMP_MISSION_CHECKOUT` + `OMP_MISSION_DELIVERY` make the `before_agent_start` bind reuse-only on that exact checkout; `OMP_MISSION_AUTOSTART` runs the given `/mission` arguments at `session_start` once plan mode is on (see @docs/holotable-launch.md).
 
 Workspace base precedence is explicit `bind_workspace base`, repository `mission.baseBranch`, written branch instructions, hosted default, then `origin/HEAD`. The instruction parser accepts both “branch from” and “start from”; it never treats the current feature branch as the base. Compact control/status results include the bound base. Delivery guidance uses that base explicitly, and delivery/review reject an actual PR-base mismatch rather than overwriting mission intent. Both revision and tree fingerprints include the base so evidence from a different target cannot complete the mission.
 

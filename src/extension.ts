@@ -26,6 +26,7 @@ import { SubagentRunner, subagentPrompt } from './subagent';
 import { copyPlanFile, sourceFilePath, writeSourceFile } from './hosts';
 import { noteSubagentSpawn, noteSubagentToolEnd, noteSubagentToolStart, noteSubagentTurnEnd } from './subagents';
 import { checkToolCall, fingerprintScopes, implementationScopes, isImplementationPath, mutatedPaths, type GuardScope } from './coordinator-guard';
+import { autostartMessage, envBase, envCheckout, envDelivery, envGraph, gateTokenId, HolotableBridge } from './holotable';
 
 const controls = ['show','clear','continue','mode','approve','review','history','focus','resend','release','dispatch','reap','actions','config'];
 export function nativePlan(ctx: ExtensionContext): boolean {
@@ -87,7 +88,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
  function syncCompletions(){completionState={sources:completionState.sources,completed:completionState.completed,available:ctx?operatorCommands(mission,!!pending,snapshot,policy(ctx),selected,operation):[],recommended:(ctx?currentStep(ctx)?.command:undefined)?.match(/^\/mission (\w+)/)?.[1],beads:(snapshot?.beads??[]).map(bead=>({id:bead.id,title:bead.title,category:bead.category})),workers:(mission?.workers??[]).map(worker=>({beadId:worker.beadId,state:worker.state,handle:!!worker.handle,stopped:worker.frontend==='subagent'&&!!worker.error&&worker.state!=='closed'}))};}
  async function refreshCompletionSources(){try{const saved=await listMissions(agentDir);completionState.sources=saved.filter(item=>item.mission.phase!=='complete'&&!ignoredPaths.has(item.path)).map(item=>({id:item.mission.source.id,title:item.mission.source.title}));completionState.completed=saved.filter(item=>item.mission.phase==='complete').map(item=>({id:displaySourceId(item.mission.source),title:item.mission.source.title,runId:item.mission.id}));}catch{/* keep the previous source list */}}
  async function availableMissions(){return (await listMissions(agentDir)).filter(item=>!ignoredPaths.has(item.path));}
- async function persist(value:Mission){if(value!==mission||!path||!ownership)throw new Error('No current controller ownership');await ownership.assertOwned();value.controllerNonce=ownership.nonce;value.updatedAt=new Date().toISOString();await saveMission(path,value);if(value.phase==='complete')await refreshCompletionSources();}
+ async function persist(value:Mission){if(value!==mission||!path||!ownership)throw new Error('No current controller ownership');await ownership.assertOwned();value.controllerNonce=ownership.nonce;value.updatedAt=new Date().toISOString();await saveMission(path,value);await publishStatus();if(value.phase==='complete')await refreshCompletionSources();}
  // In-process workers report back here: a clean result already closed the bead; a rejected one waits for the operator.
  async function settleSubagent(beadId:string,outcome:{ok:true;summary:string}|{ok:false;error:string}){const m=mission;if(!m)return;const w=m.workers.findLast(x=>x.beadId===beadId&&x.state!=='closed');if(!w)return;if(outcome.ok){w.state='closed';w.error=undefined;}else w.error=outcome.error;try{if(ownership&&!resumeHold)await persist(m);}catch{/* ownership lost: the next resume reconciles from bd */}if(!outcome.ok&&ctx)ctx.ui.notify(`Worker ${beadId}: ${outcome.error}`,'warning');await refresh(true);}
  const workerAgents=new SubagentRunner({run,agentDir,config:()=>config,context:()=>ctx,onSettled:(beadId,outcome)=>{void settleSubagent(beadId,outcome);}});
@@ -97,6 +98,25 @@ export default async function missionExtension(pi: ExtensionAPI) {
  let guided='';
  function withGuide(next:Action|undefined,always:boolean):NextView|undefined{if(!next)return undefined;const text=guide(next.kind,next);const key=text?`${next.kind}:${text}`:'';if(!text||(!always&&guided===key))return next;guided=key;return {...next,guide:text};}
  function status(context:ExtensionContext,brief=false){const action=mission?nextAction(mission,snapshot,policy(context)):undefined;const running=action?extensionRuns(context,action):undefined;const next=withGuide(running?{kind:'hold',detail:`The extension is running ${running==='review'?'the review':'the wave'} itself and wakes you when it ends. Do not call ${running==='review'?'run_review':'dispatch'}; wait.`}:action,!brief);return (brief?briefView:statusView)({mission,pending,snapshot,resumeHold,ownershipError,next});}
+
+ const holotable=new HolotableBridge(agentDir,{
+  context:()=>ctx&&eligible(ctx)?ctx:undefined,
+  source:()=>({mission,pending}),
+  resumeHold:()=>resumeHold,
+  snapshot:()=>snapshot,
+  policy:()=>ctx?policy(ctx):{resumeHold,owned:!!ownership&&!ownershipError,nativePlan:false,fresh:false,maxWorkers:config.maxWorkers},
+  step:()=>ctx?currentStep(ctx):undefined,
+  owned:()=>!!ownership&&!ownershipError,
+  selected:()=>selected,
+  operation:()=>operation,
+  gateId:()=>mission?.gate?gateTokenId(mission.gate.token):undefined,
+  decide:(context,verb,arg)=>decision(context,verb,arg),
+  request:(context,op,extra)=>request(context,op,extra),
+  clear:async context=>{await control({operation:'clear'},context);},
+  onNotify:message=>ctx?.ui.notify(message,'warning'),
+ });
+ async function publishStatus(){await holotable.publish();}
+ async function openSocket(id:string){try{await holotable.open(id);}catch(error){ctx?.ui.notify(`Holotable control socket failed: ${error instanceof Error?error.message:String(error)}`,'warning');}}
  async function assertPrBase(m:Mission,url?:string){
   if(!m.workspace.base)throw new Error('Repository base unresolved; bind the workspace before delivery or review');
   const pr=await run('gh',['pr','view',...(url?[url]:[]),'--json','baseRefName'],m.workspace.cwd);
@@ -126,6 +146,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
  }
  async function render(){
   syncCompletions();
+  await publishStatus();
   const context=ctx;
   const epoch=generation;
   if(!context||!eligible(context))return;const active=pi.getActiveTools();const enabled=!!(mission||pending);
@@ -139,9 +160,9 @@ export default async function missionExtension(pi: ExtensionAPI) {
   context.ui.setWidget('mission',(tui,theme)=>createMissionWidget(()=>projection()!,()=>tui.terminal.rows,theme),{placement:'aboveEditor'});
  }
  async function acquire(){if(!mission||!path)throw new Error('No saved mission');if(ownership){await ownership.assertOwned();return;}ownershipError=undefined;ownership=await acquireOwnership(path,mission,error=>{ownershipError=`Controller lost: ${error.message}`;resumeHold=true;lastWake='';void reviewer.dispose();void render();});mission=ownership.mission;mission.controllerNonce=ownership.nonce;}
- async function release(){const current=ownership;ownership=undefined;await current?.release();}
- async function detach(context?:ExtensionContext){generation++;coordinatorShells.clear();lifetime.abort();lifetime=new AbortController();terminalInputDispose?.();terminalInputDispose=undefined;overlayAbort?.abort();overlayAbort=undefined;if(timer&&ctx)ctx.clearTimer(timer);timer=undefined;await reviewer.dispose();await workerAgents.abortAll();await release();ctx?.ui.setWidget('mission',undefined);ctx=context;mission=undefined;pending=undefined;path=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;lastWake='';guided='';selected=undefined;history=undefined;lastPoll=0;outlineOffset=0;inspectionIntent={};subagents=[];reviewRows=[];}
- async function attach(file:string,context:ExtensionContext,announce=true){await release();mission=await loadMission(file);path=file;pending=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;ctx=context;await refresh(false);await render();
+ async function release(){const current=ownership;ownership=undefined;await current?.release();await holotable.close();}
+ async function detach(context?:ExtensionContext){generation++;coordinatorShells.clear();lifetime.abort();lifetime=new AbortController();terminalInputDispose?.();terminalInputDispose=undefined;overlayAbort?.abort();overlayAbort=undefined;if(timer&&ctx)ctx.clearTimer(timer);timer=undefined;await reviewer.dispose();await workerAgents.abortAll();await release();await publishStatus();ctx?.ui.setWidget('mission',undefined);ctx=context;mission=undefined;pending=undefined;path=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;lastWake='';guided='';selected=undefined;history=undefined;lastPoll=0;outlineOffset=0;inspectionIntent={};subagents=[];reviewRows=[];}
+ async function attach(file:string,context:ExtensionContext,announce=true){await release();mission=await loadMission(file);path=file;pending=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;ctx=context;await refresh(false);await render();await openSocket(mission.id);await publishStatus();
   const step=announce?currentStep(context):undefined;
   if(step)context.ui.notify(`${displaySourceId(mission.source)} · ${phaseLabel(displayPhase(mission,snapshot))}. ${step.command?`Next: ${step.command} — `:''}${step.text}. /mission opens the action menu.`,'info');
  }
@@ -170,7 +191,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
      const marker='\nMission pending recovery JSON:\n';const index=content.lastIndexOf(marker);if(index<0)continue;
      try{raw=JSON.parse(content.slice(index+marker.length));}catch{continue;}
     }else continue;
-    try{const recovered=validateMission(raw);if(recovered.phase==='plan'){if(entry.type==='message')pi.appendEntry('mission:pending',recovered);pending=recovered;await writeSourceFile(recovered);await render();}break;}
+    try{const recovered=validateMission(raw);if(recovered.phase==='plan'){if(entry.type==='message')pi.appendEntry('mission:pending',recovered);pending=recovered;await writeSourceFile(recovered);await render();await openSocket(recovered.id);}break;}
     catch(error){ownershipError=`Pending mission recovery failed: ${String(error)}`;context.ui.notify(ownershipError,'error');break;}
    }
   }
@@ -411,13 +432,14 @@ export default async function missionExtension(pi: ExtensionAPI) {
    target={...target,source:inferred.source};
   }else throw new Error(inferred.reason??'Usage: /mission CHR-142 | owner/repo#123 | -- description');
  }
- const source=await fetchSource(target,context.cwd,run);const workspace=await inspectWorkspace(context.cwd,run,{githubRepo:source.repo});assertSourceCheckout(source,workspace);const existing=saved.find(item=>item.mission.workspace.key===workspace.key&&item.mission.workspace.cwd===workspace.cwd&&item.mission.source.id===source.id);if(existing){await attach(existing.path,context,!parsed.force);if(parsed.force&&mission!.phase!=='complete')await request(context,'continue',{mode:parsed.pause?'pause':'force',keep:parsed.keep});return;}
+ const source=await fetchSource(target,context.cwd,run);const workspace=await inspectWorkspace(context.cwd,run,{githubRepo:source.repo,explicitBase:envBase()});assertSourceCheckout(source,workspace);const existing=saved.find(item=>item.mission.workspace.key===workspace.key&&item.mission.workspace.cwd===workspace.cwd&&item.mission.source.id===source.id);if(existing){await attach(existing.path,context,!parsed.force);if(parsed.force&&mission!.phase!=='complete')await request(context,'continue',{mode:parsed.pause?'pause':'force',keep:parsed.keep});return;}
  const bound=saved.find(item=>item.mission.workspace.cwd===workspace.cwd&&item.mission.source.id!==source.id&&item.mission.phase!=='complete');if(bound)throw new Error(`Checkout is bound to ${bound.mission.source.id}`);
  if(!parsed.force&&!nativePlan(context))throw new Error('Start through /plan /mission, or use --force outside plan mode');
- const planned: Mission = {version:1,id:missionId(source),source,workspace,graph:config.graph,scopes:{},phase:'plan',evidence:{},mode:parsed.pause?'pause':parsed.force?'force':'auto',keep:parsed.keep,reviewRequested:parsed.force,workers:[],reviews:[],repairLinks:{},round:1,createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()};
+ const planned: Mission = {version:1,id:missionId(source),source,workspace,graph:envGraph()??config.graph,scopes:{},phase:'plan',evidence:{},mode:parsed.pause?'pause':parsed.force?'force':'auto',keep:parsed.keep,reviewRequested:parsed.force,workers:[],reviews:[],repairLinks:{},round:1,createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()};
  await writeSourceFile(planned);
  pi.appendEntry('mission:pending',planned);
  pending = planned;
+ await openSocket(planned.id);
  const prompt = `Mission ${displaySourceId(source)}: ${source.title}\nRead the full specification in ${sourceFilePath(planned)} before planning.`;
  await pi.setSessionName(`${displaySourceId(source)} ${source.title}`);
  await render();
@@ -443,6 +465,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
   const cancelReview=()=>{void reviewer.dispose();};_signal?.addEventListener('abort',cancelReview,{once:true});
   try{
    if(params.operation==='clear'){
+    const dropped=pending;
     if(!mission&&!pending)throw new Error('No active mission');
     if(mission){
      const saved=path?await loadMission(path):mission;
@@ -450,7 +473,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
      if(path)ignoredPaths.add(path);
     }
     pi.appendEntry('mission:pointer',{path:null,ignoredPaths:[...ignoredPaths]});
-    await detach(context);startPolling(context);await refreshCompletionSources();await render();return status(context,true);
+    await detach(context);if(dropped)await holotable.discard(dropped).catch(()=>undefined);startPolling(context);await refreshCompletionSources();await render();return status(context,true);
    }
    if(params.operation==='start'){if(mission)throw new Error('Mission already started');if(!pending)throw new Error('Resolve /mission source first');mission=pending;pending=undefined;path=missionPath(agentDir,mission);await acquire();resumeHold=false;mission.phase='isolate';mission.evidence.plan={outcome:'passed',detail:'Operator approved plan or explicit Force start',at:new Date().toISOString()};await persist(mission);pi.appendEntry('mission:pointer',{path,ignoredPaths:[...ignoredPaths]});await writeSourceFile(mission);}
    else if(params.operation==='continue'){
@@ -583,7 +606,14 @@ export default async function missionExtension(pi: ExtensionAPI) {
  void refreshCompletionSources();
  for(const [name,chord] of Object.entries(config.keys)){if(name==='expand'||!chord)continue;pi.registerShortcut(chord as KeyId,{description:`Mission ${name}`,handler:async context=>{if(!eligible(context)||!projection())return;try{if(name==='fullscreen')await inspect(context);else await decision(context,'mode');}catch(error){context.ui.notify(error instanceof Error?error.message:String(error),'error');}}});}
  pi.on('input',(event,context)=>{if(!eligible(context)||event.text.trim().split(/\s+/)[0]!=='/mission')return;const args=event.text.trim().slice('/mission'.length);const verb=args.trim().split(/\s+/)[0];if(controls.includes(verb??'')||mission)return;try{if(!parseMissionInput(args).force&&!nativePlan(context))return {text:`/plan ${event.text}`};}catch{ return; }});
- pi.on('session_start',async(_event,context)=>restore(context));pi.on('session_switch',async(_event,context)=>restore(context));pi.on('session_branch',async(_event,context)=>restore(context));pi.on('session_shutdown',async()=>detach());
+ pi.on('session_start',async(_event,context)=>{
+  await restore(context);
+  const autostart=autostartMessage();
+  if(!autostart||mission||pending)return;
+  let tries=0;
+  const attempt=async()=>{if(mission||pending||ctx!==context)return;if(!nativePlan(context)&&++tries<50){context.setTimeout(()=>void attempt(),100);return;}await command(autostart,context);};
+  await attempt();
+ });pi.on('session_switch',async(_event,context)=>restore(context));pi.on('session_branch',async(_event,context)=>restore(context));pi.on('session_shutdown',async()=>detach());
  pi.on('auto_compaction_end',async(_event,context)=>{ctx=context;await render();});
  // Approving the plan is the approval to start. Start (and bind a checkout that already belongs to the ticket)
  // before the first execution turn, and hand the model its next step in the same turn.
@@ -595,7 +625,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
    await control({operation:'start'},context);notes.push('Mission started.');
    const started=mission as Mission|undefined;
    if(started&&effectiveGraph(started)==='beads'){
-    try{await control({operation:'bind_workspace'},context,undefined,{reuseOnly:true});const bound=mission as Mission|undefined;if(bound)notes.push(`Checkout bound: ${bound.workspace.cwd}, delivery ${bound.workspace.delivery}, beads ${bound.workspace.beadsDir}.`);}
+    try{await control({operation:'bind_workspace',cwd:envCheckout(),delivery:envDelivery(),base:envBase()},context,undefined,{reuseOnly:true});const bound=mission as Mission|undefined;if(bound)notes.push(`Checkout bound: ${bound.workspace.cwd}, delivery ${bound.workspace.delivery}, beads ${bound.workspace.beadsDir}.`);}
     catch(error){notes.push(`Checkout not bound automatically (${error instanceof Error?error.message:String(error)}).`);}
    }
   }catch(error){context.ui.notify(`Mission did not start: ${error instanceof Error?error.message:String(error)}`,'error');return;}
