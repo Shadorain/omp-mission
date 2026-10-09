@@ -4,10 +4,12 @@ import { lstat, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createConnection } from 'node:net';
+import { resolveLocalUrlToPath } from '@oh-my-pi/pi-coding-agent/internal-urls/local-protocol';
 import type { ExtensionAPI, ExtensionContext } from '@oh-my-pi/pi-coding-agent';
 import missionExtension from '../src/extension';
 import { listMissions, missionPath, saveMission } from '../src/store';
-import { buildContactStatus, gateTokenId, autostartMessage, envBase, envCheckout, envDelivery, envGraph, type ContactStatus } from '../src/holotable';
+import { buildContactStatus, gateTokenId, autostartMessage, envBase, envCheckout, envDelivery, envGraph, planRevision, type ContactStatus } from '../src/holotable';
+import { planSlug } from '../src/prompts';
 import type { Mission } from '../src/types';
 
 type Handler = (event: unknown, context: ExtensionContext) => Promise<any>;
@@ -80,6 +82,7 @@ async function session(options: { plan?: boolean; child?: boolean; autostart?: s
 	const context = {
 		agent: { kind: 'main' }, cwd, hasUI: false,
 		sessionManager: { getBranch: () => branch, getSessionName: () => undefined },
+		localProtocolOptions: { getArtifactsDir: () => join(root, 'artifacts'), getSessionId: () => 'test-session' },
 		ui: { notify: (message: string) => { notices.push(message); }, setWidget: () => {} },
 		isIdle: () => true, hasPendingMessages: () => false,
 		setInterval: () => 1, clearTimer: () => {}, setTimeout: () => 1,
@@ -275,4 +278,103 @@ test('approve without a waiting gate is rejected', async () => {
 	expect(approve.error.code).toBe('rejected');
 	expect(approve.error.message).toContain('No gate is waiting');
 	await run.event('session_shutdown', {});
+});
+
+async function writePlan(run: { root: string }, mission: Mission, text: string): Promise<string> {
+	const plan = resolveLocalUrlToPath(`local://${planSlug(mission.source)}-plan.md`, { getArtifactsDir: () => join(run.root, 'artifacts'), getSessionId: () => 'test-session' });
+	await mkdir(join(plan, '..'), { recursive: true });
+	await writeFile(plan, text);
+	return plan;
+}
+
+test('a pending plan with a written file advertises plan path and revision; otherwise null', async () => {
+	const run = await session({ plan: true, child: true });
+	await run.command('-- demo');
+	const mission = run.pending()!;
+	let status = await statusOf(run, mission);
+	expect(status.plan).toBeNull();
+	const plan = await writePlan(run, mission, '# Plan\nDo the thing.\n');
+	await run.event('auto_compaction_end', {});
+	status = await statusOf(run, mission);
+	expect(status.plan).toEqual({ path: plan, revision: planRevision('# Plan\nDo the thing.\n') });
+	// A running (non-pending) mission never advertises a plan.
+	const active = baseMission(run.cwd, { phase: 'execute' });
+	const other = await session({ child: true, mission: active });
+	expect((await statusOf(other, active)).plan).toBeNull();
+	await run.event('session_shutdown', {});
+	await other.event('session_shutdown', {});
+});
+
+test('plan reads the pending plan file without the operator flag', async () => {
+	const run = await session({ plan: true, child: true });
+	await run.command('-- demo');
+	const mission = run.pending()!;
+	const socket = (await statusOf(run, mission)).ctl!.socket;
+	expect((await ctl(socket, { v: 1, op: 'plan' })).error.code).toBe('no-plan');
+	const plan = await writePlan(run, mission, '# Plan\nStep one.\n');
+	const reply = await ctl(socket, { v: 1, op: 'plan' });
+	expect(reply.ok).toBe(true);
+	expect(reply.revision).toBe(mission.updatedAt);
+	expect(reply.plan).toEqual({ text: '# Plan\nStep one.\n', path: plan, revision: planRevision('# Plan\nStep one.\n') });
+	// A saved mission has no pending plan at all.
+	const active = baseMission('/tmp', { phase: 'execute' });
+	const other = await session({ child: true, mission: active });
+	const otherSocket = (await statusOf(other, active)).ctl!.socket;
+	expect((await ctl(otherSocket, { v: 1, op: 'plan' })).error.code).toBe('no-plan');
+	await run.event('session_shutdown', {});
+	await other.event('session_shutdown', {});
+});
+
+test('plan-edit writes atomically, bumps the revision, and enforces base and limits', async () => {
+	const run = await session({ plan: true, child: true });
+	await run.command('-- demo');
+	const mission = run.pending()!;
+	const socket = (await statusOf(run, mission)).ctl!.socket;
+	const plan = await writePlan(run, mission, 'v1\n');
+	const revision = planRevision('v1\n');
+	// The operator flag is mandatory.
+	expect((await ctl(socket, { v: 1, op: 'plan-edit', args: { text: 'v2\n' } })).error.code).toBe('bad-request');
+	// A stale base is refused and writes nothing.
+	expect((await ctl(socket, { v: 1, op: 'plan-edit', operator: true, args: { text: 'v2\n', base: 'deadbeefdead' } })).error.code).toBe('stale');
+	expect(await Bun.file(plan).text()).toBe('v1\n');
+	// Over the 256 KiB cap is a bad request.
+	expect((await ctl(socket, { v: 1, op: 'plan-edit', operator: true, args: { text: 'x'.repeat(256 * 1024 + 1) } })).error.code).toBe('bad-request');
+	// Editing with the current base writes the file and republishes the status.
+	const before = (await statusOf(run, mission)).revision;
+	const edit = await ctl(socket, { v: 1, op: 'plan-edit', operator: true, args: { text: 'v2\n', base: revision } });
+	expect(edit.ok).toBe(true);
+	expect(edit.revision).not.toBe(before);
+	expect(edit.plan).toEqual({ text: 'v2\n', path: plan, revision: planRevision('v2\n') });
+	expect(await Bun.file(plan).text()).toBe('v2\n');
+	const status = await statusOf(run, mission);
+	expect(status.plan).toEqual({ path: plan, revision: planRevision('v2\n') });
+	expect(status.revision).toBe(edit.revision);
+	// plan-edit on a saved mission is rejected: nothing is awaiting approval.
+	const active = baseMission('/tmp', { phase: 'execute' });
+	const other = await session({ child: true, mission: active });
+	const otherSocket = (await statusOf(other, active)).ctl!.socket;
+	expect((await ctl(otherSocket, { v: 1, op: 'plan-edit', operator: true, args: { text: 'x' } })).error.code).toBe('rejected');
+	await run.event('session_shutdown', {});
+	await other.event('session_shutdown', {});
+});
+
+test('plan-refine sends the message into the session and is rejected without a pending plan', async () => {
+	const run = await session({ plan: true, child: true });
+	await run.command('-- demo');
+	const mission = run.pending()!;
+	const socket = (await statusOf(run, mission)).ctl!.socket;
+	const sentBefore = run.sent.length;
+	expect(await ctl(socket, { v: 1, op: 'plan-refine', operator: true, args: { message: 'Add a rollback step.' } })).toMatchObject({ ok: true });
+	expect(run.sent.length).toBe(sentBefore + 1);
+	expect(run.sent.at(-1)).toBe('Add a rollback step.');
+	expect((await ctl(socket, { v: 1, op: 'plan-refine', args: { message: 'x' } })).error.code).toBe('bad-request');
+	expect((await ctl(socket, { v: 1, op: 'plan-refine', operator: true, args: { message: '' } })).error.code).toBe('bad-request');
+	// Outside a pending plan the op is rejected and sends nothing.
+	const active = baseMission('/tmp', { phase: 'execute' });
+	const other = await session({ child: true, mission: active });
+	const otherSocket = (await statusOf(other, active)).ctl!.socket;
+	expect((await ctl(otherSocket, { v: 1, op: 'plan-refine', operator: true, args: { message: 'hi' } })).error.code).toBe('rejected');
+	expect(other.sent.length).toBe(0);
+	await run.event('session_shutdown', {});
+	await other.event('session_shutdown', {});
 });

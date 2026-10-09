@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { chmod, lstat, mkdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -12,8 +12,10 @@ import { phases, type Mission, type PolicyContext, type Snapshot, type Step } fr
 
 // The holotable fleet contract (omp-holotable/docs/contract.md). Kept local: the repos do not import across.
 export const OPERATOR_OPS = ['approve', 'continue', 'mode', 'review', 'dispatch', 'resend', 'release', 'reap', 'clear'] as const;
-const SOCKET_OPS: Record<string, true> = { ping: true, approve: true, continue: true, mode: true, review: true, dispatch: true, resend: true, release: true, reap: true, clear: true };
-const MAX_LINE = 64 * 1024;
+const SOCKET_OPS: Record<string, true> = { ping: true, approve: true, continue: true, mode: true, review: true, dispatch: true, resend: true, release: true, reap: true, clear: true, plan: true, 'plan-edit': true, 'plan-refine': true };
+// 1 MiB: a plan-edit request carries up to 256 KiB of text plus JSON escaping overhead.
+const MAX_LINE = 1024 * 1024;
+const MAX_PLAN = 256 * 1024;
 
 export interface ContactStatus {
 	schema: 1;
@@ -32,12 +34,16 @@ export interface ContactStatus {
 	delivery: { url: string | null; branch: string | null } | null;
 	complete: boolean;
 	revision: string;
+	plan: { path: string; revision: string } | null;
 	ctl: { socket: string; generation: number } | null;
 	updatedAt: string;
 }
 
 export function gateTokenId(token: string): string {
 	return createHash('sha256').update(token).digest('hex').slice(0, 12);
+}
+export function planRevision(text: string): string {
+	return createHash('sha256').update(text).digest('hex').slice(0, 12);
 }
 
 export function statusFilePath(agentDir: string, mission: Pick<Mission, 'id' | 'workspace'>): string {
@@ -55,6 +61,7 @@ export interface StatusInput {
 	selected: string | undefined;
 	operation: boolean;
 	ctl: { socket: string; generation: number } | null;
+	planPath?: string;
 }
 
 // Pure projection of mission state into the fleet status file. Async only for the worktree realpath.
@@ -94,6 +101,7 @@ export async function buildContactStatus(input: StatusInput): Promise<ContactSta
 		workers: m.workers.length ? { live: m.workers.filter(w => w.state !== 'closed').length, total: m.workers.length } : null,
 		delivery: url || branch ? { url, branch } : null,
 		complete: phase === 'complete',
+		plan: input.pending && input.planPath ? await readFile(input.planPath, 'utf8').then(text => ({ path: input.planPath!, revision: planRevision(text) })).catch(() => null) : null,
 		revision: m.updatedAt,
 		ctl: input.ctl,
 		updatedAt: m.updatedAt,
@@ -141,6 +149,9 @@ export interface HolotableHooks {
 	decide(context: ExtensionContext, verb: string, arg?: string): Promise<void>;
 	request(context: ExtensionContext, op: string, extra?: Record<string, unknown>): Promise<void>;
 	clear(context: ExtensionContext): Promise<void>;
+	planPath(): string | undefined;
+	touchPending(): void;
+	sendUserMessage(message: string): void;
 	onNotify(message: string): void;
 }
 
@@ -148,6 +159,7 @@ interface Reply {
 	v: 1;
 	ok: boolean;
 	revision?: string;
+	plan?: { text: string; path: string; revision: string };
 	error?: { code: string; message: string };
 }
 
@@ -193,6 +205,7 @@ export class HolotableBridge {
 			selected: this.hooks.selected(),
 			operation: this.hooks.operation(),
 			ctl: this.ctlFor(current.id),
+			planPath: this.hooks.planPath(),
 		});
 		const serialized = `${JSON.stringify(status, null, 2)}\n`;
 		const file = statusFilePath(this.agentDir, current);
@@ -301,9 +314,15 @@ export class HolotableBridge {
 		if (!isRecord(request) || request.v !== 1 || typeof request.op !== 'string' || !SOCKET_OPS[request.op] || (request.args !== undefined && !isRecord(request.args))) {
 			return fail('bad-request', 'Expected {"v":1,"op":"<op>","args":{...}}');
 		}
-		const { mission } = this.hooks.source();
-		const revision = (mission ?? this.hooks.source().pending)?.updatedAt;
+		const { mission, pending } = this.hooks.source();
+		const revision = (mission ?? pending)?.updatedAt;
 		if (request.op === 'ping') return { v: 1, ok: true, ...(revision ? { revision } : {}) };
+		if (request.op === 'plan') {
+			const path = pending && !mission ? this.hooks.planPath() : undefined;
+			const text = path ? await readFile(path, 'utf8').catch(() => undefined) : undefined;
+			if (text === undefined || path === undefined) return fail('no-plan', 'No pending plan file');
+			return { v: 1, ok: true, revision: revision ?? '', plan: { text, path, revision: planRevision(text) } };
+		}
 		if (request.operator !== true) return fail('bad-request', 'Operator operations require "operator":true');
 		const context = this.hooks.context();
 		if (!context) return fail('no-session', 'No main-session context is attached');
@@ -318,6 +337,31 @@ export class HolotableBridge {
 				await this.hooks.decide(context, op, typeof args.mode === 'string' ? args.mode : undefined);
 			} else if (op === 'clear') {
 				await this.hooks.clear(context);
+			} else if (op === 'plan-edit') {
+				if (mission || !pending) return fail('rejected', 'No pending plan is awaiting approval');
+				if (typeof args.text !== 'string') return fail('bad-request', 'plan-edit requires args.text');
+				if (Buffer.byteLength(args.text, 'utf8') > MAX_PLAN) return fail('bad-request', 'Plan text exceeds 256 KiB');
+				if (args.base !== undefined && typeof args.base !== 'string') return fail('bad-request', 'args.base must be a string');
+				const planPath = this.hooks.planPath();
+				const current = planPath ? await readFile(planPath, 'utf8').catch(() => undefined) : undefined;
+				if (planPath === undefined || current === undefined) return fail('no-plan', 'No pending plan file');
+				if (args.base !== undefined && args.base !== planRevision(current)) return fail('stale', 'The plan changed since this revision; read it again');
+				const mode = (await lstat(planPath)).mode & 0o777;
+				const temporary = `${planPath}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+				try {
+					await writeFile(temporary, args.text, { mode });
+					await rename(temporary, planPath);
+				} catch (error) {
+					await rm(temporary, { force: true }).catch(() => undefined);
+					throw error;
+				}
+				this.hooks.touchPending();
+				await this.publish();
+				return { v: 1, ok: true, revision: this.hooks.source().pending?.updatedAt ?? '', plan: { text: args.text, path: planPath, revision: planRevision(args.text) } };
+			} else if (op === 'plan-refine') {
+				if (mission || !pending) return fail('rejected', 'No pending plan is awaiting approval');
+				if (typeof args.message !== 'string' || args.message.length < 1 || args.message.length > 8000) return fail('bad-request', 'plan-refine requires args.message of 1..8000 characters');
+				this.hooks.sendUserMessage(args.message);
 			} else {
 				const extra: Record<string, unknown> = {};
 				if (typeof args.beadId === 'string') extra.beadId = args.beadId;

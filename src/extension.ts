@@ -113,6 +113,9 @@ export default async function missionExtension(pi: ExtensionAPI) {
   decide:(context,verb,arg)=>decision(context,verb,arg),
   request:(context,op,extra)=>request(context,op,extra),
   clear:async context=>{await control({operation:'clear'},context);},
+  planPath:()=>{const context=ctx;if(mission||!pending||!context?.localProtocolOptions)return undefined;return resolveLocalUrlToPath(`local://${planSlug(pending.source)}-plan.md`,context.localProtocolOptions);},
+  touchPending:()=>{if(pending)pending.updatedAt=new Date().toISOString();},
+  sendUserMessage:message=>pi.sendUserMessage(message),
   onNotify:message=>ctx?.ui.notify(message,'warning'),
  });
  async function publishStatus(){await holotable.publish();}
