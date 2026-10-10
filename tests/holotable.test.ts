@@ -227,6 +227,22 @@ test('the usage probe sums worker session files, throttles, resumes mid-file and
 	expect(await new UsageProbe(root, () => now).measure(other, none)).toBeNull();
 });
 
+test('a resume hold over failed verification still says verification failed', async () => {
+	const base = baseMission('/tmp');
+	const failed = { ...base, evidence: { ...base.evidence, verify: { outcome: 'failed' as const, detail: 'tests red', at: base.updatedAt } } };
+	const status = await buildContactStatus({
+		mission: failed, pending: false, resumeHold: true, snapshot: undefined,
+		policy: idlePolicy, step: undefined, owned: true, selected: undefined, operation: false, ctl: null, usage: null,
+	});
+	// hold alone reads as an ordinary resume; verify is what tells a board not to continue it automatically.
+	expect(status.hold).toBe('resume');
+	expect(status.verify).toBe('failed');
+	expect((await buildContactStatus({
+		mission: base, pending: false, resumeHold: true, snapshot: undefined,
+		policy: idlePolicy, step: undefined, owned: true, selected: undefined, operation: false, ctl: null, usage: null,
+	})).verify).toBe(base.evidence.verify?.outcome ?? null);
+});
+
 test('the status file reports mission mode and estimated usage', async () => {
 	const cwd = '/tmp';
 	const status = await buildContactStatus({

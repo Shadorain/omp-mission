@@ -8,7 +8,7 @@ import { displayPhase, operatorCommands, quotaHold } from './controller';
 import { isRecord } from './guards';
 import { displaySourceId } from './sources';
 import { missionDirectory } from './store';
-import { phases, type Mission, type Mode, type PolicyContext, type Snapshot, type Step } from './types';
+import { phases, type Evidence, type Mission, type Mode, type PolicyContext, type Snapshot, type Step } from './types';
 
 // The holotable fleet contract (omp-holotable/docs/contract.md). Kept local: the repos do not import across.
 export const OPERATOR_OPS = ['approve', 'continue', 'mode', 'review', 'dispatch', 'resend', 'release', 'reap', 'clear'] as const;
@@ -36,6 +36,8 @@ export interface ContactStatus {
 	revision: string;
 	plan: { path: string; revision: string } | null;
 	mode: Mode | null;
+	/** Latest verification outcome; 'failed' means `continue` would re-open broken work, so automation must not send it. */
+	verify: Evidence['outcome'] | null;
 	usage: UsageTotals | null;
 	ctl: { socket: string; generation: number } | null;
 	updatedAt: string;
@@ -217,6 +219,7 @@ export async function buildContactStatus(input: StatusInput): Promise<ContactSta
 		plan: input.pending && input.planPath ? await readFile(input.planPath, 'utf8').then(text => ({ path: input.planPath!, revision: planRevision(text) })).catch(() => null) : null,
 		revision: m.updatedAt,
 		mode: m.mode ?? null,
+		verify: m.evidence.verify?.outcome ?? null,
 		usage: input.usage,
 		ctl: input.ctl,
 		updatedAt: m.updatedAt,
