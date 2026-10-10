@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { lstat, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { appendFile, lstat, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createConnection } from 'node:net';
@@ -8,7 +8,7 @@ import { resolveLocalUrlToPath } from '@oh-my-pi/pi-coding-agent/internal-urls/l
 import type { ExtensionAPI, ExtensionContext } from '@oh-my-pi/pi-coding-agent';
 import missionExtension from '../src/extension';
 import { listMissions, missionPath, saveMission } from '../src/store';
-import { buildContactStatus, gateTokenId, autostartMessage, envBase, envCheckout, envDelivery, envGraph, planRevision, type ContactStatus } from '../src/holotable';
+import { buildContactStatus, gateTokenId, autostartMessage, envBase, envCheckout, envDelivery, envGraph, planRevision, parseUsageLines, sumAssistantUsage, UsageProbe, type ContactStatus } from '../src/holotable';
 import { planSlug } from '../src/prompts';
 import type { Mission } from '../src/types';
 
@@ -59,7 +59,7 @@ function ctl(socket: string, request: unknown): Promise<Record<string, any>> {
 }
 
 // Real extension, real store; pi.exec/UI faked as in autostart.test.ts.
-async function session(options: { plan?: boolean; child?: boolean; autostart?: string; mission?: Mission } = {}) {
+async function session(options: { plan?: boolean; child?: boolean; autostart?: string; mission?: Mission; entries?: Array<Record<string, unknown>>; beforeLoad?: (root: string) => Promise<void> | void } = {}) {
 	const root = await realpath(await mkdtemp(join(tmpdir(), 'holotable-')));
 	roots.push(root);
 	const cwd = join(root, 'workspace');
@@ -78,10 +78,11 @@ async function session(options: { plan?: boolean; child?: boolean; autostart?: s
 	const branch: Array<Record<string, unknown>> = [
 		...(path ? [{ type: 'custom', customType: 'mission:pointer', data: { path } }] : []),
 		...(options.plan ? [{ type: 'mode_change', mode: 'plan' }] : []),
+		...(options.entries ?? []),
 	];
 	const context = {
 		agent: { kind: 'main' }, cwd, hasUI: false,
-		sessionManager: { getBranch: () => branch, getSessionName: () => undefined },
+		sessionManager: { getBranch: () => branch, getEntries: () => branch, getSessionName: () => undefined },
 		localProtocolOptions: { getArtifactsDir: () => join(root, 'artifacts'), getSessionId: () => 'test-session' },
 		ui: { notify: (message: string) => { notices.push(message); }, setWidget: () => {} },
 		isIdle: () => true, hasPendingMessages: () => false,
@@ -106,6 +107,7 @@ async function session(options: { plan?: boolean; child?: boolean; autostart?: s
 	setEnv('PI_CODING_AGENT_DIR', root);
 	setEnv('OMP_HOLOTABLE_CHILD', options.child ? '1' : undefined);
 	setEnv('OMP_MISSION_AUTOSTART', options.autostart);
+	await options.beforeLoad?.(root);
 	await missionExtension(api);
 	await events.get('session_start')!({}, context);
 	return {
@@ -124,7 +126,7 @@ test('the status builder maps each hold state and the C5 field list', async () =
 	const cwd = '/tmp';
 	const input = (mission: Mission, over: Partial<Parameters<typeof buildContactStatus>[0]> = {}) => buildContactStatus({
 		mission, pending: false, resumeHold: false, snapshot: undefined, policy: idlePolicy, step: undefined,
-		owned: true, selected: undefined, operation: false, ctl: null, ...over,
+		owned: true, selected: undefined, operation: false, ctl: null, usage: null, ...over,
 	});
 
 	const pending = await input(baseMission(cwd), { pending: true, resumeHold: true, step: { text: 'Approve the plan' } });
@@ -159,6 +161,100 @@ test('the status builder maps each hold state and the C5 field list', async () =
 	expect(plain.delivery).toEqual({ url: null, branch: 'feat' });
 	expect(plain.base).toBe('main');
 	expect(plain.complete).toBe(false);
+});
+
+// OMP session entries: {type:'message', message:{role:'assistant', usage:{input,output,cacheRead,cacheWrite,cost:{total}}}}
+// (SessionMessageEntry/AssistantMessage/Usage in @oh-my-pi). Anything else in the stream is ignored.
+function usageEntry(input: number, output: number, total?: number) {
+	return {
+		type: 'message',
+		message: {
+			role: 'assistant',
+			usage: { input, output, cacheRead: 4, cacheWrite: 2, totalTokens: input + output + 6, ...(total === undefined ? {} : { cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total } }) },
+		},
+	};
+}
+
+test('usage sums assistant message usage and tolerates foreign and partial records', () => {
+	expect(sumAssistantUsage([])).toBeNull();
+	expect(sumAssistantUsage([{ type: 'mode_change', mode: 'plan' }, { type: 'message', message: { role: 'user' } }, { type: 'message', message: { role: 'assistant' } }])).toBeNull();
+	const totals = sumAssistantUsage([usageEntry(100, 10, 0.5), usageEntry(200, 20), { type: 'model_usage', usage: { input: 9, output: 9 } }, 'junk', null]);
+	expect(totals).toEqual({ tokens: { input: 300, output: 30, cacheRead: 8, cacheWrite: 4 }, costUsd: 0.5, sessions: 1 });
+	expect(parseUsageLines('')).toBeNull();
+	expect(parseUsageLines(`{"type":"message","message":{"role":"assistant","usage":{"input":7,"output":3}}}\n{broken\n${JSON.stringify(usageEntry(1, 1, 0.25))}\n`))
+		.toEqual({ tokens: { input: 8, output: 4, cacheRead: 4, cacheWrite: 2 }, costUsd: 0.25, sessions: 1 });
+});
+
+test('the usage probe sums worker session files, throttles, resumes mid-file and restarts on mission switch', async () => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), 'holotable-usage-')));
+	roots.push(root);
+	const mission = baseMission(root);
+	const other = baseMission(root, { id: 'second-run' });
+	const workerDir = join(root, 'missions', mission.workspace.key, 'workers');
+	const workerFile = join(workerDir, 'b1.jsonl');
+	let now = 1_000;
+	const probe = new UsageProbe(root, () => now, 30_000);
+	const none = () => undefined;
+
+	expect(await probe.measure(mission, none)).toBeNull(); // no coordinator entries, no workers dir
+	now += 40_000;
+	await mkdir(workerDir, { recursive: true });
+	await writeFile(join(workerDir, 'b1.baseline.json'), '{}'); // sidecars in the dir are not session files
+	expect(await probe.measure(mission, none)).toBeNull();
+
+	// A mid-write tail line is skipped; the offset stops at the last newline.
+	await writeFile(workerFile, `${JSON.stringify(usageEntry(100, 10, 0.5))}\n{"type":"message","mes`);
+	now += 40_000;
+	const first = await probe.measure(mission, () => [usageEntry(50, 5, 0.25)]);
+	expect(first).toEqual({ tokens: { input: 150, output: 15, cacheRead: 8, cacheWrite: 4 }, costUsd: 0.75, sessions: 2 });
+
+	// Inside the window the coordinator thunk is not consulted and nothing is re-read.
+	await appendFile(workerFile, 'sage":{}}\n');
+	expect(await probe.measure(mission, () => { throw new Error('throttled'); })).toEqual(first);
+
+	// The deferred tail completes; only the new bytes are parsed.
+	await appendFile(workerFile, `${JSON.stringify(usageEntry(10, 1, 0.1))}\n`);
+	now += 40_000;
+	expect(await probe.measure(mission, none)).toEqual({ tokens: { input: 110, output: 11, cacheRead: 8, cacheWrite: 4 }, costUsd: 0.6, sessions: 1 });
+
+	// A mission switch recomputes immediately even inside the window.
+	expect(await probe.measure(other, () => [usageEntry(7, 7)])).toEqual({ tokens: { input: 117, output: 18, cacheRead: 12, cacheWrite: 6 }, costUsd: 0.6, sessions: 2 });
+
+	// A deleted worker file keeps its already-counted usage; a new probe reads it as foreign.
+	await rm(workerFile);
+	now += 40_000;
+	expect(await probe.measure(other, none)).toEqual({ tokens: { input: 110, output: 11, cacheRead: 8, cacheWrite: 4 }, costUsd: 0.6, sessions: 1 });
+	expect(await new UsageProbe(root, () => now).measure(other, none)).toBeNull();
+});
+
+test('the status file reports mission mode and estimated usage', async () => {
+	const cwd = '/tmp';
+	const status = await buildContactStatus({
+		mission: baseMission(cwd, { mode: 'force' }), pending: false, resumeHold: false, snapshot: undefined,
+		policy: idlePolicy, step: undefined, owned: true, selected: undefined, operation: false, ctl: null,
+		usage: { tokens: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4 }, costUsd: 0.01, sessions: 2 },
+	});
+	expect(status.mode).toBe('force');
+	expect(status.usage).toEqual({ tokens: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4 }, costUsd: 0.01, sessions: 2 });
+
+	// A pending plan reports the planned mode; nothing recorded means usage stays null.
+	const planned = await session({ plan: true });
+	await planned.command('--pause -- demo');
+	expect((await statusOf(planned, planned.pending()!)).mode).toBe('pause');
+	expect((await statusOf(planned, planned.pending()!)).usage).toBeNull();
+
+	// A saved mission sums the coordinator session entries and the worker session files.
+	const mission = baseMission('/tmp');
+	const workerDir = `missions/${mission.workspace.key}/workers`;
+	const run = await session({ mission, entries: [usageEntry(50, 5, 0.25)], beforeLoad: async root => {
+		await mkdir(join(root, workerDir), { recursive: true });
+		await writeFile(join(root, workerDir, 'b1.jsonl'), `${JSON.stringify(usageEntry(100, 10, 0.5))}\n`);
+	} });
+	const published = await statusOf(run, mission);
+	expect(published.mode).toBe('auto');
+	expect(published.usage).toEqual({ tokens: { input: 150, output: 15, cacheRead: 8, cacheWrite: 4 }, costUsd: 0.75, sessions: 2 });
+	await planned.event('session_shutdown', {});
+	await run.event('session_shutdown', {});
 });
 
 test('environment overrides are validated and the autostart message strips /mission', () => {

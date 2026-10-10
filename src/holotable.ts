@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { chmod, lstat, mkdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,7 +8,7 @@ import { displayPhase, operatorCommands, quotaHold } from './controller';
 import { isRecord } from './guards';
 import { displaySourceId } from './sources';
 import { missionDirectory } from './store';
-import { phases, type Mission, type PolicyContext, type Snapshot, type Step } from './types';
+import { phases, type Mission, type Mode, type PolicyContext, type Snapshot, type Step } from './types';
 
 // The holotable fleet contract (omp-holotable/docs/contract.md). Kept local: the repos do not import across.
 export const OPERATOR_OPS = ['approve', 'continue', 'mode', 'review', 'dispatch', 'resend', 'release', 'reap', 'clear'] as const;
@@ -35,8 +35,55 @@ export interface ContactStatus {
 	complete: boolean;
 	revision: string;
 	plan: { path: string; revision: string } | null;
+	mode: Mode | null;
+	usage: UsageTotals | null;
 	ctl: { socket: string; generation: number } | null;
 	updatedAt: string;
+}
+
+export interface UsageTotals {
+	tokens: { input: number; output: number; cacheRead: number; cacheWrite: number };
+	costUsd: number | null;
+	sessions: number;
+}
+
+const TOKEN_KEYS = ['input', 'output', 'cacheRead', 'cacheWrite'] as const;
+
+function mergeUsage(target: UsageTotals, source: UsageTotals | null): void {
+	if (!source) return;
+	for (const key of TOKEN_KEYS) target.tokens[key] += source.tokens[key];
+	if (source.costUsd !== null) target.costUsd = (target.costUsd ?? 0) + source.costUsd;
+	target.sessions += source.sessions;
+}
+
+// One session counts once when at least one of its records is a {type:'message', message:{role:'assistant'}}
+// entry whose message carries a usage object — the OMP AssistantMessage.usage shape. Anything else is skipped.
+export function sumAssistantUsage(records: readonly unknown[]): UsageTotals | null {
+	const totals: UsageTotals = { tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, costUsd: null, sessions: 0 };
+	let found = false;
+	for (const record of records) {
+		if (!isRecord(record) || record.type !== 'message' || !isRecord(record.message) || record.message.role !== 'assistant') continue;
+		const usage = record.message.usage;
+		if (!isRecord(usage)) continue;
+		found = true;
+		for (const key of TOKEN_KEYS) if (typeof usage[key] === 'number' && Number.isFinite(usage[key])) totals.tokens[key] += usage[key];
+		if (isRecord(usage.cost) && typeof usage.cost.total === 'number' && Number.isFinite(usage.cost.total)) totals.costUsd = (totals.costUsd ?? 0) + usage.cost.total;
+	}
+	if (!found) return null;
+	totals.sessions = 1;
+	return totals;
+}
+
+// Worker transcripts are OMP session files: one JSON object per line. A mid-write tail line is skipped,
+// so offset bookkeeping only ever ends on a newline boundary.
+export function parseUsageLines(text: string): UsageTotals | null {
+	const records: unknown[] = [];
+	for (const line of text.split('\n')) {
+		const trimmed = line.trim();
+		if (!trimmed) continue;
+		try { records.push(JSON.parse(trimmed)); } catch { /* partial or foreign line */ }
+	}
+	return sumAssistantUsage(records);
 }
 
 export function gateTokenId(token: string): string {
@@ -50,6 +97,71 @@ export function statusFilePath(agentDir: string, mission: Pick<Mission, 'id' | '
 	return join(missionDirectory(agentDir, mission.workspace.key), 'status', `${mission.id}.json`);
 }
 
+interface FileUsage { offset: number; counted: boolean; tokens: { input: number; output: number; cacheRead: number; cacheWrite: number }; costUsd: number | null }
+
+/**
+ * Usage probe for the status file. Sums assistant-message usage in the coordinator session
+ * (`SessionManager.getEntries()`) and in the mission's worker session files under
+ * missions/<key>/workers/*.jsonl (read-only). Recomputed at most once per `intervalMs` (default
+ * 30 s): worker files are re-parsed incrementally from the byte offset after the last newline.
+ * A mission switch recomputes immediately. Null means nothing has recorded usage yet.
+ */
+export class UsageProbe {
+	private readonly files = new Map<string, FileUsage>();
+	private stamp = 0;
+	private key = '';
+	private cache: UsageTotals | null = null;
+
+	constructor(private readonly agentDir: string, private readonly now: () => number = Date.now, private readonly intervalMs = 30_000) {}
+
+	async measure(mission: Mission, coordinatorEntries: () => readonly unknown[] | undefined): Promise<UsageTotals | null> {
+		const key = `${mission.workspace.key} ${mission.id}`;
+		const now = this.now();
+		if (this.key === key && now - this.stamp < this.intervalMs) return this.cache;
+		if (this.key !== key) this.files.clear();
+		this.key = key;
+		this.stamp = now;
+		this.cache = await this.compute(mission, coordinatorEntries);
+		return this.cache;
+	}
+
+	private async compute(mission: Mission, coordinatorEntries: () => readonly unknown[] | undefined): Promise<UsageTotals | null> {
+		const totals: UsageTotals = { tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, costUsd: null, sessions: 0 };
+		mergeUsage(totals, sumAssistantUsage(coordinatorEntries() ?? []));
+		const dir = join(missionDirectory(this.agentDir, mission.workspace.key), 'workers');
+		const names = new Set(await readdir(dir).catch(() => [] as string[]));
+		for (const name of [...names].sort()) {
+			if (!name.endsWith('.jsonl')) continue;
+			mergeUsage(totals, await this.file(join(dir, name)));
+		}
+		// A worker file deleted since the last pass keeps the usage already parsed from it.
+		for (const [path, entry] of this.files) {
+			if (path.startsWith(`${dir}/`) && !names.has(path.slice(dir.length + 1)) && entry.counted) {
+				mergeUsage(totals, { tokens: { ...entry.tokens }, costUsd: entry.costUsd, sessions: 1 });
+			}
+		}
+		return totals.sessions > 0 ? totals : null;
+	}
+
+	private async file(path: string): Promise<UsageTotals | null> {
+		let entry = this.files.get(path);
+		const data = await readFile(path).catch(() => null);
+		if (data === null) return entry ? { tokens: { ...entry.tokens }, costUsd: entry.costUsd, sessions: entry.counted ? 1 : 0 } : null;
+		const end = data.lastIndexOf(0x0a);
+		if (!entry) { entry = { offset: 0, counted: false, tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, costUsd: null }; this.files.set(path, entry); }
+		if (end > entry.offset) {
+			const parsed = parseUsageLines(data.toString('utf8', entry.offset, end + 1));
+			entry.offset = end + 1;
+			if (parsed) {
+				for (const key of TOKEN_KEYS) entry.tokens[key] += parsed.tokens[key];
+				if (parsed.costUsd !== null) entry.costUsd = (entry.costUsd ?? 0) + parsed.costUsd;
+				entry.counted = true;
+			}
+		}
+		return { tokens: { ...entry.tokens }, costUsd: entry.costUsd, sessions: entry.counted ? 1 : 0 };
+	}
+}
+
 export interface StatusInput {
 	mission: Mission;
 	pending: boolean;
@@ -61,6 +173,7 @@ export interface StatusInput {
 	selected: string | undefined;
 	operation: boolean;
 	ctl: { socket: string; generation: number } | null;
+	usage: UsageTotals | null;
 	planPath?: string;
 }
 
@@ -103,6 +216,8 @@ export async function buildContactStatus(input: StatusInput): Promise<ContactSta
 		complete: phase === 'complete',
 		plan: input.pending && input.planPath ? await readFile(input.planPath, 'utf8').then(text => ({ path: input.planPath!, revision: planRevision(text) })).catch(() => null) : null,
 		revision: m.updatedAt,
+		mode: m.mode ?? null,
+		usage: input.usage,
 		ctl: input.ctl,
 		updatedAt: m.updatedAt,
 	};
@@ -177,8 +292,11 @@ export class HolotableBridge {
 	private lastPath = '';
 	private failed = false;
 	private writing: Promise<void> = Promise.resolve();
+	private readonly usage: UsageProbe;
 
-	constructor(private readonly agentDir: string, private readonly hooks: HolotableHooks) {}
+	constructor(private readonly agentDir: string, private readonly hooks: HolotableHooks) {
+		this.usage = new UsageProbe(agentDir);
+	}
 
 	ctlFor(missionId: string): { socket: string; generation: number } | null {
 		return this.socketId === missionId && this.server && this.socketPath ? { socket: this.socketPath, generation: this.generation } : null;
@@ -194,6 +312,9 @@ export class HolotableBridge {
 		const { mission, pending } = this.hooks.source();
 		const current = mission ?? pending;
 		if (!current) return;
+		// getEntries() (not getBranch()): every assistant message in the coordinator session counts toward spend.
+		// Lazy so a publish inside the probe's throttle window does not pay for the copy.
+		const coordinatorEntries = () => { try { return this.hooks.context()?.sessionManager.getEntries(); } catch { return undefined; } };
 		const status = await buildContactStatus({
 			mission: current,
 			pending: !mission && !!pending,
@@ -205,6 +326,7 @@ export class HolotableBridge {
 			selected: this.hooks.selected(),
 			operation: this.hooks.operation(),
 			ctl: this.ctlFor(current.id),
+			usage: await this.usage.measure(current, coordinatorEntries),
 			planPath: this.hooks.planPath(),
 		});
 		const serialized = `${JSON.stringify(status, null, 2)}\n`;
