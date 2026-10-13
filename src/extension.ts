@@ -1,10 +1,10 @@
-import { realpath } from 'node:fs/promises';
+import { readFile, realpath } from 'node:fs/promises';
 import { isAbsolute, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { matchesKey } from '@oh-my-pi/pi-tui';
 import { z } from '@oh-my-pi/pi-coding-agent';
 import { resolveLocalUrlToPath } from '@oh-my-pi/pi-coding-agent/internal-urls/local-protocol';
-import type { ExtensionAPI, ExtensionContext } from '@oh-my-pi/pi-coding-agent';
+import type { ExtensionAPI, ExtensionContext, PlanReviewRequestedEvent } from '@oh-my-pi/pi-coding-agent';
 import type { KeyId } from '@oh-my-pi/pi-tui';
 import type { Action, Evidence, Mission, MissionConfig, Mode, Projection, Run, Snapshot, SubagentRow } from './types';
 import { configNotice, displayConfigPath, formatMissionConfig, readMissionConfig, resolveAgentDir, validateMissionConfig, writeMissionConfig } from './config';
@@ -26,7 +26,7 @@ import { SubagentRunner, subagentPrompt } from './subagent';
 import { copyPlanFile, sourceFilePath, writeSourceFile } from './hosts';
 import { noteSubagentSpawn, noteSubagentToolEnd, noteSubagentToolStart, noteSubagentTurnEnd } from './subagents';
 import { checkToolCall, fingerprintScopes, implementationScopes, isImplementationPath, mutatedPaths, type GuardScope } from './coordinator-guard';
-import { autostartMessage, envBase, envCheckout, envDelivery, envGraph, gateTokenId, HolotableBridge } from './holotable';
+import { autostartMessage, envBase, envCheckout, envDelivery, envGraph, gateTokenId, HolotableBridge, planRevision } from './holotable';
 import { mergeConflictPaths } from './mergecheck';
 
 const controls = ['show','clear','continue','mode','approve','review','history','focus','resend','release','dispatch','reap','actions','config'];
@@ -48,11 +48,9 @@ export default async function missionExtension(pi: ExtensionAPI) {
  let lifetime=new AbortController();let operationSignal:AbortSignal|undefined;
  let inspectionIntent:{mode?:Mode;reviewRequested?:boolean}={};
  let reviewRows:SubagentRow[]=[];
- // The open OMP interactive plan review, tracked via plan_review_requested/resolved so the board can answer it.
- let planReviewId:string|undefined;
- // resolvePlanReview/getPendingPlanReview exist only on newer OMP (post-18.x); every use is feature-detected.
- type PlanReviewApi={resolvePlanReview?:(id:string,choice:string,input?:{feedback?:string})=>boolean;getPendingPlanReview?:()=>{reviewId:string}|undefined};
- type PlanReviewEvent={type:string;reviewId?:string};
+ let planReview:PlanReviewRequestedEvent|undefined;
+ let openedPlanRevision:string|undefined;
+ let openingPlanReview=false;
  // Reviewers are in-process sessions: list them in the mission outline while they run, and keep their transcripts (also in Agent Hub) so a finished review can be inspected.
  const reviewDir=(m:Mission)=>join(agentDir,'missions',m.workspace.key,'reviews',m.id);
  const reviewer=new Reviewer(undefined,{sessionDir:reviewDir,checkpoint:async(m)=>{await persist(m);await render();},progress:({label,state})=>{const id=`subagent:review:${mission?.reviews.length??0}:${label}`;reviewRows=[...reviewRows.filter(row=>row.id!==id),{id,name:`review ${label}`,kind:'task',state}];void render();}});
@@ -120,11 +118,11 @@ export default async function missionExtension(pi: ExtensionAPI) {
   decide:(context,verb,arg)=>decision(context,verb,arg),
   request:(context,op,extra)=>request(context,op,extra),
   clear:async context=>{await control({operation:'clear'},context);},
-  planPath:()=>{const context=ctx;if(mission||!pending||!context?.localProtocolOptions)return undefined;return resolveLocalUrlToPath(`local://${planSlug(pending.source)}-plan.md`,context.localProtocolOptions);},
+  planPath:()=>{const context=ctx;if(mission||!pending||!context)return undefined;const review=context.getPendingPlanReview?context.getPendingPlanReview():planReview;const file=review?.planFilePath;if(file)return file.startsWith('local://')?(context.localProtocolOptions?resolveLocalUrlToPath(file,context.localProtocolOptions):undefined):file;return holotablePlanPath(context);},
   touchPending:()=>{if(pending)pending.updatedAt=new Date().toISOString();},
   sendUserMessage:message=>pi.sendUserMessage(message),
   onNotify:message=>ctx?.ui.notify(message,'warning'),
-  planReview:()=>{const api=ctx&&eligible(ctx)?ctx as ExtensionContext&PlanReviewApi:undefined;const open=api?.getPendingPlanReview?api.getPendingPlanReview()?.reviewId:planReviewId;return api?.resolvePlanReview&&open?{reviewId:open,resolve:(choice,input)=>api.resolvePlanReview!(open,choice,input)}:undefined;},
+  planReview:()=>{const context=ctx&&eligible(ctx)?ctx:undefined;const review=context?.getPendingPlanReview?context.getPendingPlanReview():planReview;return context?.resolvePlanReview&&review?{reviewId:review.reviewId,canApprove:!review.options?.find(option=>option.id==='compact')?.disabled,resolve:(choice,input)=>context.resolvePlanReview(review.reviewId,choice,input)}:undefined;},
  });
  async function publishStatus(){await holotable.publish();}
  async function openSocket(id:string){try{await holotable.open(id);}catch(error){ctx?.ui.notify(`Holotable control socket failed: ${error instanceof Error?error.message:String(error)}`,'warning');}}
@@ -172,7 +170,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
  }
  async function acquire(){if(!mission||!path)throw new Error('No saved mission');if(ownership){await ownership.assertOwned();return;}ownershipError=undefined;ownership=await acquireOwnership(path,mission,error=>{ownershipError=`Controller lost: ${error.message}`;resumeHold=true;lastWake='';void reviewer.dispose();void render();});mission=ownership.mission;mission.controllerNonce=ownership.nonce;}
  async function release(){const current=ownership;ownership=undefined;await current?.release();await holotable.close();}
- async function detach(context?:ExtensionContext){generation++;providerHold=undefined;coordinatorShells.clear();lifetime.abort();lifetime=new AbortController();terminalInputDispose?.();terminalInputDispose=undefined;overlayAbort?.abort();overlayAbort=undefined;if(timer&&ctx)ctx.clearTimer(timer);timer=undefined;await reviewer.dispose();await workerAgents.abortAll();await release();await publishStatus();ctx?.ui.setWidget('mission',undefined);ctx=context;mission=undefined;pending=undefined;path=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;lastWake='';guided='';selected=undefined;history=undefined;lastPoll=0;outlineOffset=0;inspectionIntent={};subagents=[];reviewRows=[];planReviewId=undefined;}
+ async function detach(context?:ExtensionContext){generation++;providerHold=undefined;coordinatorShells.clear();lifetime.abort();lifetime=new AbortController();terminalInputDispose?.();terminalInputDispose=undefined;overlayAbort?.abort();overlayAbort=undefined;if(timer&&ctx)ctx.clearTimer(timer);timer=undefined;await reviewer.dispose();await workerAgents.abortAll();await release();await publishStatus();ctx?.ui.setWidget('mission',undefined);ctx=context;mission=undefined;pending=undefined;path=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;lastWake='';guided='';selected=undefined;history=undefined;lastPoll=0;outlineOffset=0;inspectionIntent={};subagents=[];reviewRows=[];planReview=undefined;openedPlanRevision=undefined;openingPlanReview=false;}
  async function attach(file:string,context:ExtensionContext,announce=true){providerHold=undefined;await release();mission=await loadMission(file);path=file;pending=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;ctx=context;await refresh(false);await render();await openSocket(mission.id);await publishStatus();
   const step=announce?currentStep(context):undefined;
   if(step)context.ui.notify(`${displaySourceId(mission.source)} · ${phaseLabel(displayPhase(mission,snapshot))}. ${step.command?`Next: ${step.command} — `:''}${step.text}. /mission opens the action menu.`,'info');
@@ -211,11 +209,29 @@ export default async function missionExtension(pi: ExtensionAPI) {
   startPolling(context);
  }
  function startPolling(context:ExtensionContext){
-  timer=context.setInterval(()=>{
+  timer=context.setInterval(async()=>{
    if(operation)return;
+   if(pending&&ctx)await openPendingPlanReview(ctx).catch(error=>ctx?.ui.notify(`Could not open plan review: ${String(error)}`,'warning'));
    const interval=mission&&(mission.phase==='execute'||mission.phase==='repair')?5000:30000;
    if(Date.now()-lastPoll>=interval)void refresh(true);
   },1000);
+ }
+ async function openPendingPlanReview(context:ExtensionContext){
+  if(ctx!==context||!pending||mission||openingPlanReview||operation||providerHold||!eligible(context)||!nativePlan(context)||!context.isIdle()||context.hasPendingMessages()||!context.openPlanReview||context.getPendingPlanReview?.())return;
+  const epoch=generation;
+  openingPlanReview=true;
+  try{
+   const planPath=holotablePlanPath(context);
+   const text=planPath?await readFile(planPath,'utf8').catch(()=>undefined):undefined;
+   if(!text?.trim()||epoch!==generation||!pending||mission)return;
+   const revision=planRevision(text);
+   if(revision===openedPlanRevision)return;
+   if(await context.openPlanReview()&&epoch===generation)openedPlanRevision=revision;
+  }finally{if(epoch===generation)openingPlanReview=false;}
+ }
+ function holotablePlanPath(context:ExtensionContext){
+  if(!pending||!context.localProtocolOptions)return undefined;
+  return resolveLocalUrlToPath(`local://${planSlug(pending.source)}-plan.md`,context.localProtocolOptions);
  }
  async function refresh(wake:boolean){
   if(refreshing||!mission||!mission.epicId||!ctx)return;
@@ -672,10 +688,8 @@ async function finishMission(context:ExtensionContext){
   ]};
  });
  pi.on('session_compact',()=>{guided='';});
- // The plan-review events exist only on OMP builds exposing resolvePlanReview; on older builds the handlers never fire.
- // The publish promise is returned so awaited status updates are observable to the board.
- (pi.on as unknown as (event:string,handler:(event:PlanReviewEvent,context:ExtensionContext)=>Promise<void>)=>void)('plan_review_requested',async(event,context)=>{if(!eligible(context))return;planReviewId=typeof event.reviewId==='string'?event.reviewId:planReviewId;return publishStatus();});
- (pi.on as unknown as (event:string,handler:(event:PlanReviewEvent,context:ExtensionContext)=>Promise<void>)=>void)('plan_review_resolved',async(event,context)=>{if(!eligible(context))return;if(planReviewId&&(event.reviewId===undefined||event.reviewId===planReviewId))planReviewId=undefined;return publishStatus();});
+ pi.on('plan_review_requested',async(event,context)=>{if(!eligible(context))return;ctx=context;planReview=event;await publishStatus();});
+ pi.on('plan_review_resolved',async(event,context)=>{if(!eligible(context))return;ctx=context;if(planReview?.reviewId===event.reviewId)planReview=undefined;await publishStatus();});
  pi.on('tool_call',async(event,context)=>{
   const m=mission;if(!eligible(context)||!m||m.phase==='complete'||effectiveGraph(m)!=='beads')return;
   const scope:GuardScope={cwd:m.workspace.cwd,toolCwd:context.cwd,scopes:implementationScopes(m),beadsDir:m.workspace.beadsDir};

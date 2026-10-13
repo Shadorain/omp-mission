@@ -75,6 +75,7 @@ async function session(options: { plan?: boolean; child?: boolean; autostart?: s
 	const notices: string[] = [];
 	let command: ((args: string, context: ExtensionContext) => Promise<void>) | undefined;
 	let active: string[] = [];
+	let poll: (() => Promise<void>) | undefined;
 	const branch: Array<Record<string, unknown>> = [
 		...(path ? [{ type: 'custom', customType: 'mission:pointer', data: { path } }] : []),
 		...(options.plan ? [{ type: 'mode_change', mode: 'plan' }] : []),
@@ -86,7 +87,7 @@ async function session(options: { plan?: boolean; child?: boolean; autostart?: s
 		localProtocolOptions: { getArtifactsDir: () => join(root, 'artifacts'), getSessionId: () => 'test-session' },
 		ui: { notify: (message: string) => { notices.push(message); }, setWidget: () => {} },
 		isIdle: () => true, hasPendingMessages: () => false,
-		setInterval: () => 1, clearTimer: () => {}, setTimeout: () => 1,
+		setInterval: (callback: () => Promise<void>) => { poll = callback; return 1; }, clearTimer: () => {}, setTimeout: () => 1,
 	} as unknown as ExtensionContext;
 	const api = {
 		registerTool: () => {}, registerShortcut: () => {},
@@ -115,6 +116,7 @@ async function session(options: { plan?: boolean; child?: boolean; autostart?: s
 		command: (args: string) => command!(args, context),
 		pending: () => branch.find(entry => entry.type === 'custom' && entry.customType === 'mission:pending')?.data as Mission | undefined,
 		event: (name: string, event: unknown) => events.get(name)!(event, context),
+		poll: () => poll?.(),
 	};
 }
 
@@ -513,7 +515,7 @@ test('plan-refine sends the message into the session and is rejected without a p
 	await other.event('session_shutdown', {});
 });
 
-// Installs the OMP plan-review API (omp 18.x lacks it; presence is feature-detected) on the fake context.
+// Older running OMP sessions can lack the native review API.
 function planReviewApi(run: { context: ExtensionContext }, calls: Array<[string, string, { feedback?: string } | undefined]>, pending?: { reviewId: string }) {
 	const api = run.context as unknown as Record<string, unknown>;
 	api.resolvePlanReview = (reviewId: string, choice: string, input?: { feedback?: string }) => { calls.push([reviewId, choice, input]); return true; };
@@ -582,5 +584,85 @@ test('plan-approve picks up a review that opened before the handlers saw it', as
 	expect((await statusOf(run, mission)).actions).toEqual(['plan-approve']);
 	expect((await ctl(socket, { v: 1, op: 'plan-approve', operator: true })).ok).toBe(true);
 	expect(calls).toEqual([['restored', 'compact', undefined]]);
+	await run.event('session_shutdown', {});
+});
+
+test('idle pending plans open native review once per revision, never while streaming', async () => {
+	const run = await session({ plan: true, child: true });
+	await run.command('-- demo');
+	const mission = run.pending()!;
+	const file = await writePlan(run, mission, '# Ready\nImplement it.\n');
+	let idle = false;
+	let opened = 0;
+	run.context.isIdle = () => idle;
+	run.context.openPlanReview = async () => {
+		opened++;
+		await run.event('plan_review_requested', { type: 'plan_review_requested', reviewId: `review-${opened}`, planFilePath: file, options: [{ id: 'compact', disabled: false }] });
+		return true;
+	};
+	const calls: Array<[string, string, { feedback?: string } | undefined]> = [];
+	planReviewApi(run, calls);
+	await run.poll();
+	expect(opened).toBe(0);
+	idle = true;
+	await run.poll();
+	expect((await statusOf(run, mission)).actions).toContain('plan-approve');
+	await run.event('plan_review_resolved', { type: 'plan_review_resolved', reviewId: 'review-1' });
+	await run.poll();
+	expect(opened).toBe(1);
+	await run.event('session_shutdown', {});
+});
+
+test('native review path is authoritative and a closed refinement never queues a fallback prompt', async () => {
+	const run = await session({ plan: true, child: true });
+	await run.command('-- demo');
+	const mission = run.pending()!;
+	await writePlan(run, mission, 'Old plan\n');
+	const file = join(run.root, 'native-plan.md');
+	await writeFile(file, 'Native plan\n');
+	const calls: Array<[string, string, { feedback?: string } | undefined]> = [];
+	planReviewApi(run, calls);
+	await run.event('plan_review_requested', { type: 'plan_review_requested', reviewId: 'native', planFilePath: file, options: [{ id: 'compact', disabled: false }] });
+	expect((await statusOf(run, mission)).plan?.path).toBe(file);
+	const socket = (await statusOf(run, mission)).ctl!.socket;
+	expect((await ctl(socket, { v: 1, op: 'plan-approve', operator: true, args: { revision: planRevision('Old plan\n') } })).error.code).toBe('stale');
+	run.context.resolvePlanReview = () => false;
+	const before = run.sent.length;
+	expect((await ctl(socket, { v: 1, op: 'plan-refine', operator: true, args: { message: 'Tighter scope' } })).error.code).toBe('rejected');
+	expect(run.sent.length).toBe(before);
+	await run.event('session_shutdown', {});
+});
+
+test('native local plan URL resolves to the file edited and approved by the board', async () => {
+	const run = await session({ plan: true, child: true });
+	await run.command('-- demo');
+	const mission = run.pending()!;
+	const file = await writePlan(run, mission, 'Reviewed plan\n');
+	const calls: Array<[string, string, { feedback?: string } | undefined]> = [];
+	planReviewApi(run, calls);
+	await run.event('plan_review_requested', { type: 'plan_review_requested', reviewId: 'local-review', planFilePath: `local://${planSlug(mission.source)}-plan.md`, options: [{ id: 'compact', disabled: false }] });
+	const status = await statusOf(run, mission);
+	expect(status.plan).toEqual({ path: file, revision: planRevision('Reviewed plan\n') });
+	const socket = status.ctl!.socket;
+	expect((await ctl(socket, { v: 1, op: 'plan-edit', operator: true, args: { base: status.plan!.revision, text: 'Edited native plan\n' } })).ok).toBe(true);
+	expect(await Bun.file(file).text()).toBe('Edited native plan\n');
+	expect((await ctl(socket, { v: 1, op: 'plan-approve', operator: true, args: { revision: planRevision('Edited native plan\n') } })).ok).toBe(true);
+	await run.event('session_shutdown', {});
+});
+
+test('disabled compact approval still permits native refinement without bypassing approval', async () => {
+	const run = await session({ plan: true, child: true });
+	await run.command('-- demo');
+	const mission = run.pending()!;
+	await writePlan(run, mission, 'Pending\n');
+	const calls: Array<[string, string, { feedback?: string } | undefined]> = [];
+	planReviewApi(run, calls);
+	await run.event('plan_review_requested', { type: 'plan_review_requested', reviewId: 'disabled', options: [{ id: 'compact', disabled: true }, { id: 'refine', disabled: false }] });
+	const status = await statusOf(run, mission);
+	expect(status.actions).not.toContain('plan-approve');
+	const socket = status.ctl!.socket;
+	expect((await ctl(socket, { v: 1, op: 'plan-approve', operator: true })).error.code).toBe('rejected');
+	expect((await ctl(socket, { v: 1, op: 'plan-refine', operator: true, args: { message: 'Narrow scope' } })).ok).toBe(true);
+	expect(calls).toEqual([['disabled', 'refine', { feedback: 'Narrow scope' }]]);
 	await run.event('session_shutdown', {});
 });

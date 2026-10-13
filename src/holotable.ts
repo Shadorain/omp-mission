@@ -3,7 +3,7 @@ import { chmod, lstat, mkdir, readdir, readFile, realpath, rename, rm, writeFile
 import { createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { ExtensionContext } from '@oh-my-pi/pi-coding-agent';
+import type { ExtensionContext, PlanReviewChoice } from '@oh-my-pi/pi-coding-agent';
 import { displayPhase, operatorCommands, quotaBlocked } from './controller';
 import { isRecord } from './guards';
 import { displaySourceId } from './sources';
@@ -275,7 +275,7 @@ export interface HolotableHooks {
 	touchPending(): void;
 	sendUserMessage(message: string): void;
 	// The open interactive plan review, when OMP exposes the review API (ctx.resolvePlanReview) and a review awaits an answer.
-	planReview(): { reviewId: string; resolve(choice: string, input?: { feedback?: string }): boolean } | undefined;
+	planReview(): { reviewId: string; canApprove: boolean; resolve(choice: PlanReviewChoice, input?: { feedback?: string }): boolean } | undefined;
 	onNotify(message: string): void;
 }
 
@@ -337,7 +337,7 @@ export class HolotableBridge {
 			ctl: this.ctlFor(current.id),
 			usage: await this.usage.measure(current, coordinatorEntries),
 			planPath: this.hooks.planPath(),
-			planReview: !!this.hooks.planReview(),
+			planReview: this.hooks.planReview()?.canApprove === true,
 		});
 		const serialized = `${JSON.stringify(status, null, 2)}\n`;
 		const file = statusFilePath(this.agentDir, current);
@@ -494,7 +494,7 @@ export class HolotableBridge {
 				if (mission || !pending) return fail('rejected', 'No pending plan is awaiting approval');
 				if (args.revision !== undefined && typeof args.revision !== 'string') return fail('bad-request', 'args.revision must be a string');
 				const review = this.hooks.planReview();
-				if (!review) return fail('rejected', 'No plan review is open, or this OMP does not expose resolvePlanReview');
+				if (!review?.canApprove) return fail('rejected', 'No plan review with compact approval is available');
 				if (args.revision !== undefined) {
 					const planPath = this.hooks.planPath();
 					const current = planPath ? await readFile(planPath, 'utf8').catch(() => undefined) : undefined;
@@ -508,8 +508,10 @@ export class HolotableBridge {
 			} else if (op === 'plan-refine') {
 				if (mission || !pending) return fail('rejected', 'No pending plan is awaiting approval');
 				if (typeof args.message !== 'string' || args.message.length < 1 || args.message.length > 8000) return fail('bad-request', 'plan-refine requires args.message of 1..8000 characters');
-				// Route through the open review when possible so the overlay records the refinement; sendUserMessage is the fallback.
-				if (!this.hooks.planReview()?.resolve('refine', { feedback: args.message })) this.hooks.sendUserMessage(args.message);
+				const review = this.hooks.planReview();
+				if (review) {
+					if (!review.resolve('refine', { feedback: args.message })) return fail('rejected', 'The plan review closed before it could be refined');
+				} else this.hooks.sendUserMessage(args.message);
 			} else {
 				const extra: Record<string, unknown> = {};
 				if (typeof args.beadId === 'string') extra.beadId = args.beadId;
