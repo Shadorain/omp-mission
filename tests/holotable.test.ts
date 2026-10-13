@@ -490,3 +490,75 @@ test('plan-refine sends the message into the session and is rejected without a p
 	await run.event('session_shutdown', {});
 	await other.event('session_shutdown', {});
 });
+
+// Installs the OMP plan-review API (omp 18.x lacks it; presence is feature-detected) on the fake context.
+function planReviewApi(run: { context: ExtensionContext }, calls: Array<[string, string, { feedback?: string } | undefined]>, pending?: { reviewId: string }) {
+	const api = run.context as unknown as Record<string, unknown>;
+	api.resolvePlanReview = (reviewId: string, choice: string, input?: { feedback?: string }) => { calls.push([reviewId, choice, input]); return true; };
+	if (pending) api.getPendingPlanReview = () => pending;
+}
+
+test('plan-approve advertises while a review is open and resolves it with compact', async () => {
+	const run = await session({ plan: true, child: true });
+	await run.command('-- demo');
+	const mission = run.pending()!;
+	const socket = (await statusOf(run, mission)).ctl!.socket;
+	// Without the API the op stays hidden and is rejected.
+	expect((await statusOf(run, mission)).actions).toEqual([]);
+	expect((await ctl(socket, { v: 1, op: 'plan-approve', operator: true })).error.code).toBe('rejected');
+	// With the API but no open review it stays rejected too.
+	const calls: Array<[string, string, { feedback?: string } | undefined]> = [];
+	planReviewApi(run, calls);
+	expect((await ctl(socket, { v: 1, op: 'plan-approve', operator: true })).error.code).toBe('rejected');
+	await writePlan(run, mission, '# Plan\nDo it.\n');
+	await run.event('plan_review_requested', { type: 'plan_review_requested', reviewId: 'r1' });
+	const status = await statusOf(run, mission);
+	expect(status.actions).toEqual(['plan-approve']);
+	const revision = status.plan!.revision;
+	expect((await ctl(socket, { v: 1, op: 'plan-approve', operator: true, args: { revision: 'deadbeefdead' } })).error.code).toBe('stale');
+	expect(calls).toEqual([]);
+	// A review routed through the API keeps plan-refine out of sendUserMessage.
+	const sentBefore = run.sent.length;
+	expect((await ctl(socket, { v: 1, op: 'plan-refine', operator: true, args: { message: 'Tighter scope.' } })).ok).toBe(true);
+	expect(run.sent.length).toBe(sentBefore);
+	const ok = await ctl(socket, { v: 1, op: 'plan-approve', operator: true, args: { revision } });
+	expect(ok.ok).toBe(true);
+	expect(ok.revision).toBe(mission.updatedAt);
+	expect(calls).toEqual([
+		['r1', 'refine', { feedback: 'Tighter scope.' }],
+		['r1', 'compact', undefined],
+	]);
+	expect(calls.some(([, choice]) => choice === 'execute')).toBe(false);
+	// When the review closes the op leaves the actions list and is rejected again.
+	await run.event('plan_review_resolved', { type: 'plan_review_resolved', reviewId: 'r1' });
+	expect((await statusOf(run, mission)).actions).toEqual([]);
+	expect((await ctl(socket, { v: 1, op: 'plan-approve', operator: true, args: { revision } })).error.code).toBe('rejected');
+	await run.event('session_shutdown', {});
+});
+
+test('plan-approve stays hidden and rejected on an OMP without the plan-review API', async () => {
+	const run = await session({ plan: true, child: true });
+	await run.command('-- demo');
+	const mission = run.pending()!;
+	const socket = (await statusOf(run, mission)).ctl!.socket;
+	// A tracked review alone does not advertise: without resolvePlanReview the op is not advertised and is rejected.
+	await run.event('plan_review_requested', { type: 'plan_review_requested', reviewId: 'r1' });
+	expect((await statusOf(run, mission)).actions).toEqual([]);
+	expect((await ctl(socket, { v: 1, op: 'plan-approve', operator: true, args: { revision: 'anything' } })).error.code).toBe('rejected');
+	await run.event('session_shutdown', {});
+});
+
+test('plan-approve picks up a review that opened before the handlers saw it', async () => {
+	const run = await session({ plan: true, child: true });
+	await run.command('-- demo');
+	const mission = run.pending()!;
+	const socket = (await statusOf(run, mission)).ctl!.socket;
+	// The review opened before this session bound its events; getPendingPlanReview still reports it.
+	const calls: Array<[string, string, { feedback?: string } | undefined]> = [];
+	planReviewApi(run, calls, { reviewId: 'restored' });
+	await run.event('auto_compaction_end', {}); // republish so the status file sees the API
+	expect((await statusOf(run, mission)).actions).toEqual(['plan-approve']);
+	expect((await ctl(socket, { v: 1, op: 'plan-approve', operator: true })).ok).toBe(true);
+	expect(calls).toEqual([['restored', 'compact', undefined]]);
+	await run.event('session_shutdown', {});
+});

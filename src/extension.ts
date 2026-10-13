@@ -47,6 +47,11 @@ export default async function missionExtension(pi: ExtensionAPI) {
  let lifetime=new AbortController();let operationSignal:AbortSignal|undefined;
  let inspectionIntent:{mode?:Mode;reviewRequested?:boolean}={};
  let reviewRows:SubagentRow[]=[];
+ // The open OMP interactive plan review, tracked via plan_review_requested/resolved so the board can answer it.
+ let planReviewId:string|undefined;
+ // resolvePlanReview/getPendingPlanReview exist only on newer OMP (post-18.x); every use is feature-detected.
+ type PlanReviewApi={resolvePlanReview?:(id:string,choice:string,input?:{feedback?:string})=>boolean;getPendingPlanReview?:()=>{reviewId:string}|undefined};
+ type PlanReviewEvent={type:string;reviewId?:string};
  // Reviewers are in-process sessions: list them in the mission outline while they run, and keep their transcripts (also in Agent Hub) so a finished review can be inspected.
  const reviewDir=(m:Mission)=>join(agentDir,'missions',m.workspace.key,'reviews',m.id);
  const reviewer=new Reviewer(undefined,{sessionDir:reviewDir,checkpoint:async(m)=>{await persist(m);await render();},progress:({label,state})=>{const id=`subagent:review:${mission?.reviews.length??0}:${label}`;reviewRows=[...reviewRows.filter(row=>row.id!==id),{id,name:`review ${label}`,kind:'task',state}];void render();}});
@@ -117,6 +122,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
   touchPending:()=>{if(pending)pending.updatedAt=new Date().toISOString();},
   sendUserMessage:message=>pi.sendUserMessage(message),
   onNotify:message=>ctx?.ui.notify(message,'warning'),
+  planReview:()=>{const api=ctx&&eligible(ctx)?ctx as ExtensionContext&PlanReviewApi:undefined;const open=api?.getPendingPlanReview?api.getPendingPlanReview()?.reviewId:planReviewId;return api?.resolvePlanReview&&open?{reviewId:open,resolve:(choice,input)=>api.resolvePlanReview!(open,choice,input)}:undefined;},
  });
  async function publishStatus(){await holotable.publish();}
  async function openSocket(id:string){try{await holotable.open(id);}catch(error){ctx?.ui.notify(`Holotable control socket failed: ${error instanceof Error?error.message:String(error)}`,'warning');}}
@@ -164,7 +170,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
  }
  async function acquire(){if(!mission||!path)throw new Error('No saved mission');if(ownership){await ownership.assertOwned();return;}ownershipError=undefined;ownership=await acquireOwnership(path,mission,error=>{ownershipError=`Controller lost: ${error.message}`;resumeHold=true;lastWake='';void reviewer.dispose();void render();});mission=ownership.mission;mission.controllerNonce=ownership.nonce;}
  async function release(){const current=ownership;ownership=undefined;await current?.release();await holotable.close();}
- async function detach(context?:ExtensionContext){generation++;coordinatorShells.clear();lifetime.abort();lifetime=new AbortController();terminalInputDispose?.();terminalInputDispose=undefined;overlayAbort?.abort();overlayAbort=undefined;if(timer&&ctx)ctx.clearTimer(timer);timer=undefined;await reviewer.dispose();await workerAgents.abortAll();await release();await publishStatus();ctx?.ui.setWidget('mission',undefined);ctx=context;mission=undefined;pending=undefined;path=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;lastWake='';guided='';selected=undefined;history=undefined;lastPoll=0;outlineOffset=0;inspectionIntent={};subagents=[];reviewRows=[];}
+ async function detach(context?:ExtensionContext){generation++;coordinatorShells.clear();lifetime.abort();lifetime=new AbortController();terminalInputDispose?.();terminalInputDispose=undefined;overlayAbort?.abort();overlayAbort=undefined;if(timer&&ctx)ctx.clearTimer(timer);timer=undefined;await reviewer.dispose();await workerAgents.abortAll();await release();await publishStatus();ctx?.ui.setWidget('mission',undefined);ctx=context;mission=undefined;pending=undefined;path=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;lastWake='';guided='';selected=undefined;history=undefined;lastPoll=0;outlineOffset=0;inspectionIntent={};subagents=[];reviewRows=[];planReviewId=undefined;}
  async function attach(file:string,context:ExtensionContext,announce=true){await release();mission=await loadMission(file);path=file;pending=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;ctx=context;await refresh(false);await render();await openSocket(mission.id);await publishStatus();
   const step=announce?currentStep(context):undefined;
   if(step)context.ui.notify(`${displaySourceId(mission.source)} · ${phaseLabel(displayPhase(mission,snapshot))}. ${step.command?`Next: ${step.command} — `:''}${step.text}. /mission opens the action menu.`,'info');
@@ -653,6 +659,10 @@ export default async function missionExtension(pi: ExtensionAPI) {
   ]};
  });
  pi.on('session_compact',()=>{guided='';});
+ // The plan-review events exist only on OMP builds exposing resolvePlanReview; on older builds the handlers never fire.
+ // The publish promise is returned so awaited status updates are observable to the board.
+ (pi.on as unknown as (event:string,handler:(event:PlanReviewEvent,context:ExtensionContext)=>Promise<void>)=>void)('plan_review_requested',async(event,context)=>{if(!eligible(context))return;planReviewId=typeof event.reviewId==='string'?event.reviewId:planReviewId;return publishStatus();});
+ (pi.on as unknown as (event:string,handler:(event:PlanReviewEvent,context:ExtensionContext)=>Promise<void>)=>void)('plan_review_resolved',async(event,context)=>{if(!eligible(context))return;if(planReviewId&&(event.reviewId===undefined||event.reviewId===planReviewId))planReviewId=undefined;return publishStatus();});
  pi.on('tool_call',async(event,context)=>{
   const m=mission;if(!eligible(context)||!m||m.phase==='complete'||effectiveGraph(m)!=='beads')return;
   const scope:GuardScope={cwd:m.workspace.cwd,toolCwd:context.cwd,scopes:implementationScopes(m),beadsDir:m.workspace.beadsDir};

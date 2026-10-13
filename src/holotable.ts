@@ -11,8 +11,8 @@ import { missionDirectory } from './store';
 import { phases, type Evidence, type Mission, type Mode, type PolicyContext, type Snapshot, type Step } from './types';
 
 // The holotable fleet contract (omp-holotable/docs/contract.md). Kept local: the repos do not import across.
-export const OPERATOR_OPS = ['approve', 'continue', 'mode', 'review', 'dispatch', 'resend', 'release', 'reap', 'clear'] as const;
-const SOCKET_OPS: Record<string, true> = { ping: true, approve: true, continue: true, mode: true, review: true, dispatch: true, resend: true, release: true, reap: true, clear: true, plan: true, 'plan-edit': true, 'plan-refine': true };
+export const OPERATOR_OPS = ['approve', 'continue', 'mode', 'review', 'dispatch', 'resend', 'release', 'reap', 'clear', 'plan-approve'] as const;
+const SOCKET_OPS: Record<string, true> = { ping: true, approve: true, continue: true, mode: true, review: true, dispatch: true, resend: true, release: true, reap: true, clear: true, plan: true, 'plan-edit': true, 'plan-refine': true, 'plan-approve': true };
 // 1 MiB: a plan-edit request carries up to 256 KiB of text plus JSON escaping overhead.
 const MAX_LINE = 1024 * 1024;
 const MAX_PLAN = 256 * 1024;
@@ -177,6 +177,7 @@ export interface StatusInput {
 	ctl: { socket: string; generation: number } | null;
 	usage: UsageTotals | null;
 	planPath?: string;
+	planReview?: boolean;
 }
 
 // Pure projection of mission state into the fleet status file. Async only for the worktree realpath.
@@ -190,11 +191,14 @@ export async function buildContactStatus(input: StatusInput): Promise<ContactSta
 		: m.blocker ? 'blocked'
 		: m.evidence.review?.outcome === 'failed' && quotaHold.test(m.evidence.review.detail) ? 'quota'
 		: 'none';
-	const actions = input.pending ? [] : [...new Set(
-		operatorCommands(m, false, input.snapshot, input.policy, input.selected, input.operation)
-			.map(command => command.split(' ')[0]!)
-			.filter((verb): verb is (typeof OPERATOR_OPS)[number] => (OPERATOR_OPS as readonly string[]).includes(verb)),
-	)];
+	const actions = input.pending
+		// plan-approve answers OMP's interactive plan review; it is advertised only while a review is actually open and resolvable.
+		? (input.planReview ? ['plan-approve'] : [])
+		: [...new Set(
+			operatorCommands(m, false, input.snapshot, input.policy, input.selected, input.operation)
+				.map(command => command.split(' ')[0]!)
+				.filter((verb): verb is (typeof OPERATOR_OPS)[number] => (OPERATOR_OPS as readonly string[]).includes(verb)),
+		)];
 	const detail = m.evidence.deliver?.detail ?? '';
 	const first = detail.split('\n', 1)[0]!.trim();
 	const url = /^https?:\/\/\S+$/.test(first) ? first : null;
@@ -270,6 +274,8 @@ export interface HolotableHooks {
 	planPath(): string | undefined;
 	touchPending(): void;
 	sendUserMessage(message: string): void;
+	// The open interactive plan review, when OMP exposes the review API (ctx.resolvePlanReview) and a review awaits an answer.
+	planReview(): { reviewId: string; resolve(choice: string, input?: { feedback?: string }): boolean } | undefined;
 	onNotify(message: string): void;
 }
 
@@ -331,6 +337,7 @@ export class HolotableBridge {
 			ctl: this.ctlFor(current.id),
 			usage: await this.usage.measure(current, coordinatorEntries),
 			planPath: this.hooks.planPath(),
+			planReview: !!this.hooks.planReview(),
 		});
 		const serialized = `${JSON.stringify(status, null, 2)}\n`;
 		const file = statusFilePath(this.agentDir, current);
@@ -467,26 +474,42 @@ export class HolotableBridge {
 				if (typeof args.text !== 'string') return fail('bad-request', 'plan-edit requires args.text');
 				if (Buffer.byteLength(args.text, 'utf8') > MAX_PLAN) return fail('bad-request', 'Plan text exceeds 256 KiB');
 				if (args.base !== undefined && typeof args.base !== 'string') return fail('bad-request', 'args.base must be a string');
-				const planPath = this.hooks.planPath();
-				const current = planPath ? await readFile(planPath, 'utf8').catch(() => undefined) : undefined;
-				if (planPath === undefined || current === undefined) return fail('no-plan', 'No pending plan file');
+				const editPath = this.hooks.planPath();
+				const current = editPath ? await readFile(editPath, 'utf8').catch(() => undefined) : undefined;
+				if (editPath === undefined || current === undefined) return fail('no-plan', 'No pending plan file');
 				if (args.base !== undefined && args.base !== planRevision(current)) return fail('stale', 'The plan changed since this revision; read it again');
-				const mode = (await lstat(planPath)).mode & 0o777;
-				const temporary = `${planPath}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+				const mode = (await lstat(editPath)).mode & 0o777;
+				const temporary = `${editPath}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
 				try {
 					await writeFile(temporary, args.text, { mode });
-					await rename(temporary, planPath);
+					await rename(temporary, editPath);
 				} catch (error) {
 					await rm(temporary, { force: true }).catch(() => undefined);
 					throw error;
 				}
 				this.hooks.touchPending();
 				await this.publish();
-				return { v: 1, ok: true, revision: this.hooks.source().pending?.updatedAt ?? '', plan: { text: args.text, path: planPath, revision: planRevision(args.text) } };
+				return { v: 1, ok: true, revision: this.hooks.source().pending?.updatedAt ?? '', plan: { text: args.text, path: editPath, revision: planRevision(args.text) } };
+			} else if (op === 'plan-approve') {
+				if (mission || !pending) return fail('rejected', 'No pending plan is awaiting approval');
+				if (args.revision !== undefined && typeof args.revision !== 'string') return fail('bad-request', 'args.revision must be a string');
+				const review = this.hooks.planReview();
+				if (!review) return fail('rejected', 'No plan review is open, or this OMP does not expose resolvePlanReview');
+				if (args.revision !== undefined) {
+					const planPath = this.hooks.planPath();
+					const current = planPath ? await readFile(planPath, 'utf8').catch(() => undefined) : undefined;
+					if (planPath === undefined || current === undefined) return fail('no-plan', 'No pending plan file');
+					if (args.revision !== planRevision(current)) return fail('stale', 'The plan changed since this revision; read it again');
+				}
+				// 'compact' approves and keeps the session, so the mission:pending entry survives and the mission starts on the
+				// before_agent_start 'Plan approved.' path. 'execute' would clear the session and lose the pending mission — never use it here.
+				if (!review.resolve('compact')) return fail('rejected', 'The plan review closed before it could be resolved');
+				return { v: 1, ok: true, revision: this.hooks.source().pending?.updatedAt ?? '' };
 			} else if (op === 'plan-refine') {
 				if (mission || !pending) return fail('rejected', 'No pending plan is awaiting approval');
 				if (typeof args.message !== 'string' || args.message.length < 1 || args.message.length > 8000) return fail('bad-request', 'plan-refine requires args.message of 1..8000 characters');
-				this.hooks.sendUserMessage(args.message);
+				// Route through the open review when possible so the overlay records the refinement; sendUserMessage is the fallback.
+				if (!this.hooks.planReview()?.resolve('refine', { feedback: args.message })) this.hooks.sendUserMessage(args.message);
 			} else {
 				const extra: Record<string, unknown> = {};
 				if (typeof args.beadId === 'string') extra.beadId = args.beadId;
