@@ -133,7 +133,7 @@ async function fixture(graph: Graph, leaves = true, host: { idle?: boolean; pend
     completions: (prefix: string) => completions!(prefix) ?? [], messages,
     noticeCount: (prefix: string, count: number) => { const { promise, resolve } = Promise.withResolvers<string>(); noticeWaiters.push({ prefix, count, resolve }); settleNoticeWaiters(); return promise; },
     errorCount: (count:number) => {const {promise,resolve}=Promise.withResolvers<string>();noticeWaiters.push({level:'error',count,resolve});settleNoticeWaiters();return promise;},
-    execute, cwd, state: () => loadMission(path),
+    execute, cwd, root, path, state: () => loadMission(path),
     event: (name:string,event:unknown) => events.get(name)!(event,context),
     restore: () => start({}, context),
     status: async () => {
@@ -424,3 +424,42 @@ test('a control result does not tell the coordinator to run a step the extension
     expect((await mission.status()).next.kind).toBe('hold');
   } finally { await mission.dispose(); }
 });
+
+test('a terminal quota end persists before agent_end resolves, does not wake, and continue only releases that park', async () => {
+  const flags = { idle: false, reviewRequested: false };
+  const mission = await fixture('beads', true, flags);
+  try {
+    await mission.execute({ operation: 'record_verification', passed: false, detail: 'gate failed' });
+    const before = mission.sent.length;
+    await mission.event('agent_end', { willContinue: false, messages: [{ role: 'assistant', stopReason: 'error', errorMessage: '403 You have run out of credits' }] });
+    const parked = await mission.state();
+    expect(parked.blocker).toBe('Provider quota exhausted. Restore quota or change the model, then /mission continue');
+    expect(parked.evidence.verify?.outcome).toBe('failed');
+    expect(parked.phase).not.toBe('complete');
+    flags.idle = true;
+    await expect(mission.execute({ operation: 'record_delivery', detail: 'skip' })).rejects.toThrow(/quota exhausted/);
+    expect(mission.sent.length).toBe(before);
+    await mission.event('turn_start', {});
+    expect((await mission.state()).blocker).toBeUndefined();
+    expect((await mission.state()).evidence.verify?.outcome).toBe('failed');
+    await mission.command('continue');
+    const resumed = await mission.state();
+    expect(resumed.evidence.verify?.outcome).toBe('pending');
+    expect(resumed.phase).not.toBe('complete');
+    expect(resumed.blocker).toBeUndefined();
+  } finally { await mission.dispose(); }
+});
+
+test('turn_start leaves a blocker that only mentions quota', async () => {
+  const mission = await fixture('beads', true, { idle: false, reviewRequested: false });
+  try {
+    const foreign = 'upstream quota exhausted; leave this';
+    const saved = await mission.state();
+    await saveMission(mission.path, { ...saved, blocker: foreign });
+    await mission.event('session_shutdown', {});
+    await mission.event('session_start', {});
+    await mission.event('turn_start', {});
+    expect((await mission.state()).blocker).toBe(foreign);
+  } finally { await mission.dispose(); }
+});
+

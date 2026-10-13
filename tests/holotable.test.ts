@@ -148,6 +148,28 @@ test('the status builder maps each hold state and the C5 field list', async () =
 
 	const quota = await input(baseMission(cwd, { phase: 'review', evidence: { review: { outcome: 'failed', detail: 'Reviewer quota exhausted on provider', at: 'now' } } }));
 	expect(quota.hold).toBe('quota');
+	expect(quota.complete).toBe(false);
+
+	const delivered = { verify: { outcome: 'passed' as const, detail: 'ok', revision: 'rev', at: 'now' }, deliver: { outcome: 'passed' as const, detail: 'local', at: 'now' } };
+	const credits = await input(baseMission(cwd, { phase: 'review', reviewRequested: true, evidence: { ...delivered, review: { outcome: 'failed', detail: '403 You have run out of credits', revision: 'rev', at: 'now' } } }));
+	expect(credits.hold).toBe('quota');
+	expect(credits.actions).not.toContain('review');
+	expect(credits.complete).toBe(false);
+
+	const rate = await input(baseMission(cwd, { phase: 'review', reviewRequested: true, evidence: { ...delivered, review: { outcome: 'failed', detail: 'status 429 Too Many Requests', revision: 'rev', at: 'now' } } }));
+	expect(rate.hold).toBe('none');
+	expect(rate.actions).toContain('review');
+
+	const workerQuota = await input(baseMission(cwd, {
+		workers: [{ beadId: 'b1', attempt: 'a', cwd, files: [], state: 'running', assignment: '', error: 'usage limit reached' }],
+	}));
+	expect(workerQuota.hold).toBe('quota');
+	expect(workerQuota.complete).toBe(false);
+
+	const parked = baseMission(cwd, { blocker: 'Provider quota exhausted. Restore quota or change the model, then /mission continue' });
+	const resumedQuota = await input(parked, { resumeHold: true, pending: true, step: { text: 'Approve the plan' } });
+	expect(resumedQuota.hold).toBe('quota');
+	expect(parked.phase).toBe('execute');
 
 	const plain = await input(baseMission(cwd, {
 		workspace: { key: 'k', cwd, delivery: 'pr', branch: 'feat', base: 'main' },

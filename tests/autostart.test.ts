@@ -129,3 +129,41 @@ test('restoring an old pending plan migrates its recovery into hidden session me
  expect(result.message.content).toContain('Mission started.');
  await run.events.get('session_shutdown')!({}, run.context);
 });
+
+test('a quota end parks the pending plan without sending another turn', async () => {
+  const run = await session({ bd: true, body: 'keep this plan' });
+  const before = run.sent.length;
+  await run.events.get('agent_end')!({ willContinue: false, messages: [{ role: 'assistant', stopReason: 'error', errorMessage: 'Your weekly usage quota has been exhausted' }] }, run.context);
+  const pending = run.branch.find(entry => entry.type === 'custom' && entry.customType === 'mission:pending');
+  if (!pending || pending.type !== 'custom') throw new Error('Pending entry missing');
+  const recovered = validateMission(pending.data);
+  expect(recovered.source.body).toContain('keep this plan');
+  expect(recovered.blocker).toBe('Provider quota exhausted. Restore quota or change the model, then /mission continue');
+  expect(recovered.phase).toBe('plan');
+  expect(run.sent.length).toBe(before);
+  await run.events.get('session_shutdown')!({}, run.context);
+});
+
+
+test('a quota park survives pending-plan restore and an explicit new turn preserves its scope', async () => {
+ const body = 'Keep every acceptance criterion.';
+ const run = await session({bd: true, body});
+ try {
+  await run.events.get('agent_end')!({willContinue:false,messages:[{role:'assistant',stopReason:'error',errorMessage:'402 This request requires more credits'}]},run.context);
+  const pendingEntry = () => run.branch.findLast(entry => entry.type === 'custom' && entry.customType === 'mission:pending');
+  const parked = pendingEntry();
+  if (!parked || parked.type !== 'custom') throw new Error('Pending plan missing');
+  expect(validateMission(parked.data).blocker).toMatch(/^Provider quota exhausted/);
+  for (const entry of run.branch) if (entry.type === 'custom') entry.data = structuredClone(entry.data);
+  await run.events.get('session_switch')!({},run.context);
+  await run.events.get('turn_start')!({},run.context);
+  const resumed = pendingEntry();
+  if (!resumed || resumed.type !== 'custom') throw new Error('Pending plan lost');
+  expect(validateMission(resumed.data).blocker).toBeUndefined();
+  expect(validateMission(resumed.data).source.body).toBe(body);
+  await run.events.get('before_agent_start')!(approved,run.context);
+  const saved = await loadMission((await Array.fromAsync(new Bun.Glob('missions/*/*.json').scan({cwd:run.root,absolute:true})))[0]!);
+  expect(saved.source.body).toBe(body);
+  expect(saved.phase).toBe('graph');
+ } finally { await run.events.get('session_shutdown')!({},run.context); }
+});

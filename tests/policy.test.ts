@@ -1,5 +1,5 @@
 import {test,expect} from 'bun:test';
-import {nextAction,operatorStep,operatorCommands,setMode,approveGate,enforceMutation,enforceGate,waveGate} from '../src/controller';
+import {nextAction,operatorStep,operatorCommands,setMode,approveGate,enforceMutation,enforceGate,waveGate,terminalCapacity,QUOTA_BLOCKER} from '../src/controller';
 import type {Mission,Snapshot,PolicyContext} from '../src/types';
 export function fixture(): Mission {return {version:1,id:'freeform-test',source:{kind:'freeform',id:'test',title:'test',body:'test',comments:'',extra:''},workspace:{key:'key',cwd:'/tmp',delivery:'local'},epicId:'epic',scopes:{a:['a.ts'],b:['b.ts']},phase:'execute',evidence:{},mode:'auto',keep:false,reviewRequested:false,workers:[],reviews:[],repairLinks:{},round:1,createdAt:'now',updatedAt:'now'};}
 const ready:Snapshot={beads:[{id:'a',title:'a',status:'open',children:[],ready:true,category:'ready'},{id:'b',title:'b',status:'open',children:[],ready:true,category:'ready'}],leaves:[],ready:['a','b'],closed:0,active:0,blocked:0,fetchedAt:Date.now()};ready.leaves=ready.beads;
@@ -78,6 +78,19 @@ test('operator step names the command a person must run, and stays silent when t
  m.evidence.review.detail='Your daily usage quota has been exhausted';
  expect(step(m,policy,closed).command).toBeUndefined();
  expect(step(m,policy,closed).text).toContain('provider quota');
+ for (const detail of [
+  '403 You have run out of credits or need a Grok subscription (type=personal-team-blocked:spending-limit)',
+  '402 This request requires more credits, or fewer max_tokens',
+  'You have hit your ChatGPT usage limit',
+  'resource_exhausted',
+ ]) {
+  m.evidence.review.detail=detail;
+  expect(step(m,policy,closed).command).toBeUndefined();
+  expect(step(m,policy,closed).text).toContain('provider quota');
+  expect(m.phase).toBe('execute');
+ }
+ m.evidence.review.detail='429 Too Many Requests: rate limit exceeded';
+ expect(step(m,policy,closed).command).toBe('/mission review');
  m.phase='complete';
  expect(step(m,{...policy,resumeHold:true,nativePlan:true,owned:false}).command).toBe('/mission show');
  expect(()=>enforceMutation(m,{...policy,nativePlan:true})).toThrow('native plan');
@@ -137,3 +150,41 @@ test('operatorCommands binds selected worker commands to their bead',()=>{
  m.keep=false;m.blocker='blocked upstream';
  expect(operatorCommands(m,false,closed,policy,'a')).not.toContain('reap a');
 });
+
+test('quota or rate-limit worker failures hold without completing or advertising a blind retry',()=>{
+ const m=fixture();
+ const worker={beadId:'a',attempt:'1',cwd:'/tmp',files:['a.ts'],state:'running' as const,assignment:'a',frontend:'subagent' as const,error:'403 You have run out of credits (type=personal-team-blocked:spending-limit)'};
+ m.workers=[worker];
+ const before=JSON.stringify({phase:m.phase,reviews:m.reviews,blocker:m.blocker,state:worker.state});
+ const action=nextAction(m,ready,policy);
+ expect(action.kind).toBe('hold');
+ expect(action.kind).not.toBe('complete');
+ expect(action.kind).not.toBe('resend');
+ expect(operatorStep(m,action,policy).command).toBeUndefined();
+ expect(operatorStep(m,action,policy).text).toContain('provider quota');
+ expect(operatorCommands(m,false,ready,policy,'a')).not.toContain('resend a');
+ expect(operatorCommands(m,false,ready,policy,'a')).toContain('release a');
+ expect(JSON.stringify({phase:m.phase,reviews:m.reviews,blocker:m.blocker,state:worker.state})).toBe(before);
+ m.workers=[{...worker,error:'status 429 Too Many Requests'}];
+ const limited=nextAction(m,ready,policy);
+ expect(limited.kind).toBe('hold');
+ expect(limited.detail).toContain('/mission resend when it clears');
+ expect(operatorCommands(m,false,ready,policy,'a')).toContain('resend a');
+ m.mode='pause';
+ m.workers=[{...worker,error:'worker reported it is not done'}];
+ expect(nextAction(m,ready,policy).kind).toBe('resend');
+});
+
+test('a terminal quota error parks; a clean stop and an in-flight retry do not',()=>{
+ expect(terminalCapacity([{role:'assistant',stopReason:'error',errorMessage:'Your weekly usage quota has been exhausted'}])).toBe('quota');
+ expect(terminalCapacity([{role:'assistant',stopReason:'error',errorMessage:'rate limit exceeded'}])).toBe('rate');
+ expect(terminalCapacity([{role:'assistant',stopReason:'stop',errorMessage:'quota exhausted'}])).toBeUndefined();
+ expect(terminalCapacity([])).toBeUndefined();
+ const m=fixture();
+ m.blocker=QUOTA_BLOCKER;
+ const action=nextAction(m,ready,policy);
+ expect(action.kind).toBe('hold');
+ expect(operatorCommands(m,false,ready,policy)).toContain('continue');
+ expect(operatorStep(m,action,policy).command).toBe('/mission continue');
+});
+

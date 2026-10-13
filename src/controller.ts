@@ -1,7 +1,33 @@
 import { createHash } from 'node:crypto';
 import type { Action, Gate, Graph, Mission, Mode, Phase, PolicyContext, Snapshot, Step } from './types';
 export function token(value: unknown): string { return createHash('sha256').update(JSON.stringify(value)).digest('hex'); }
-export const quotaHold = /quota.{0,80}exhausted|insufficient.{0,30}(credits|balance)/i;
+export const quotaHold = /quota.{0,80}exhausted|insufficient.{0,40}(?:credits|balance|funds)|usage[_ -]?limit|usage_limit_reached|resource[_ -]?exhausted|run out of credits|out of credits|out of (?:extra )?usage|spending[- ]?limit|personal-team-blocked|requires more credits|more credits, or fewer max_tokens/i;
+/** Transient throttle wording. OMP already retries these; the mission must not start another loop. */
+export const rateLimitHold = /\brate limit\b|too many requests|(?:http|status)[^\n]{0,16}\b429\b/i;
+export function providerCapacity(detail: string): 'quota' | 'rate' | undefined {
+ if (quotaHold.test(detail)) return 'quota';
+ if (rateLimitHold.test(detail)) return 'rate';
+ return undefined;
+}
+/** Persisted coordinator park. `/mission continue` clears it; it is not a completed mission. */
+export const QUOTA_BLOCKER = 'Provider quota exhausted. Restore quota or change the model, then /mission continue';
+export function quotaBlocked(m: Pick<Mission, 'blocker' | 'workers' | 'evidence'>): boolean {
+ if (m.blocker && quotaHold.test(m.blocker)) return true;
+ if (m.evidence.review?.outcome === 'failed' && quotaHold.test(m.evidence.review.detail)) return true;
+ return m.workers.some(worker => worker.state !== 'closed' && !!worker.error && quotaHold.test(worker.error));
+}
+/** Last assistant error of a finished turn. A clean stop is not a hold, so an OMP fallback success is left alone. */
+export function terminalCapacity(messages: readonly unknown[]): 'quota' | 'rate' | undefined {
+ for (let i = messages.length - 1; i >= 0; i--) {
+  const message = messages[i];
+  if (!message || typeof message !== 'object') continue;
+  const row = message as { role?: string; stopReason?: string; errorMessage?: string };
+  if (row.role !== 'assistant') continue;
+  if (row.stopReason !== 'error') return undefined;
+  return providerCapacity(row.errorMessage ?? '');
+ }
+ return undefined;
+}
 export function reviewFailureStep(detail:string,completed=0,total=0):Step{
  const progress=total?` (${completed}/${total} reviewers complete)`:'';
  if(quotaHold.test(detail))return {text:`Review blocked by provider quota${progress}. Restore quota or configure a funded review model, then /mission review`};
@@ -73,6 +99,14 @@ export function nextAction(m: Mission, snapshot: Snapshot | undefined, policy: P
   const stalled = workers.filter(worker => worker.state === 'awaiting-claim' && !worker.error && worker.launchedAt && Date.now() - Date.parse(worker.launchedAt) > CLAIM_STALL_MS && snapshot.leaves.some(bead => bead.id === worker.beadId && bead.category === 'ready'));
   if (stalled.length) return {kind: 'resend', detail: `No claim ${Math.round(CLAIM_STALL_MS / 60000)}+ min after launch: ${stalled.map(worker => worker.beadId).join(', ')}. Inspect the tab, then resend once`, ids: stalled.map(worker => worker.beadId).sort()};
   const stopped = workers.filter(worker => worker.frontend === 'subagent' && worker.error && worker.state !== 'missing');
+  const capped = stopped.filter(worker => providerCapacity(worker.error ?? ''));
+  if (capped.length) {
+   const quota = capped.filter(worker => providerCapacity(worker.error ?? '') === 'quota');
+   const shown = (quota.length ? quota : capped).map(worker => `${worker.beadId} (${worker.error!.slice(0, 180)})`).join('; ');
+   return {kind: 'hold', detail: quota.length
+    ? `Worker blocked by provider quota: ${shown}. Restore quota or change the worker model, then /mission resend`
+    : `Worker rate-limited after the provider retry: ${shown}. /mission resend when it clears`};
+  }
   if (workers.some(worker => worker.state === 'missing' || (worker.error && worker.frontend !== 'subagent'))) return {kind: 'hold', detail: 'Worker identity or claim requires recovery'};
   const outstanding = snapshot.leaves.filter(bead => bead.category !== 'closed');
   if (outstanding.length) {
@@ -137,9 +171,9 @@ export function operatorCommands(m: Mission | undefined, pending: boolean, snaps
  // worker or a frontend without a tab would surface a guaranteed failure instead.
  if (worker?.handle && worker.state !== 'closed' && ['orca', 'herdr'].includes(worker.frontend ?? 'orca')) commands.push(`focus ${worker.beadId}`);
  if (!m || m.phase === 'complete' || p.nativePlan || operation) return commands;
- if (p.resumeHold || !p.owned || m.evidence.verify?.outcome==='failed') commands.push('continue');
+ if (p.resumeHold || !p.owned || m.evidence.verify?.outcome==='failed' || m.blocker?.startsWith(QUOTA_BLOCKER)) commands.push('continue');
  commands.push('mode');
- if (m.evidence.deliver?.outcome === 'passed' && m.evidence.verify?.outcome !== 'failed') commands.push('review');
+ if (m.evidence.deliver?.outcome === 'passed' && m.evidence.verify?.outcome !== 'failed' && !quotaBlocked(m)) commands.push('review');
  if (m.gate && !m.gate.approved && p.owned && !p.resumeHold && m.evidence.verify?.outcome !== 'failed') commands.push('approve');
  const action = nextAction(m, snapshot, p);
  if (action.kind === 'dispatch') commands.push('dispatch');
@@ -148,7 +182,7 @@ export function operatorCommands(m: Mission | undefined, pending: boolean, snaps
  const mutable = p.owned && !p.resumeHold && !m.blocker && m.evidence.verify?.outcome !== 'failed' && !!snapshot && !snapshot.error && p.fresh;
  if (mutable && action.kind === 'resend') for (const id of action.ids ?? []) if (!commands.includes(`resend ${id}`)) commands.push(`resend ${id}`);
  if (mutable && worker) {
-  if (worker.frontend === 'subagent' ? worker.state !== 'closed' && !!worker.error : worker.state === 'awaiting-claim' && !!worker.handle) if (!commands.includes(`resend ${worker.beadId}`)) commands.push(`resend ${worker.beadId}`);
+  if (worker.frontend === 'subagent' ? worker.state !== 'closed' && !!worker.error && providerCapacity(worker.error) !== 'quota' : worker.state === 'awaiting-claim' && !!worker.handle) if (!commands.includes(`resend ${worker.beadId}`)) commands.push(`resend ${worker.beadId}`);
   if (worker.frontend === 'subagent' && worker.state !== 'closed') commands.push(`release ${worker.beadId}`);
   if (!m.keep && worker.handle && snapshot?.leaves.some(bead => bead.id === worker.beadId && bead.category === 'closed')) commands.push(`reap ${worker.beadId}`);
  }
@@ -164,7 +198,7 @@ export function operatorStep(m: Mission, action: Action, p: PolicyContext, owner
  if (ownershipError) return {command: '/mission continue', text: `Lost control of the mission (${ownershipError}); take it back`};
  if (p.resumeHold) return {command: '/mission continue', text: 'Take control of this resumed mission'};
  if (action.gate) return {command: '/mission approve', text: action.gate.detail};
- if (m.blocker) return {command: '/mission', text: m.blocker};
+ if (m.blocker) return {command: m.blocker.startsWith(QUOTA_BLOCKER) ? '/mission continue' : '/mission', text: m.blocker};
  if(verificationParked(m))return {command:'/mission continue',text:`Verification blocked: ${m.evidence.verify!.detail}. Continue releases the hold so the fix can be bound and dispatched; it does not mark the blocker fixed`};
  if (action.kind === 'resend' && action.ids?.length) return {command: `/mission resend ${action.ids[0]}`, text: action.detail};
  if (action.kind === 'hold') {

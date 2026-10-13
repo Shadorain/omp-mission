@@ -14,7 +14,7 @@ import { acquireOwnership, listMissions, loadMission, missionId, missionPath, sa
 import type { Ownership } from './store';
 import { readClaimActor, readGraph, readHistory } from './beads';
 import { createWorkerDriver } from './workers';
-import { approveGate, autoDispatchAllowed, consumeGate, displayPhase, effectiveGraph, enforceGate, enforceMutation, nextAction, operatorCommands, operatorStep, requireBeadsGraph, revisionGate, reviewFailureStep, setMode, waveGate } from './controller';
+import { approveGate, autoDispatchAllowed, consumeGate, displayPhase, effectiveGraph, enforceGate, enforceMutation, nextAction, operatorCommands, operatorStep, QUOTA_BLOCKER, requireBeadsGraph, revisionGate, reviewFailureStep, setMode, terminalCapacity, waveGate } from './controller';
 import { alignVerifiedRevision, captureRevision, Reviewer, roleModelString } from './review';
 import { beadTask, coordinatorPrompt, guide, planSlug, workerPrompt } from './prompts';
 import { createMissionWidget, createMissionInspector, phaseLabel } from './ui';
@@ -101,6 +101,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
  function policy(context:ExtensionContext){return {resumeHold,owned:!!ownership&&!ownershipError,nativePlan:nativePlan(context),fresh:!!snapshot&&!snapshot.error&&Date.now()-snapshot.fetchedAt<35000,maxWorkers:config.maxWorkers};}
  // A hint is attached once per distinct text. The action detail is always sent, so recovery does not depend on it.
  let guided='';
+ let providerHold: 'quota' | 'rate' | undefined;
  function withGuide(next:Action|undefined,always:boolean):NextView|undefined{if(!next)return undefined;const text=guide(next.kind,next);const key=text?`${next.kind}:${text}`:'';if(!text||(!always&&guided===key))return next;guided=key;return {...next,guide:text};}
  function status(context:ExtensionContext,brief=false){const action=mission?nextAction(mission,snapshot,policy(context)):undefined;const running=action?extensionRuns(context,action):undefined;const next=withGuide(running?{kind:'hold',detail:`The extension is running ${running==='review'?'the review':'the wave'} itself and wakes you when it ends. Do not call ${running==='review'?'run_review':'dispatch'}; wait.`}:action,!brief);return (brief?briefView:statusView)({mission,pending,snapshot,resumeHold,ownershipError,next});}
 
@@ -170,8 +171,8 @@ export default async function missionExtension(pi: ExtensionAPI) {
  }
  async function acquire(){if(!mission||!path)throw new Error('No saved mission');if(ownership){await ownership.assertOwned();return;}ownershipError=undefined;ownership=await acquireOwnership(path,mission,error=>{ownershipError=`Controller lost: ${error.message}`;resumeHold=true;lastWake='';void reviewer.dispose();void render();});mission=ownership.mission;mission.controllerNonce=ownership.nonce;}
  async function release(){const current=ownership;ownership=undefined;await current?.release();await holotable.close();}
- async function detach(context?:ExtensionContext){generation++;coordinatorShells.clear();lifetime.abort();lifetime=new AbortController();terminalInputDispose?.();terminalInputDispose=undefined;overlayAbort?.abort();overlayAbort=undefined;if(timer&&ctx)ctx.clearTimer(timer);timer=undefined;await reviewer.dispose();await workerAgents.abortAll();await release();await publishStatus();ctx?.ui.setWidget('mission',undefined);ctx=context;mission=undefined;pending=undefined;path=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;lastWake='';guided='';selected=undefined;history=undefined;lastPoll=0;outlineOffset=0;inspectionIntent={};subagents=[];reviewRows=[];planReviewId=undefined;}
- async function attach(file:string,context:ExtensionContext,announce=true){await release();mission=await loadMission(file);path=file;pending=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;ctx=context;await refresh(false);await render();await openSocket(mission.id);await publishStatus();
+ async function detach(context?:ExtensionContext){generation++;providerHold=undefined;coordinatorShells.clear();lifetime.abort();lifetime=new AbortController();terminalInputDispose?.();terminalInputDispose=undefined;overlayAbort?.abort();overlayAbort=undefined;if(timer&&ctx)ctx.clearTimer(timer);timer=undefined;await reviewer.dispose();await workerAgents.abortAll();await release();await publishStatus();ctx?.ui.setWidget('mission',undefined);ctx=context;mission=undefined;pending=undefined;path=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;lastWake='';guided='';selected=undefined;history=undefined;lastPoll=0;outlineOffset=0;inspectionIntent={};subagents=[];reviewRows=[];planReviewId=undefined;}
+ async function attach(file:string,context:ExtensionContext,announce=true){providerHold=undefined;await release();mission=await loadMission(file);path=file;pending=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;ctx=context;await refresh(false);await render();await openSocket(mission.id);await publishStatus();
   const step=announce?currentStep(context):undefined;
   if(step)context.ui.notify(`${displaySourceId(mission.source)} · ${phaseLabel(displayPhase(mission,snapshot))}. ${step.command?`Next: ${step.command} — `:''}${step.text}. /mission opens the action menu.`,'info');
  }
@@ -273,7 +274,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
   await persist(m);await render();
   context.ui.notify('Mission complete: verified, delivered and independently reviewed clean. /mission clear starts fresh.','info');
  }
- async function wakeCoordinator(){if(quiet||!ctx||!mission||operation||!eligible(ctx))return;const action=nextAction(mission,snapshot,policy(ctx));if(action.gate){mission.gate=action.gate;if(ownership&&!resumeHold)await persist(mission);await render();return;}if(action.kind==='hold')return;if(action.kind==='complete'){await finishMission(ctx).catch(error=>ctx?.ui.notify(`Could not mark the mission complete: ${error instanceof Error?error.message:String(error)}`,'warning'));return;}if(await autoDispatch(ctx,action))return;if(autoReview(ctx,action))return;
+ async function wakeCoordinator(){if(quiet||!ctx||!mission||operation||!eligible(ctx)||providerHold==='rate')return;const action=nextAction(mission,snapshot,policy(ctx));if(action.gate){mission.gate=action.gate;if(ownership&&!resumeHold)await persist(mission);await render();return;}if(action.kind==='hold')return;if(action.kind==='complete'){await finishMission(ctx).catch(error=>ctx?.ui.notify(`Could not mark the mission complete: ${error instanceof Error?error.message:String(error)}`,'warning'));return;}if(await autoDispatch(ctx,action))return;if(autoReview(ctx,action))return;
  // A guide is attached once per distinct hint. The action detail is always sent, so recovery does not depend on the hint.
  if(!ctx.isIdle()||ctx.hasPendingMessages())return;const signature=JSON.stringify([mission.id,mission.round,action.kind,action.ids,mission.evidence.verify?.revision,mission.reviews.length,action.detail]);if(signature===lastWake)return;lastWake=signature;const view=withGuide(action,false)!;pi.sendUserMessage(`Mission: ${action.detail}${action.ids?.length?` [${action.ids.join(', ')}]`:''}. Next: ${action.kind}. ${view.guide??''}`.trim(),{attribution:'agent'});}
  async function request(context:ExtensionContext,op:string,extra:Record<string,unknown>={}){
@@ -484,13 +485,13 @@ export default async function missionExtension(pi: ExtensionAPI) {
     pi.appendEntry('mission:pointer',{path:null,ignoredPaths:[...ignoredPaths]});
     await detach(context);if(dropped)await holotable.discard(dropped).catch(()=>undefined);startPolling(context);await refreshCompletionSources();await render();return status(context,true);
    }
-   if(params.operation==='start'){if(mission)throw new Error('Mission already started');if(!pending)throw new Error('Resolve /mission source first');mission=pending;pending=undefined;path=missionPath(agentDir,mission);await acquire();resumeHold=false;mission.phase='isolate';mission.evidence.plan={outcome:'passed',detail:'Operator approved plan or explicit Force start',at:new Date().toISOString()};await persist(mission);pi.appendEntry('mission:pointer',{path,ignoredPaths:[...ignoredPaths]});await writeSourceFile(mission);}
+   if(params.operation==='start'){if(mission)throw new Error('Mission already started');if(!pending)throw new Error('Resolve /mission source first');mission=pending;pending=undefined;path=missionPath(agentDir,mission);await acquire();resumeHold=false;providerHold=undefined;mission.phase='isolate';mission.evidence.plan={outcome:'passed',detail:'Operator approved plan or explicit Force start',at:new Date().toISOString()};await persist(mission);pi.appendEntry('mission:pointer',{path,ignoredPaths:[...ignoredPaths]});await writeSourceFile(mission);}
    else if(params.operation==='continue'){
     if(mission?.evidence.verify?.outcome==='failed'&&!internal.operator)throw new Error('Verification is held; the operator must run /mission continue after resolving the blocker');
     if(!mission)throw new Error('No saved mission');await acquire();const mode=params.mode??inspectionIntent.mode;if(mode)setMode(mission,mode);
     if(inspectionIntent.reviewRequested){mission.reviewRequested=true;if(mission.evidence.review?.outcome==='failed')delete mission.evidence.review;}
     if(mission.evidence.verify?.outcome==='failed')mission.evidence.verify={...mission.evidence.verify,outcome:'pending'};
-    if(params.keep!==undefined)mission.keep=params.keep;resumeHold=false;await persist(mission);inspectionIntent={};pi.appendEntry('mission:pointer',{path,ignoredPaths:[...ignoredPaths]});
+    if(params.keep!==undefined)mission.keep=params.keep;resumeHold=false;if(mission.blocker?.startsWith(QUOTA_BLOCKER))delete mission.blocker;providerHold=undefined;await persist(mission);inspectionIntent={};pi.appendEntry('mission:pointer',{path,ignoredPaths:[...ignoredPaths]});
     await refresh(false);
    }
    else{
@@ -691,7 +692,21 @@ export default async function missionExtension(pi: ExtensionAPI) {
  pi.on('before_subagent_spawn',(event)=>{subagents=noteSubagentSpawn(subagents,{agent:event.agent,invocationKind:event.invocationKind,spawnKey:event.spawnKey});void render();});
  pi.on('tool_execution_start',(event)=>{subagents=noteSubagentToolStart(subagents,event);void render();});
  pi.on('tool_execution_end',(event)=>{subagents=noteSubagentToolEnd(subagents,event);void render();});
- pi.on('agent_end',()=>{subagents=noteSubagentTurnEnd(subagents);void render();});
+ async function noteProviderStop(messages: readonly unknown[]){
+  const kind=terminalCapacity(messages);
+  if(kind==='rate'){providerHold='rate';await render();return;}
+  if(kind!=='quota'){providerHold=undefined;return;}
+  providerHold='quota';
+  const target=mission??pending;
+  if(target&&!target.blocker){
+   target.blocker=QUOTA_BLOCKER;
+   if(target===pending)pi.appendEntry('mission:pending',pending);
+   if(target===mission&&ownership&&!resumeHold){try{await persist(mission);}catch{/* in-memory park still stops the next wake */}}
+  }
+  await render();
+ }
+ pi.on('agent_end',async(event)=>{subagents=noteSubagentTurnEnd(subagents);if(!event.willContinue)await noteProviderStop(event.messages);else await render();});
+ pi.on('turn_start',async()=>{const parked=(mission??pending)?.blocker;const ours=parked?.startsWith(QUOTA_BLOCKER)===true;if(ours){if(mission?.blocker?.startsWith(QUOTA_BLOCKER))delete mission.blocker;if(pending?.blocker?.startsWith(QUOTA_BLOCKER)){delete pending.blocker;pi.appendEntry('mission:pending',pending);}}providerHold=undefined;if(ours&&mission&&ownership&&!resumeHold){try{await persist(mission);}catch{/* the in-memory park is already cleared */}}});
  pi.events.on('mission:query',(request:unknown)=>{
   if(!isRecord(request)||typeof request.cwd!=='string'||typeof request.reply!=='function'||!ctx||!eligible(ctx)||!mission||request.cwd!==ctx.cwd)return;
   request.reply({workspace:mission.workspace.cwd,beadsDir:mission.workspace.beadsDir,epicId:mission.epicId,graph:effectiveGraph(mission),mode:mission.mode,hold:nativePlan(ctx)?'Native plan mode':resumeHold?'Resume hold':ownershipError??(!ownership?'Controller ownership required':false),projection:snapshot?{ready:snapshot.ready,closed:snapshot.closed,total:snapshot.leaves.length,error:snapshot.error}:undefined});

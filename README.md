@@ -121,7 +121,7 @@ Startup shows the ticket title and a readable specification-file path, not a tic
 
 The header labels dependency-waiting tasks as **waiting** with a neutral indicator. Only explicitly blocked beads use the error indicator; waiting for another worker is not a failed task.
 
-A quota-exhausted reviewer stays blocked; restore provider quota or configure a funded review model before retrying `/mission review`. The extension never substitutes a reviewer or marks a failed review clean.
+Provider quota or credit exhaustion parks the coordinator, worker or reviewer without completing the mission or discarding its pending plan. OMP owns transient retries and model fallback; the mission does not start a second retry loop. Restore quota or change the model, then use `/mission continue` for a parked coordinator, `/mission resend <bead-id>` for a worker, or `/mission review` for a review. Holotable Recovery leaves quota-held contacts alone.
 
 A failed `record_verification` is a durable hold. The model cannot record success or release it. After resolving the blocker, the operator runs `/mission continue`; verification becomes pending, not passed.
 
