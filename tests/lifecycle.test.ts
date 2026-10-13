@@ -15,7 +15,7 @@ type Execute = (id: string, params: Params, signal: undefined, update: undefined
 type EventHandler = (event: unknown, context: ExtensionContext) => Promise<unknown>;
 const noRun: Run = async () => { throw new Error('Unexpected command'); };
 
-async function fixture(graph: Graph, leaves = true, host: { idle?: boolean; pending?: boolean; resumed?: boolean; unreviewed?: boolean; clean?: boolean; complete?: boolean; plan?: boolean; otherCheckout?: boolean; linearCheckout?: boolean; archived?: boolean; prBase?: string; delivered?: boolean; reviewRequested?: boolean; legacyFingerprint?: boolean } = {}) {
+async function fixture(graph: Graph, leaves = true, host: { idle?: boolean; pending?: boolean; resumed?: boolean; unreviewed?: boolean; clean?: boolean; complete?: boolean; plan?: boolean; otherCheckout?: boolean; linearCheckout?: boolean; archived?: boolean; prBase?: string; delivered?: boolean; reviewRequested?: boolean; legacyFingerprint?: boolean; mergeConflict?: boolean } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'mission-lifecycle-'));
   const cwd = join(root, 'workspace');
   await mkdir(cwd);
@@ -29,6 +29,7 @@ async function fixture(graph: Graph, leaves = true, host: { idle?: boolean; pend
     ...(graph === 'beads' ? { epicId: 'epic' } : {}),
   };
   const revision = (await captureRevision(mission, noRun)).revision;
+  if (host.mergeConflict) { mission.workspace.commonDir = '.git'; mission.workspace.base = 'main'; }
   if (graph === 'local') {
     mission.phase = 'review';
     mission.evidence.verify = { outcome: 'passed', revision, detail: 'before', at: 'now' };
@@ -96,6 +97,10 @@ async function fixture(graph: Graph, leaves = true, host: { idle?: boolean; pend
       const bdIndex = args.indexOf('bd');
       if (command === 'env' && bdIndex >= 0) args = args.slice(bdIndex + 1);
       else if (command === 'git') {
+        if (host.mergeConflict) {
+          if (args[0] === 'rev-parse') return { code: 0, stdout: 'main\n', stderr: '' };
+          if (args[0] === 'merge-tree') return { code: 1, stdout: `deadbeef\0task.txt\0`, stderr: '' };
+        }
         if (!host.otherCheckout && !host.linearCheckout) return { code: 128, stdout: '', stderr: 'not a git repository' };
         const stdout = args[1] === '--show-toplevel' ? cwd : args[1] === '--git-common-dir' ? join(root, '.git') : args[0] === 'branch' ? 'chr-143-domain-error-2' : args[0] === 'config' ? 'main' : '';
         return { code: stdout ? 0 : 1, stdout, stderr: '' };
@@ -370,6 +375,18 @@ test('a clean review of the verified revision completes the mission in the exten
     expect(mission.completions('').map(item => item.label)).not.toContain('smoke');
     expect(mission.completions('').map(item => item.label)).toContain('clear');
     expect(mission.completions('history ').map(item => item.value)).toContain('history smoke ');
+  } finally { await mission.dispose(); }
+});
+
+test('a branch that conflicts with its base cannot complete: verification reopens with the contested paths', async () => {
+  const mission = await fixture('local', true, { idle: true, clean: true, resumed: true, mergeConflict: true });
+  try {
+    await mission.execute({ operation: 'continue' });
+    const saved = await mission.state();
+    expect(saved.phase).toBe('verify');
+    expect(saved.evidence.complete).toBeUndefined();
+    expect(saved.evidence.verify?.outcome).toBe('failed');
+    expect(saved.evidence.verify?.detail).toContain('task.txt');
   } finally { await mission.dispose(); }
 });
 

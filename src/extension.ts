@@ -27,6 +27,7 @@ import { copyPlanFile, sourceFilePath, writeSourceFile } from './hosts';
 import { noteSubagentSpawn, noteSubagentToolEnd, noteSubagentToolStart, noteSubagentTurnEnd } from './subagents';
 import { checkToolCall, fingerprintScopes, implementationScopes, isImplementationPath, mutatedPaths, type GuardScope } from './coordinator-guard';
 import { autostartMessage, envBase, envCheckout, envDelivery, envGraph, gateTokenId, HolotableBridge } from './holotable';
+import { mergeConflictPaths } from './mergecheck';
 
 const controls = ['show','clear','continue','mode','approve','review','history','focus','resend','release','dispatch','reap','actions','config'];
 export function nativePlan(ctx: ExtensionContext): boolean {
@@ -262,18 +263,32 @@ export default async function missionExtension(pi: ExtensionAPI) {
   const options=context.localProtocolOptions;if(!options)return;
   try{await copyPlanFile(m,resolveLocalUrlToPath(`local://${planSlug(m.source)}-plan.md`,options));}catch{/* no plan written (forced run, or local graph) */}
  }
- // A clean independent review of the verified revision ends the mission. That is bookkeeping, not judgement: recording it here saves the
- // coordinator a full-context turn (~$0.24 on a large session) that only answers "complete", and fixes a mission re-verified after its
- // review (a PR retarget, say) that otherwise stays in phase `review` forever.
- async function finishMission(context:ExtensionContext){
-  const m=mission;const review=m?.reviews.at(-1);if(!m||!review||!ownership||resumeHold||ownershipError)return;
-  await ownership.assertOwned();
-  m.phase='complete';
-  m.evidence.complete={outcome:'passed',detail:'Verification, delivery and independent review complete',revision:review.revision,at:new Date().toISOString()};
-  if(m.evidence.repair?.outcome==='active')m.evidence.repair={...m.evidence.complete};
-  await persist(m);await render();
-  context.ui.notify('Mission complete: verified, delivered and independently reviewed clean. /mission clear starts fresh.','info');
+// A clean independent review of the verified revision ends the mission. That is bookkeeping, not judgement: recording it here saves the
+// coordinator a full-context turn (~$0.24 on a large session) that only answers "complete", and fixes a mission re-verified after its
+// review (a PR retarget, say) that otherwise stays in phase `review` forever.
+// tryComplete is the single gate before phase `complete`: a branch that still conflicts with its base is marked
+// verify-failed instead, so the normal verify/repair machinery drives the merge resolution rather than landing a conflict.
+async function tryComplete(m:Mission,evidence:Omit<Evidence,'outcome'>){
+ const conflicts=await mergeConflictPaths(m,run);
+ if(conflicts&&conflicts.length){
+  m.evidence.verify={outcome:'failed',detail:`Branch conflicts with ${m.workspace.base}: ${conflicts.join(', ')}. Merge ${m.workspace.base} into this branch and resolve before completion.`,at:new Date().toISOString()};
+  delete m.evidence.deliver;
+  m.phase='verify';
+  return false;
  }
+ m.phase='complete';
+ m.evidence.complete={...evidence,outcome:'passed'};
+ if(m.evidence.repair?.outcome==='active')m.evidence.repair={...m.evidence.complete};
+ return true;
+}
+async function finishMission(context:ExtensionContext){
+ const m=mission;const review=m?.reviews.at(-1);if(!m||!review||!ownership||resumeHold||ownershipError)return;
+ await ownership.assertOwned();
+ const done=await tryComplete(m,{detail:'Verification, delivery and independent review complete',revision:review.revision,at:new Date().toISOString()});
+ await persist(m);await render();
+ if(!done){context.ui.notify(`Merge check: ${m.evidence.verify?.detail}`,'warning');return;}
+ context.ui.notify('Mission complete: verified, delivered and independently reviewed clean. /mission clear starts fresh.','info');
+}
  async function wakeCoordinator(){if(quiet||!ctx||!mission||operation||!eligible(ctx)||providerHold==='rate')return;const action=nextAction(mission,snapshot,policy(ctx));if(action.gate){mission.gate=action.gate;if(ownership&&!resumeHold)await persist(mission);await render();return;}if(action.kind==='hold')return;if(action.kind==='complete'){await finishMission(ctx).catch(error=>ctx?.ui.notify(`Could not mark the mission complete: ${error instanceof Error?error.message:String(error)}`,'warning'));return;}if(await autoDispatch(ctx,action))return;if(autoReview(ctx,action))return;
  // A guide is attached once per distinct hint. The action detail is always sent, so recovery does not depend on the hint.
  if(!ctx.isIdle()||ctx.hasPendingMessages())return;const signature=JSON.stringify([mission.id,mission.round,action.kind,action.ids,mission.evidence.verify?.revision,mission.reviews.length,action.detail]);if(signature===lastWake)return;lastWake=signature;const view=withGuide(action,false)!;pi.sendUserMessage(`Mission: ${action.detail}${action.ids?.length?` [${action.ids.join(', ')}]`:''}. Next: ${action.kind}. ${view.guide??''}`.trim(),{attribution:'agent'});}
@@ -560,9 +575,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
      mission.reviews.push(result);
      mission.evidence.review = {outcome:'passed',detail:result.summary,revision:result.revision,at:result.at};
      if (!result.findings.length) {
-      mission.phase = 'complete';
-      mission.evidence.complete = {outcome:'passed',detail:'Verification, delivery and independent review complete',revision:result.revision,at:result.at};
-      if (mission.evidence.repair?.outcome === 'active') mission.evidence.repair = {...mission.evidence.complete};
+      await tryComplete(mission,{detail:'Verification, delivery and independent review complete',revision:result.revision,at:result.at});
      }
     }else if(params.operation==='accept_repairs'){
      const review = mission.reviews.at(-1);
@@ -595,8 +608,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
      }
      await refresh(false);
      if (nextAction(mission, snapshot, policy(context)).kind === 'complete') {
-      mission.phase = 'complete';
-      mission.evidence.complete = evidence;
+      await tryComplete(mission,evidence);
      }
     }else if(params.operation==='resend'||params.operation==='release'||params.operation==='reap'){
      requireBeadsGraph(mission);if(!params.beadId)throw new Error('beadId required');await refresh(false);
