@@ -258,7 +258,8 @@ export default async function missionExtension(pi: ExtensionAPI) {
   finally{refreshing=false;}
  }
  const dispatchSignature=(m:Mission,action:Action)=>JSON.stringify([m.id,m.round,action.ids,m.workers.length]);
- const reviewSignature=(m:Mission)=>JSON.stringify([m.id,m.round,m.evidence.verify?.revision,m.reviews.length]);
+ // The attempt count is part of it: a failed run is not restarted by itself, but a scheduled transient retry is a new attempt.
+ const reviewSignature=(m:Mission)=>JSON.stringify([m.id,m.round,m.evidence.verify?.revision,m.reviews.length,m.evidence.review?.attempts??0]);
  // The step the extension starts by itself once the current operation ends. A control result must not tell the coordinator to run it too:
  // the model's own call raced the extension's and failed ("Workers running", "Mission operation already running").
  function extensionRuns(context:ExtensionContext,action:Action):'dispatch'|'review'|undefined{
@@ -585,7 +586,8 @@ async function finishMission(context:ExtensionContext){
      if(!(action.kind==='review'||action.kind==='hold'&&action.gate?.kind==='review')||!mission.reviewRequested||mission.evidence.verify?.outcome!=='passed'||mission.evidence.deliver?.outcome!=='passed')throw new Error(action.detail);
      if(mission.workspace.delivery==='pr')await assertPrBase(mission);
      const revision=alignVerifiedRevision(mission,await captureRevision(mission,run));
-     enforceGate(mission,revisionGate(mission,'review',revision));mission.phase='review';mission.evidence.review={outcome:'active',detail:'Independent reviewer running',revision,at:new Date().toISOString()};await persist(mission);reviewStarted=true;reviewRows=[];await render();
+     const prior=mission.evidence.review;const failedBefore=prior?.outcome==='failed'&&prior.revision===mission.evidence.verify?.revision?prior.attempts??1:0;
+     enforceGate(mission,revisionGate(mission,'review',revision));mission.phase='review';mission.evidence.review={outcome:'active',detail:'Independent reviewer running',revision,at:new Date().toISOString(),...(failedBefore?{attempts:failedBefore}:{})};await persist(mission);reviewStarted=true;reviewRows=[];await render();
      const reviewFiles=await contextFilesFor(config.reviewContext,mission.workspace.cwd,agentDir);const targets=config.frontend==='subagent'&&mission.graph==='beads'&&snapshot?snapshot.leaves.filter(b=>mission!.scopes[b.id]?.length).map(b=>({id:b.id,title:b.title,text:beadTask(b)??b.title,files:mission!.scopes[b.id]!})):[];const result=targets.length>1?await reviewer.runPerBead(mission,context,run,config.modelRole,reviewFiles,targets):await reviewer.run(mission,context,run,config.modelRole,reviewFiles);if(epoch!==generation)throw new Error('Session changed during review');
      consumeGate(mission);
      mission.reviews.push(result);
@@ -636,7 +638,7 @@ async function finishMission(context:ExtensionContext){
     if(epoch!==generation)throw new Error('Session changed during operation');await persist(mission);
    }
    await render();return status(context,true);
-  }catch(error){if(epoch===generation&&mission&&ownership&&reviewStarted){mission.evidence.review={outcome:'failed',detail:String(error),revision:mission.evidence.verify?.revision,at:new Date().toISOString()};await persist(mission);}await render();throw error;}
+  }catch(error){if(epoch===generation&&mission&&ownership&&reviewStarted){mission.evidence.review={outcome:'failed',detail:String(error),revision:mission.evidence.verify?.revision,at:new Date().toISOString(),attempts:(mission.evidence.review?.attempts??0)+1};await persist(mission);}await render();throw error;}
   finally{_signal?.removeEventListener('abort',cancelReview);operation=false;operationSignal=undefined;if(epoch===generation){lastWake='';await wakeCoordinator();}}
  }
  pi.registerTool({name:'mission_control',defaultInactive:true,loadMode:'essential',label:'Mission control',description:'Drive approved mission phases/workers/review. Every operation preserves native approvals, Pause gates, resume hold and ownership.',approval:'exec',parameters:controlSchema,execute:async(_id,rawParams,signal,_update,context)=>({content:[{type:'text',text:JSON.stringify(await control(rawParams,context,signal))}],details:{}})});

@@ -34,6 +34,28 @@ export function reviewFailureStep(detail:string,completed=0,total=0):Step{
  if(/deadline exceeded|timed out|timeout/i.test(detail))return {command:'/mission review',text:`Review timed out${progress}.${completed?' Retry only failed reviewers; completed results are retained':' Retry the failed review'}`};
  return {command:'/mission review',text:`Review failed${progress}.${completed?' Retry only failed reviewers; completed results are retained':' Retry it'}`};
 }
+/** Review failures a later run clears by itself: throttles, provider overload, dropped connections, a reviewer deadline. Quota needs a person. */
+const transientReview = /deadline exceeded|timed out|timeout|overloaded|rate_limit_error|\b(?:502|503|504|529)\b|internal server error|econnreset|socket hang up|fetch failed|network error/i;
+export const REVIEW_RETRIES = 3;
+const REVIEW_BACKOFF_MS = [2 * 60_000, 10 * 60_000, 30 * 60_000];
+const MAX_RETRY_AFTER_MS = 6 * 3600_000;
+/**
+ * When a failed review reruns without the operator, or undefined when it waits for `/mission review`.
+ * Honors the provider's retry-after, and spreads missions that failed together (one rate limit hits
+ * every concurrent review) by up to a quarter of the wait, keyed on the mission id.
+ */
+export function reviewRetryAt(m: Pick<Mission, 'id' | 'evidence'>): number | undefined {
+ const review = m.evidence.review;
+ if (review?.outcome !== 'failed' || quotaHold.test(review.detail)) return undefined;
+ if (!rateLimitHold.test(review.detail) && !transientReview.test(review.detail)) return undefined;
+ const attempts = review.attempts ?? 1;
+ if (attempts > REVIEW_RETRIES) return undefined;
+ const asked = Number(/retry-after-ms=(\d+)/.exec(review.detail)?.[1] ?? 0);
+ const wait = Math.min(Math.max(REVIEW_BACKOFF_MS[attempts - 1]!, asked), MAX_RETRY_AFTER_MS);
+ const spread = Math.floor(parseInt(token(m.id).slice(0, 4), 16) / 0xffff * wait / 4);
+ const failedAt = Date.parse(review.at);
+ return Number.isFinite(failedAt) ? failedAt + wait + spread : undefined;
+}
 export function displayPhase(m: Mission, snapshot?: Snapshot): Phase {
  if (['complete','plan','isolate','graph'].includes(m.phase)) return m.phase;
  if (m.workers.some(worker=>worker.state!=='closed') || snapshot?.leaves.some(bead=>bead.category!=='closed')) return m.phase;
@@ -141,7 +163,9 @@ export function nextAction(m: Mission, snapshot: Snapshot | undefined, policy: P
  if (!revision) return {kind: 'hold', detail: 'Verification fingerprint missing'};
  const reviewEvidence = m.evidence.review;
  if (reviewEvidence?.outcome === 'failed' && reviewEvidence.revision === revision) {
-  return {kind: 'hold', detail: `Review failed; /mission review explicitly retries: ${reviewEvidence.detail}`};
+  const retryAt = reviewRetryAt(m);
+  if (retryAt === undefined) return {kind: 'hold', detail: `Review failed; /mission review explicitly retries: ${reviewEvidence.detail}`};
+  if (Date.now() < retryAt) return {kind: 'hold', detail: `Review retries automatically at ${new Date(retryAt).toISOString().slice(11, 16)} UTC (attempt ${(reviewEvidence.attempts ?? 1) + 1} of ${REVIEW_RETRIES + 1}) after: ${reviewEvidence.detail.slice(0, 200)}`};
  }
  const review = m.reviews.at(-1);
  if (review && !review.invalidated && review.revision === revision) {
@@ -173,7 +197,8 @@ export function operatorCommands(m: Mission | undefined, pending: boolean, snaps
  if (!m || m.phase === 'complete' || p.nativePlan || operation) return commands;
  if (p.resumeHold || !p.owned || m.evidence.verify?.outcome==='failed' || m.blocker?.startsWith(QUOTA_BLOCKER)) commands.push('continue');
  commands.push('mode');
- if (m.evidence.deliver?.outcome === 'passed' && m.evidence.verify?.outcome !== 'failed' && !quotaBlocked(m)) commands.push('review');
+ // A scheduled automatic retry is the extension's step, so the operator is not asked for it.
+ if (m.evidence.deliver?.outcome === 'passed' && m.evidence.verify?.outcome !== 'failed' && !quotaBlocked(m) && reviewRetryAt(m) === undefined) commands.push('review');
  if (m.gate && !m.gate.approved && p.owned && !p.resumeHold && m.evidence.verify?.outcome !== 'failed') commands.push('approve');
  const action = nextAction(m, snapshot, p);
  if (action.kind === 'dispatch') commands.push('dispatch');
@@ -205,6 +230,7 @@ export function operatorStep(m: Mission, action: Action, p: PolicyContext, owner
   const delivered = m.evidence.deliver?.outcome === 'passed';
   if (delivered && !m.reviewRequested) return {command: '/mission review', text: 'Result is ready. Request an independent review, or stop here'};
   if (delivered && m.evidence.review?.outcome === 'failed') {
+   if (reviewRetryAt(m) !== undefined) return {text: action.detail};
    return reviewFailureStep(m.evidence.review.detail,m.reviewProgress?Object.keys(m.reviewProgress.targets).length:0,m.reviewProgress?Object.keys(m.reviewProgress.inputs).length:0);
   }
   if (action.detail.startsWith('Worker identity')) return {command: '/mission', text: action.detail};

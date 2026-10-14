@@ -90,7 +90,8 @@ export function validateMission(value: unknown): Mission {
     if (!PHASES.includes(key as Phase)) invalid(`unsupported evidence phase ${key}`);
     const item = object(raw, `evidence.${key}`);
     if (!(EVIDENCE_OUTCOMES as readonly unknown[]).includes(item.outcome)) invalid(`evidence.${key}.outcome is unsupported`);
-    evidence[key as Phase] = { outcome: item.outcome as Evidence["outcome"], detail: content(item.detail, `evidence.${key}.detail`, 50_000), at: text(item.at, `evidence.${key}.at`, 100), ...(item.revision === undefined ? {} : { revision: text(item.revision, `evidence.${key}.revision`, 1000) }), ...(item.tree === undefined ? {} : { tree: text(item.tree, `evidence.${key}.tree`, 200) }) };
+    if (item.attempts !== undefined && (!Number.isInteger(item.attempts) || (item.attempts as number) < 0 || (item.attempts as number) > 1000)) invalid(`evidence.${key}.attempts must be a small non-negative integer`);
+    evidence[key as Phase] = { outcome: item.outcome as Evidence["outcome"], detail: content(item.detail, `evidence.${key}.detail`, 50_000), at: text(item.at, `evidence.${key}.at`, 100), ...(item.revision === undefined ? {} : { revision: text(item.revision, `evidence.${key}.revision`, 1000) }), ...(item.tree === undefined ? {} : { tree: text(item.tree, `evidence.${key}.tree`, 200) }), ...(item.attempts === undefined ? {} : { attempts: item.attempts as number }) };
   }
   const scopesRow = object(row.scopes, "scopes");
   const scopes: Record<string, string[]> = {};

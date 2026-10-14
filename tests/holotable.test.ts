@@ -167,9 +167,13 @@ test('the status builder maps each hold state and the C5 field list', async () =
 	expect(credits.actions).not.toContain('review');
 	expect(credits.complete).toBe(false);
 
-	const rate = await input(baseMission(cwd, { phase: 'review', reviewRequested: true, evidence: { ...delivered, review: { outcome: 'failed', detail: 'status 429 Too Many Requests', revision: 'rev', at: 'now' } } }));
+	const throttled = { outcome: 'failed' as const, detail: 'status 429 Too Many Requests', revision: 'rev', at: new Date().toISOString() };
+	const rate = await input(baseMission(cwd, { phase: 'review', reviewRequested: true, evidence: { ...delivered, review: throttled } }));
 	expect(rate.hold).toBe('none');
-	expect(rate.actions).toContain('review');
+	// The extension reruns a throttled review by itself, so the board does not ask for it.
+	expect(rate.actions).not.toContain('review');
+	const spent = await input(baseMission(cwd, { phase: 'review', reviewRequested: true, evidence: { ...delivered, review: { ...throttled, attempts: 4 } } }));
+	expect(spent.actions).toContain('review');
 
 	const workerQuota = await input(baseMission(cwd, {
 		workers: [{ beadId: 'b1', attempt: 'a', cwd, files: [], state: 'running', assignment: '', error: 'usage limit reached' }],

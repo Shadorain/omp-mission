@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test';
-import { nextAction } from '../src/controller';
+import { nextAction, operatorStep, REVIEW_RETRIES } from '../src/controller';
 import type { Mission, Snapshot, Bead } from '../src/types';
 
 const leaf: Bead = { id: 'L', title: 'L', status: 'closed', children: [], ready: false, category: 'closed' };
@@ -80,4 +80,38 @@ test('independent review -> repair -> rereview loop state transitions', () => {
   });
   delete m.gate;
   expect(nextAction(m, emptySnapshot, basePolicy).kind).toBe('complete');
+});
+
+test('a throttled or timed-out review reruns by itself after its backoff, and only quota or a spent budget waits for the operator', () => {
+  const m = mkMission();
+  m.epicId = 'E';
+  m.reviewRequested = true;
+  m.evidence.verify = { outcome: 'passed', revision: 'r', detail: 'OK', at: 'now' };
+  m.evidence.deliver = { outcome: 'passed', revision: 'r', detail: 'OK', at: 'now' };
+  const fail = (detail: string, ageMs: number, attempts?: number) => {
+    m.evidence.review = { outcome: 'failed', detail, revision: 'r', at: new Date(Date.now() - ageMs).toISOString(), ...(attempts ? { attempts } : {}) };
+    return nextAction(m, emptySnapshot, basePolicy);
+  };
+  const throttle = 'Error: [integration] Reviewer error: 429 {"type":"rate_limit_error"} retry-after-ms=3600000 (review incomplete; failed targets: integration)';
+
+  // The provider asked for an hour: an hour in it still waits, and the operator sees when it reruns, not a command.
+  const waiting = fail(throttle, 30 * 60_000);
+  expect(waiting.kind).toBe('hold');
+  expect(waiting.detail).toMatch(/^Review retries automatically at \d\d:\d\d UTC \(attempt 2 of 4\)/);
+  expect(operatorStep(m, waiting, basePolicy).command).toBeUndefined();
+  // Past the retry-after plus the per-mission spread (at most a quarter of the wait), it is a review again.
+  expect(fail(throttle, 76 * 60_000).kind).toBe('review');
+  expect(fail('Error: [bd-1] Reviewer aborted: Deadline exceeded', 3 * 60_000).kind).toBe('review');
+  expect(fail('Error: [bd-1] Reviewer aborted: Deadline exceeded', 60_000).kind).toBe('hold');
+
+  // Later attempts back off further; past the budget the operator retries explicitly.
+  expect(fail('Reviewer aborted: Deadline exceeded', 5 * 60_000, 2).kind).toBe('hold');
+  expect(fail('Reviewer aborted: Deadline exceeded', 13 * 60_000, 2).kind).toBe('review');
+  const spent = fail(throttle, 24 * 3600_000, REVIEW_RETRIES + 1);
+  expect(spent.detail).toStartWith('Review failed; /mission review explicitly retries');
+  expect(operatorStep(m, spent, basePolicy).command).toBe('/mission review');
+
+  // Quota and non-transient failures never rerun by themselves.
+  expect(fail('Reviewer error: quota exhausted for this month', 24 * 3600_000).detail).toStartWith('Review failed; /mission review explicitly retries');
+  expect(fail('Revision changed during review; result invalidated', 24 * 3600_000).detail).toStartWith('Review failed; /mission review explicitly retries');
 });
