@@ -1,20 +1,21 @@
 import { createHash } from 'node:crypto';
 import type { Action, Gate, Graph, Mission, Mode, Phase, PolicyContext, Snapshot, Step } from './types';
 export function token(value: unknown): string { return createHash('sha256').update(JSON.stringify(value)).digest('hex'); }
-export const quotaHold = /quota.{0,80}exhausted|insufficient.{0,40}(?:credits|balance|funds)|usage[_ -]?limit|usage_limit_reached|resource[_ -]?exhausted|run out of credits|out of credits|out of (?:extra )?usage|spending[- ]?limit|personal-team-blocked|requires more credits|more credits, or fewer max_tokens/i;
+const quotaHold = /quota.{0,80}exhausted|insufficient.{0,40}(?:credits|balance|funds)|usage[_ -]?limit|usage_limit_reached|run out of credits|out of credits|out of (?:extra )?usage|spending[- ]?limit|personal-team-blocked|requires more credits|more credits, or fewer max_tokens/i;
 /** Transient throttle wording. OMP already retries these; the mission must not start another loop. */
 export const rateLimitHold = /\brate[_ -]?limit(?:_error)?\b|too many requests|\b429\b/i;
 export function providerCapacity(detail: string): 'quota' | 'rate' | undefined {
  if (quotaHold.test(detail)) return 'quota';
  if (rateLimitHold.test(detail)) return 'rate';
+ if (/resource[_ -]?exhausted/i.test(detail)) return 'quota';
  return undefined;
 }
 /** Persisted coordinator park. `/mission continue` clears it; it is not a completed mission. */
 export const QUOTA_BLOCKER = 'Provider quota exhausted. Restore quota or change the model, then /mission continue';
 export function quotaBlocked(m: Pick<Mission, 'blocker' | 'workers' | 'evidence'>): boolean {
- if (m.blocker && quotaHold.test(m.blocker)) return true;
- if (m.evidence.review?.outcome === 'failed' && quotaHold.test(m.evidence.review.detail)) return true;
- return m.workers.some(worker => worker.state !== 'closed' && !!worker.error && quotaHold.test(worker.error));
+ if (m.blocker && providerCapacity(m.blocker) === 'quota') return true;
+ if (m.evidence.review?.outcome === 'failed' && providerCapacity(m.evidence.review.detail) === 'quota') return true;
+ return m.workers.some(worker => worker.state !== 'closed' && !!worker.error && providerCapacity(worker.error) === 'quota');
 }
 /** Last assistant error of a finished turn. A clean stop is not a hold, so an OMP fallback success is left alone. */
 export function terminalCapacity(messages: readonly unknown[]): 'quota' | 'rate' | undefined {
@@ -30,7 +31,7 @@ export function terminalCapacity(messages: readonly unknown[]): 'quota' | 'rate'
 }
 export function reviewFailureStep(detail:string,completed=0,total=0):Step{
  const progress=total?` (${completed}/${total} reviewers complete)`:'';
- if(quotaHold.test(detail))return {text:`Review blocked by provider quota${progress}. Restore quota or configure a funded review model, then /mission review`};
+ if(providerCapacity(detail)==='quota')return {text:`Review blocked by provider quota${progress}. Restore quota or configure a funded review model, then /mission review`};
  if(/deadline exceeded|timed out|timeout/i.test(detail))return {command:'/mission review',text:`Review timed out${progress}.${completed?' Retry only failed reviewers; completed results are retained':' Retry the failed review'}`};
  return {command:'/mission review',text:`Review failed${progress}.${completed?' Retry only failed reviewers; completed results are retained':' Retry it'}`};
 }
@@ -45,14 +46,24 @@ const REVIEW_BACKOFF_MS = [2 * 60_000, 10 * 60_000, 30 * 60_000];
  */
 export function reviewRetryAt(m: Pick<Mission, 'id' | 'evidence'>): number | undefined {
  const review = m.evidence.review;
- if (review?.outcome !== 'failed' || quotaHold.test(review.detail)) return undefined;
- if (!rateLimitHold.test(review.detail) && !transientReview.test(review.detail)) return undefined;
+ if (review?.outcome !== 'failed' || providerCapacity(review.detail) === 'quota') return undefined;
+ if (providerCapacity(review.detail) !== 'rate' && !transientReview.test(review.detail)) return undefined;
  const attempts = review.attempts ?? 1;
  if (attempts > REVIEW_RETRIES) return undefined;
+ const failedAt = Date.parse(review.at);
  const hints = [...review.detail.matchAll(/retry-after-ms=(\d+)/g)].map(match => Number(match[1])).filter(Number.isFinite);
+ for (const match of review.detail.matchAll(/\breset(?:s|ting)?\s+in\s+(\d+)\s+(seconds?|minutes?|hours?)\b/gi))
+  hints.push(Number(match[1]) * (/hour/i.test(match[2]!) ? 3_600_000 : /minute/i.test(match[2]!) ? 60_000 : 1000));
+ for (const match of review.detail.matchAll(/\bat\s+(\d{1,2}):(\d{2})\s+UTC\b/gi)) {
+  const hour = Number(match[1]), minute = Number(match[2]);
+  if (hour > 23 || minute > 59) continue;
+  const reset = new Date(failedAt);
+  reset.setUTCHours(hour, minute, 0, 0);
+  if (reset.getTime() < failedAt) reset.setUTCDate(reset.getUTCDate() + 1);
+  hints.push(reset.getTime() - failedAt);
+ }
  const wait = Math.max(REVIEW_BACKOFF_MS[attempts - 1]!, ...hints);
  const spread = Math.floor(parseInt(token(m.id).slice(0, 4), 16) / 0xffff * Math.min(wait / 4, 60_000));
- const failedAt = Date.parse(review.at);
  const retryAt = failedAt + wait + spread;
  return Number.isFinite(new Date(retryAt).getTime()) ? retryAt : undefined;
 }

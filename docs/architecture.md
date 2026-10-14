@@ -35,6 +35,8 @@ Per-bead review partitions file ownership before launching sessions: repair-link
 
 Per-bead lanes stop starting uncached targets after the first provider-capacity failure while allowing in-flight and reusable targets to settle. Aggregation prioritizes quota over rate limits over other errors and carries the longest provider retry-after. `reviewRetryAt` honors that deadline without a six-hour truncation and adds at most one minute of mission-keyed jitter; genuine quota exhaustion never auto-retries.
 
+Capacity classification gives explicit credit exhaustion precedence, then rate-limit wording, then an otherwise unexplained `resource_exhausted`. A free-model throttle is therefore recoverable even when its transport code says resource exhaustion. Review backoff takes the latest retry-after, reset duration, or dated UTC reset derived from the failure timestamp.
+
 
 ## Safety model
 

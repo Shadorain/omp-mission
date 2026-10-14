@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test';
-import { nextAction, operatorStep, REVIEW_RETRIES, reviewRetryAt } from '../src/controller';
+import { nextAction, operatorStep, providerCapacity, quotaBlocked, REVIEW_RETRIES, reviewRetryAt } from '../src/controller';
 import type { Mission, Snapshot, Bead } from '../src/types';
 
 const leaf: Bead = { id: 'L', title: 'L', status: 'closed', children: [], ready: false, category: 'closed' };
@@ -125,4 +125,24 @@ test('provider waits longer than six hours are honored with bounded jitter and t
  expect(retry).toBeLessThanOrEqual(failedAt + 28800000 + 60000);
  m.evidence.review.detail = 'quota exhausted for this month';
  expect(reviewRetryAt(m)).toBeUndefined();
+});
+
+test('resource_exhausted with a timed free-model rate limit waits for reset, not restored credits', () => {
+ const m = mkMission();
+ const detail = 'Devin stream error resource_exhausted: Reached free model rate limit. Your limit will reset in 10 minutes (at 22:01 UTC).';
+ m.evidence.review = { outcome: 'failed', detail, at: '2026-10-14T21:49:09.317Z', attempts: 1 };
+ expect(providerCapacity(detail)).toBe('rate');
+ expect(quotaBlocked(m)).toBe(false);
+ expect(reviewRetryAt(m)!).toBeGreaterThanOrEqual(Date.parse('2026-10-14T22:01:00Z'));
+ expect(reviewRetryAt(m)!).toBeLessThanOrEqual(Date.parse('2026-10-14T22:02:00Z'));
+ m.evidence.review.at = '2026-10-14T23:59:00Z';
+ m.evidence.review.detail = 'resource_exhausted: rate limit. Your limit will reset in 5 minutes (at 00:04 UTC).';
+ expect(reviewRetryAt(m)!).toBeGreaterThanOrEqual(Date.parse('2026-10-15T00:04:00Z'));
+ expect(reviewRetryAt(m)!).toBeLessThanOrEqual(Date.parse('2026-10-15T00:05:00Z'));
+ m.evidence.review.detail = 'resource_exhausted: rate limit. Your limit will reset in 20 minutes.';
+ expect(reviewRetryAt(m)!).toBeGreaterThanOrEqual(Date.parse('2026-10-15T00:19:00Z'));
+ m.evidence.review.detail = 'resource_exhausted: insufficient credits. Rate limit retries cannot restore funds.';
+ expect(quotaBlocked(m)).toBe(true);
+ expect(reviewRetryAt(m)).toBeUndefined();
+ expect(providerCapacity('resource_exhausted')).toBe('quota');
 });
