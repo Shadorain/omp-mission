@@ -4,7 +4,7 @@ import { createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ExtensionContext, PlanReviewChoice } from '@oh-my-pi/pi-coding-agent';
-import { displayPhase, effectiveGraph, operatorCommands, quotaBlocked } from './controller';
+import { displayPhase, effectiveGraph, operatorCommands, providerCapacity, quotaBlocked, reviewRetryAt } from './controller';
 import { isRecord } from './guards';
 import { displaySourceId } from './sources';
 import { missionDirectory } from './store';
@@ -17,6 +17,36 @@ const SOCKET_OPS: Record<string, true> = { ping: true, approve: true, continue: 
 const MAX_LINE = 1024 * 1024;
 const MAX_PLAN = 256 * 1024;
 
+export interface MissionProblem {
+ kind: 'quota' | 'rate-limit' | 'timeout' | 'error';
+ source: string;
+ detail: string;
+ retryAt: string | null;
+ attempt: number | null;
+ completed: number | null;
+ total: number | null;
+}
+
+function missionProblem(m: Mission, graphError?: string): MissionProblem | null {
+ if (m.phase === 'complete') return null;
+ const review = m.evidence.review;
+ const worker = m.workers.find(w => w.state !== 'closed' && w.error);
+ const source = graphError ? 'graph' : m.blocker ? 'coordinator'
+  : review?.outcome === 'failed' ? 'review' : worker ? 'worker'
+  : m.evidence.verify?.outcome === 'failed' ? 'verification' : undefined;
+ const detail = graphError ?? m.blocker ?? (source === 'review' ? review!.detail : worker?.error ?? (source === 'verification' ? m.evidence.verify!.detail : undefined));
+ if (!source || !detail) return null;
+ const capacity = providerCapacity(detail);
+ const retry = source === 'review' ? reviewRetryAt(m) : undefined;
+ return {
+  kind: capacity === 'quota' ? 'quota' : capacity === 'rate' ? 'rate-limit'
+   : /deadline exceeded|timed out|timeout/i.test(detail) ? 'timeout' : 'error',
+  source, detail, retryAt: retry === undefined ? null : new Date(retry).toISOString(),
+  attempt: source === 'review' ? review!.attempts ?? 1 : null,
+  completed: source === 'review' && m.reviewProgress ? Object.keys(m.reviewProgress.targets).length : null,
+  total: source === 'review' && m.reviewProgress ? Object.keys(m.reviewProgress.inputs).length : null,
+ };
+}
 export interface ContactStatus {
 	schema: 1;
 	id: string;
@@ -38,6 +68,7 @@ export interface ContactStatus {
 	mode: Mode | null;
 	/** Latest verification outcome; 'failed' means `continue` would re-open broken work, so automation must not send it. */
 	verify: Evidence['outcome'] | null;
+ problem?: MissionProblem | null;
 	usage: UsageTotals | null;
 	ctl: { socket: string; generation: number } | null;
 	updatedAt: string;
@@ -226,6 +257,7 @@ export async function buildContactStatus(input: StatusInput): Promise<ContactSta
 		revision: m.updatedAt,
 		mode: m.mode ?? null,
 		verify: m.evidence.verify?.outcome ?? null,
+		problem: missionProblem(m, graphDown ? input.snapshot?.error : undefined),
 		usage: input.usage,
 		ctl: input.ctl,
 		updatedAt: m.updatedAt,

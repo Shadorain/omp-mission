@@ -7,6 +7,7 @@ import { openUnlistedSession } from './session-file';
 import type { Finding, Mission, ReviewRound, Run } from './types';
 import { isRecord } from './guards';
 import { validateFinding, validateReviewSummary } from './store';
+import { providerCapacity } from './controller';
 /** `tree` fingerprints file contents and target base, not HEAD, so a same-byte commit on the same base leaves it unchanged. `legacy*` is that fingerprint before the base prefix, so evidence recorded then still matches. */
 export interface RevisionCapture { revision: string; tree: string; legacyRevision: string; legacyTree: string; diff: string; files: string[] }
 /**
@@ -215,7 +216,7 @@ export class Reviewer {
   * asked to persist; a retry reuses only still-valid outputs and reruns the rest. An incomplete round
   * throws and is never a passed review.
   */
- async runPerBead(m: Mission, ctx: ExtensionContext, run: Run, role: string, contextFiles: Array<{ path: string; content: string }> | undefined, targets: BeadReviewTarget[]): Promise<ReviewRound> {
+ async runPerBead(m: Mission, ctx: ExtensionContext, run: Run, role: string, contextFiles: Array<{ path: string; content: string }> | undefined, targets: BeadReviewTarget[], maxConcurrent = 3): Promise<ReviewRound> {
   if(!ctx.model||!ctx.modelRegistry)throw new Error('Coordinator model/registry unavailable');
   const model = pickRoleModel(roleModelString(role), ctx.modelRegistry.getAvailable()) ?? ctx.model;
   const modelName=`${model.provider}/${model.id}`;
@@ -268,14 +269,20 @@ export class Reviewer {
    tail=queued.catch(()=>{});
    return queued;
   };
-  const jobs:Array<Promise<{label:string;beadId?:string;result:TargetResult}>>=[];
+  // Reviewers run a few at a time, not all at once: one round over a wide graph is 6+ provider sessions,
+  // and concurrent missions reviewing together exhausted the account rate limit on every one of them.
+  const lanes = Math.max(1, Math.min(maxConcurrent, planned.length));
+  const queue=[...planned];
   for(const job of planned){
    job.inputHash=createHash('sha256').update(reviewerInput([REVIEW_SYSTEM,job.note,effectiveContext,job.input])).digest('hex');
    state.inputs[job.label]=job.inputHash;
-   jobs.push((async()=>{
+  }
+  let capacityFailure: Error | undefined;
+  const runJob=async(job:typeof planned[number])=>{
     let result:TargetResult|undefined;
     const cached=reusable&&reusable.inputs[job.label]===job.inputHash?reusable.targets[job.label]:undefined;
     try{
+     if (capacityFailure && !cached) throw new Error(`Not started while provider capacity is unavailable: ${capacityFailure.message}`);
      if(cached)result={summary:cached.summary,findings:cached.findings,...(cached.transcript?{file:cached.transcript}:{})};
      else result=await this.#review(m,ctx,model,effectiveContext,job.note,job.input,captured.revision,job.budget,job.label);
      // Out-of-owner citations are partitioned at assembly. Failing the target here discarded a finished review and looped the retry.
@@ -286,20 +293,33 @@ export class Reviewer {
     }catch(error){
      const reason=error instanceof Error?error.message:String(error);
      state.failures[job.label]=reason.startsWith(`[${job.label}] `)?reason.slice(job.label.length+3):reason;
+     if (!reason.startsWith('Not started') && providerCapacity(reason) && (!capacityFailure || providerCapacity(reason) === 'quota'))
+      capacityFailure = error instanceof Error ? error : new Error(reason);
      state.at=new Date().toISOString();m.reviewProgress=state;
      await checkpoint().catch(()=>{});
      throw error instanceof Error&&error.message.startsWith('[')?error:new Error(`[${job.label}] ${reason}`);
     }
     return {label:job.label,beadId:job.beadId,result:result!};
-   })());
-  }
-  const settled=await Promise.allSettled(jobs);
+  };
+  // Each lane takes the next target when its own finishes; a cached target costs no provider call.
+  const settled:PromiseSettledResult<{label:string;beadId?:string;result:TargetResult}>[]=[];
+  await Promise.all(Array.from({length:lanes},async()=>{
+   for(;;){
+    const job=queue.shift();
+    if(!job)return;
+    settled.push(await runJob(job).then(value=>({status:'fulfilled',value}) as const,reason=>({status:'rejected',reason}) as const));
+   }
+  }));
   await tail;
   const failed=settled.filter((item):item is PromiseRejectedResult=>item.status==='rejected');
   if(failed.length){
-   const firstReason=failed[0]!.reason instanceof Error?failed[0]!.reason:new Error(String(failed[0]!.reason));
+   const reasons = failed.map(item => item.reason instanceof Error ? item.reason : new Error(String(item.reason)));
+   const firstReason = reasons.find(reason => providerCapacity(reason.message) === 'quota')
+    ?? reasons.find(reason => providerCapacity(reason.message) === 'rate') ?? reasons[0]!;
+   const waits = reasons.flatMap(reason => [...reason.message.matchAll(/retry-after-ms=(\d+)/g)].map(match => Number(match[1]))).filter(Number.isFinite);
+   const retryAfter = waits.length ? ` retry-after-ms=${Math.max(...waits)}` : '';
    const labels=Object.keys(state.failures);
-   throw new Error(`${firstReason.message} (review incomplete; failed targets: ${labels.join(', ')||'unknown'})`);
+   throw new Error(`${firstReason.message}${retryAfter} (review incomplete; failed targets: ${labels.join(', ')||'unknown'})`);
   }
   const outcomes=settled.map(item=>(item as PromiseFulfilledResult<{label:string;beadId?:string;result:TargetResult}>).value);
   const after=await captureRevision(m,run);if(after.revision!==captured.revision)throw new Error('Revision changed during review; result invalidated');

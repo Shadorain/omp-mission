@@ -79,6 +79,49 @@ test('first round reviews every bead on its scoped diff plus one integration pas
   expect(Object.keys(round.beads!).sort()).toEqual(['bd-a', 'bd-b']);
 });
 
+test('reviewers obey maxConcurrent as targets settle', async () => {
+  await writeFile(join(root, 'a', 'one.txt'), 'changed a');
+  await writeFile(join(root, 'b', 'two.txt'), 'changed b');
+  const m = await missionAt();
+  let open = 0;
+  let peak = 0;
+  let started = 0;
+  const release: Array<() => void> = [];
+  const twoStarted = Promise.withResolvers<void>();
+  const threeStarted = Promise.withResolvers<void>();
+  // Each reviewer blocks until this test releases it, so "open at once" is observable rather than timing-dependent.
+  const gated: ReviewOpener = async () => ({
+    session: {
+      state: { messages: [] as unknown[] } as never,
+      async prompt(text: string) {
+        started += 1;
+        open += 1;
+        peak = Math.max(peak, open);
+        const { promise, resolve } = Promise.withResolvers<void>();
+        release.push(resolve);
+        if (started === 2) twoStarted.resolve();
+        if (started === 3) threeStarted.resolve();
+        await promise;
+        open -= 1;
+        const payload = JSON.parse(text) as { reviewedRevision: string };
+        (this as { state: { messages: unknown[] } }).state.messages.push({ role: 'assistant', content: [{ type: 'text', text: JSON.stringify({ reviewedRevision: payload.reviewedRevision, summary: 's', findings: [] }) }] });
+      },
+      async dispose() {},
+    } as never,
+  });
+  const round = new Reviewer(gated).runPerBead(m, ctx, real, 'default', undefined, targets, 2);
+  await twoStarted.promise;
+  expect(started).toBe(2);
+  expect(open).toBe(2);
+  release.shift()!();
+  await threeStarted.promise;
+  expect(started).toBe(3);
+  expect(open).toBe(2);
+  for (const resolve of release.splice(0)) resolve();
+  await round;
+  expect(peak).toBe(2);
+});
+
 test('a later round re-reviews only the beads whose files changed, with no integration pass', async () => {
   await writeFile(join(root, 'a', 'one.txt'), 'changed a');
   const m = await missionAt();
@@ -350,3 +393,32 @@ test('review progress survives save/load and still scopes the retry', async () =
   await rm(dir, { recursive: true, force: true });
 });
 
+test('capacity failure stops unstarted reviewers and keeps completed checkpoints for retry', async () => {
+ const m = await missionAt();
+ const started: string[] = [];
+ const limited: ReviewOpener = async (...args) => {
+  const label = args[6]!.label;
+  started.push(label);
+  const opened = await opener([], () => ({ summary: 'retained', findings: [] }))(...args);
+  if (label === 'bd-b') opened.session.prompt = async () => { throw new Error('429 rate_limit_error retry-after-ms=3600000'); };
+  return opened;
+ };
+ await expect(new Reviewer(limited).runPerBead(m, ctx, real, 'default', [], targets, 1)).rejects.toThrow('retry-after-ms=3600000');
+ expect(started).toEqual(['bd-a', 'bd-b']);
+ expect(m.reviewProgress!.targets['bd-a']!.summary).toBe('retained');
+ expect(m.reviewProgress!.failures.integration).toContain('Not started');
+ const retried: Array<{ note: string; payload: Record<string, unknown> }> = [];
+ const result = await new Reviewer(opener(retried, () => ({ summary: 'recovered', findings: [] }))).runPerBead(m, ctx, real, 'default', [], targets, 1);
+ expect(retried.map(item => beadOf(item.payload) ?? 'integration')).toEqual(['bd-b', 'integration']);
+ expect(result.summary).toContain('[bd-a] retained');
+});
+
+test('a timeout finishing first cannot hide a later provider cooldown', async () => {
+ const m = await missionAt();
+ const failing: ReviewOpener = async (...args) => {
+  const opened = await opener([], () => ({ summary: '', findings: [] }))(...args);
+  opened.session.prompt = async () => { throw new Error(args[6]!.label === 'bd-a' ? 'Deadline exceeded' : '429 rate_limit_error retry-after-ms=28800000'); };
+  return opened;
+ };
+ await expect(new Reviewer(failing).runPerBead(m, ctx, real, 'default', [], targets, 1)).rejects.toThrow('429 rate_limit_error retry-after-ms=28800000');
+});

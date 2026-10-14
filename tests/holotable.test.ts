@@ -164,7 +164,7 @@ test('the status builder maps each hold state and the C5 field list', async () =
 	const delivered = { verify: { outcome: 'passed' as const, detail: 'ok', revision: 'rev', at: 'now' }, deliver: { outcome: 'passed' as const, detail: 'local', at: 'now' } };
 	const credits = await input(baseMission(cwd, { phase: 'review', reviewRequested: true, evidence: { ...delivered, review: { outcome: 'failed', detail: '403 You have run out of credits', revision: 'rev', at: 'now' } } }));
 	expect(credits.hold).toBe('quota');
-	expect(credits.actions).not.toContain('review');
+	expect(credits.actions).toContain('review');
 	expect(credits.complete).toBe(false);
 
 	const throttled = { outcome: 'failed' as const, detail: 'status 429 Too Many Requests', revision: 'rev', at: new Date().toISOString() };
@@ -174,6 +174,11 @@ test('the status builder maps each hold state and the C5 field list', async () =
 	expect(rate.actions).not.toContain('review');
 	const spent = await input(baseMission(cwd, { phase: 'review', reviewRequested: true, evidence: { ...delivered, review: { ...throttled, attempts: 4 } } }));
 	expect(spent.actions).toContain('review');
+	expect(rate.problem?.kind).toBe('rate-limit');
+	expect(rate.problem?.retryAt).not.toBeNull();
+	expect(spent.problem?.retryAt).toBeNull();
+	expect(credits.problem).toMatchObject({ kind: 'quota', source: 'review', retryAt: null });
+	expect(credits.problem?.detail).toContain('run out of credits');
 
 	const workerQuota = await input(baseMission(cwd, {
 		workers: [{ beadId: 'b1', attempt: 'a', cwd, files: [], state: 'running', assignment: '', error: 'usage limit reached' }],
@@ -198,6 +203,16 @@ test('the status builder maps each hold state and the C5 field list', async () =
 	expect(plain.delivery).toEqual({ url: null, branch: 'feat' });
 	expect(plain.base).toBe('main');
 	expect(plain.complete).toBe(false);
+});
+
+test('closed implementation leaves report verification, while local work and unreadable graphs do not', async () => {
+ const m = baseMission('/tmp', { graph: 'beads', epicId: 'E' });
+ const leaf = { id: 'L', title: 'L', status: 'closed', category: 'closed' as const, children: [], ready: false };
+ const snapshot = { beads: [leaf], leaves: [leaf], ready: [], closed: 1, active: 0, blocked: 0, fetchedAt: Date.now() };
+ const input = { mission: m, pending: false, resumeHold: false, snapshot, policy: idlePolicy, step: undefined, owned: true, selected: undefined, operation: false, ctl: null, usage: null };
+ expect((await buildContactStatus(input)).phase).toBe('verify');
+ expect((await buildContactStatus({ ...input, mission: baseMission('/tmp'), snapshot: undefined })).phase).toBe('execute');
+ expect((await buildContactStatus({ ...input, snapshot: { ...snapshot, error: 'Graph unavailable' } })).hold).toBe('blocked');
 });
 
 // OMP session entries: {type:'message', message:{role:'assistant', usage:{input,output,cacheRead,cacheWrite,cost:{total}}}}

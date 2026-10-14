@@ -3,7 +3,7 @@ import type { Action, Gate, Graph, Mission, Mode, Phase, PolicyContext, Snapshot
 export function token(value: unknown): string { return createHash('sha256').update(JSON.stringify(value)).digest('hex'); }
 export const quotaHold = /quota.{0,80}exhausted|insufficient.{0,40}(?:credits|balance|funds)|usage[_ -]?limit|usage_limit_reached|resource[_ -]?exhausted|run out of credits|out of credits|out of (?:extra )?usage|spending[- ]?limit|personal-team-blocked|requires more credits|more credits, or fewer max_tokens/i;
 /** Transient throttle wording. OMP already retries these; the mission must not start another loop. */
-export const rateLimitHold = /\brate limit\b|too many requests|(?:http|status)[^\n]{0,16}\b429\b/i;
+export const rateLimitHold = /\brate[_ -]?limit(?:_error)?\b|too many requests|\b429\b/i;
 export function providerCapacity(detail: string): 'quota' | 'rate' | undefined {
  if (quotaHold.test(detail)) return 'quota';
  if (rateLimitHold.test(detail)) return 'rate';
@@ -38,11 +38,10 @@ export function reviewFailureStep(detail:string,completed=0,total=0):Step{
 const transientReview = /deadline exceeded|timed out|timeout|overloaded|rate_limit_error|\b(?:502|503|504|529)\b|internal server error|econnreset|socket hang up|fetch failed|network error/i;
 export const REVIEW_RETRIES = 3;
 const REVIEW_BACKOFF_MS = [2 * 60_000, 10 * 60_000, 30 * 60_000];
-const MAX_RETRY_AFTER_MS = 6 * 3600_000;
 /**
  * When a failed review reruns without the operator, or undefined when it waits for `/mission review`.
- * Honors the provider's retry-after, and spreads missions that failed together (one rate limit hits
- * every concurrent review) by up to a quarter of the wait, keyed on the mission id.
+ * Honors the provider's retry-after, and spreads missions that failed together by up to
+ * a minute; a multi-hour provider reset must not gain another hour of jitter.
  */
 export function reviewRetryAt(m: Pick<Mission, 'id' | 'evidence'>): number | undefined {
  const review = m.evidence.review;
@@ -50,16 +49,18 @@ export function reviewRetryAt(m: Pick<Mission, 'id' | 'evidence'>): number | und
  if (!rateLimitHold.test(review.detail) && !transientReview.test(review.detail)) return undefined;
  const attempts = review.attempts ?? 1;
  if (attempts > REVIEW_RETRIES) return undefined;
- const asked = Number(/retry-after-ms=(\d+)/.exec(review.detail)?.[1] ?? 0);
- const wait = Math.min(Math.max(REVIEW_BACKOFF_MS[attempts - 1]!, asked), MAX_RETRY_AFTER_MS);
- const spread = Math.floor(parseInt(token(m.id).slice(0, 4), 16) / 0xffff * wait / 4);
+ const hints = [...review.detail.matchAll(/retry-after-ms=(\d+)/g)].map(match => Number(match[1])).filter(Number.isFinite);
+ const wait = Math.max(REVIEW_BACKOFF_MS[attempts - 1]!, ...hints);
+ const spread = Math.floor(parseInt(token(m.id).slice(0, 4), 16) / 0xffff * Math.min(wait / 4, 60_000));
  const failedAt = Date.parse(review.at);
- return Number.isFinite(failedAt) ? failedAt + wait + spread : undefined;
+ const retryAt = failedAt + wait + spread;
+ return Number.isFinite(new Date(retryAt).getTime()) ? retryAt : undefined;
 }
 export function displayPhase(m: Mission, snapshot?: Snapshot): Phase {
  if (['complete','plan','isolate','graph'].includes(m.phase)) return m.phase;
  if (m.workers.some(worker=>worker.state!=='closed') || snapshot?.leaves.some(bead=>bead.category!=='closed')) return m.phase;
  if (m.evidence.verify?.outcome === 'passed') return m.evidence.deliver?.outcome === 'passed' ? (m.phase === 'repair' ? 'repair' : 'review') : 'deliver';
+ if (m.epicId && snapshot?.leaves.length && !snapshot.error && (m.phase === 'execute' || m.phase === 'repair')) return 'verify';
  return m.phase;
 }
 export function waveGate(m: Mission, ids: string[], snapshot: Snapshot): Gate {
@@ -198,7 +199,8 @@ export function operatorCommands(m: Mission | undefined, pending: boolean, snaps
  if (p.resumeHold || !p.owned || m.evidence.verify?.outcome==='failed' || m.blocker?.startsWith(QUOTA_BLOCKER)) commands.push('continue');
  commands.push('mode');
  // A scheduled automatic retry is the extension's step, so the operator is not asked for it.
- if (m.evidence.deliver?.outcome === 'passed' && m.evidence.verify?.outcome !== 'failed' && !quotaBlocked(m) && reviewRetryAt(m) === undefined) commands.push('review');
+ if (m.evidence.deliver?.outcome === 'passed' && m.evidence.verify?.outcome !== 'failed' && !m.blocker &&
+  (!quotaBlocked(m) || m.evidence.review?.outcome === 'failed') && reviewRetryAt(m) === undefined) commands.push('review');
  if (m.gate && !m.gate.approved && p.owned && !p.resumeHold && m.evidence.verify?.outcome !== 'failed') commands.push('approve');
  const action = nextAction(m, snapshot, p);
  if (action.kind === 'dispatch') commands.push('dispatch');

@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test';
-import { nextAction, operatorStep, REVIEW_RETRIES } from '../src/controller';
+import { nextAction, operatorStep, REVIEW_RETRIES, reviewRetryAt } from '../src/controller';
 import type { Mission, Snapshot, Bead } from '../src/types';
 
 const leaf: Bead = { id: 'L', title: 'L', status: 'closed', children: [], ready: false, category: 'closed' };
@@ -114,4 +114,15 @@ test('a throttled or timed-out review reruns by itself after its backoff, and on
   // Quota and non-transient failures never rerun by themselves.
   expect(fail('Reviewer error: quota exhausted for this month', 24 * 3600_000).detail).toStartWith('Review failed; /mission review explicitly retries');
   expect(fail('Revision changed during review; result invalidated', 24 * 3600_000).detail).toStartWith('Review failed; /mission review explicitly retries');
+});
+
+test('provider waits longer than six hours are honored with bounded jitter and the longest hint wins', () => {
+ const m = mkMission();
+ const failedAt = Date.parse('2026-10-14T00:00:00Z');
+ m.evidence.review = { outcome: 'failed', detail: '429 rate_limit_error retry-after-ms=1000 retry-after-ms=28800000', at: new Date(failedAt).toISOString(), attempts: 1 };
+ const retry = reviewRetryAt(m)!;
+ expect(retry).toBeGreaterThanOrEqual(failedAt + 28800000);
+ expect(retry).toBeLessThanOrEqual(failedAt + 28800000 + 60000);
+ m.evidence.review.detail = 'quota exhausted for this month';
+ expect(reviewRetryAt(m)).toBeUndefined();
 });
