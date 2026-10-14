@@ -148,6 +148,15 @@ test('the status builder maps each hold state and the C5 field list', async () =
 	const blocked = await input(baseMission(cwd, { blocker: 'Upstream stalled' }));
 	expect(blocked.hold).toBe('blocked');
 
+	const graphError = 'Dolt server unreachable at 127.0.0.1:38581';
+	const outage = { beads: [], leaves: [], ready: [], closed: 0, active: 0, blocked: 0, fetchedAt: 0, error: graphError };
+	const beadsMission = baseMission(cwd, { graph: 'beads', epicId: 'epic' });
+	const graphDown = await input(beadsMission, { snapshot: outage, step: { text: graphError } });
+	expect(graphDown.hold).toBe('blocked');
+	expect(graphDown.next).toBe(graphError);
+	expect((await input(baseMission(cwd), { snapshot: outage })).hold).toBe('none');
+	expect((await input(beadsMission, { snapshot: { ...outage, error: undefined, fetchedAt: 1 } })).hold).toBe('none');
+
 	const quota = await input(baseMission(cwd, { phase: 'review', evidence: { review: { outcome: 'failed', detail: 'Reviewer quota exhausted on provider', at: 'now' } } }));
 	expect(quota.hold).toBe('quota');
 	expect(quota.complete).toBe(false);

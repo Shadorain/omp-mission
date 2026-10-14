@@ -4,7 +4,7 @@ import { createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ExtensionContext, PlanReviewChoice } from '@oh-my-pi/pi-coding-agent';
-import { displayPhase, operatorCommands, quotaBlocked } from './controller';
+import { displayPhase, effectiveGraph, operatorCommands, quotaBlocked } from './controller';
 import { isRecord } from './guards';
 import { displaySourceId } from './sources';
 import { missionDirectory } from './store';
@@ -185,11 +185,13 @@ export async function buildContactStatus(input: StatusInput): Promise<ContactSta
 	const m = input.mission;
 	const phase = displayPhase(m, input.snapshot);
 	const worktree = await realpath(m.workspace.cwd).catch(() => m.workspace.cwd);
+	// An unreadable bead graph stops the controller (nextAction holds on snapshot.error) even though no blocker is saved.
+	const graphDown = phase !== 'complete' && !!m.epicId && effectiveGraph(m) === 'beads' && !!input.snapshot?.error;
 	const hold = quotaBlocked(m) ? 'quota'
 		: input.pending ? 'plan-approval'
 		: input.resumeHold ? 'resume'
 		: m.gate ? 'gate'
-		: m.blocker ? 'blocked'
+		: m.blocker || graphDown ? 'blocked'
 		: 'none';
 	const actions = input.pending
 		// plan-approve answers OMP's interactive plan review; it is advertised only while a review is actually open and resolvable.
