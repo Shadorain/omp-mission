@@ -92,7 +92,7 @@ A worker never stalls a mission silently. If its terminal disappears while the b
 
 ## Subagent workers
 
-`/mission config frontend subagent` runs each bead in an in-process OMP session instead of a separate terminal or `omp -p` process. Beads graphs only. The session has file, shell, and search tools plus `yield`, no extensions, MCP, skills, or rules, and approvals are off (`yolo`). Sessions appear in the Agent Hub (`Alt+A`) as `<bead-id>`.
+`/mission config frontend subagent` runs each bead in an in-process OMP session instead of a separate terminal or `omp -p` process. Beads graphs only. The session has file, shell, and search tools plus `yield`, no extensions, MCP, skills, or rules, and approvals are off (`yolo`). Shell commands run in the foreground until they finish (no auto-background, no async jobs): the session has no wait tool and its turn ends at yield, so a backgrounded `cargo auto` used to end in a `done: false, "waiting"` result. Sessions appear in the Agent Hub (`Alt+A`) as `<bead-id>`.
 
 The extension, not the worker, owns `bd`. It claims the bead as the bead's own actor before the session starts. The worker returns `{done, summary, verification}` through the native yield tool. A launch baseline and mutating-tool traces attribute shared-checkout changes: unrelated sibling edits do not blame an innocent finisher, but attributed edits outside the worker's scope and unattributed changes outside all worker scopes leave its bead open.
 

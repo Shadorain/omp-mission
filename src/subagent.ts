@@ -58,7 +58,7 @@ const RESULT_SCHEMA = {
 
 export const WORKER_SYSTEM = [
 	'You implement exactly one bead in this checkout, then stop. A coordinator claims and closes the bead; never run bd.',
-	'Real Rust builds and tests on this host use `cargo auto <subcommand>`, never cargo build or cargo test directly.',
+	'Real Rust builds and tests on this host use `cargo auto <subcommand>`, never cargo build or cargo test directly. Commands run in the foreground until they finish: give long ones (cargo auto, make verify) a bash timeout up to 3600 seconds, and yield only after you have their result.',
 	'Finish by calling yield with {"done":true,"summary":"<what changed>","verification":"<exact commands and results>"}. If you cannot finish, yield {"done":false,"summary":"<the blocker>"}.',
 ].join('\n');
 
@@ -146,7 +146,9 @@ const defaultFactory: SessionFactory = async request => {
 		requireYieldTool: true, outputSchema: RESULT_SCHEMA,
 		agentId: request.worker.beadId, agentDisplayName: `mission ${request.worker.beadId}`, parentAgentId: 'Main', taskDepth: 1,
 		agentRegistry: AgentRegistry.global(), sessionManager: manager,
-		settings: Settings.isolated({ 'advisor.enabled': false, 'autolearn.enabled': false, 'tools.approvalMode': 'yolo' }),
+		// A worker has no wait tool and its turn ends at yield, so a command moved to a background job left it
+		// yielding "not done: waiting" while the job still ran. Long commands block instead.
+		settings: Settings.isolated({ 'advisor.enabled': false, 'autolearn.enabled': false, 'tools.approvalMode': 'yolo', 'bash.autoBackground.enabled': false, 'async.enabled': false }),
 	});
 	return { session: session as unknown as SubagentSession, file: manager.getSessionFile() ?? '' };
 };
