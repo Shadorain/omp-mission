@@ -118,6 +118,26 @@ test('resend with guidance continues the stopped session with the rejection and 
   expect(live.calls).toEqual(['steer:Use the v2 helper.']);
 });
 
+test('resend files widens a stopped worker so the leaf can finish, but never into a sibling\'s scope', async () => {
+  const w = worker({ error: 'edits outside the allowed paths (docs/v2/schema.md)' });
+  const m = mission(w);
+  m.scopes = { 'bd-1': ['a/**'] };
+  const { driver, calls } = port({ canResume: true });
+  await driver.resend(m, 'bd-1', bead('active', 'bd-1'), 'Only the index row.', ['docs/v2/schema.md', 'a/**']);
+  expect(w.files).toEqual(['a/**', 'docs/v2/schema.md']);
+  expect(m.scopes['bd-1']).toEqual(['a/**', 'docs/v2/schema.md']);
+  expect(calls).toEqual(['resume:Your last result was rejected: edits outside the allowed paths (docs/v2/schema.md). Your allowed paths now also include ["docs/v2/schema.md"]. Only the index row. Finish by calling yield.']);
+
+  const blocked = worker({ error: 'edits outside the allowed paths (docs/v2/index.md)' });
+  const crowded = mission(blocked);
+  crowded.workers.push(worker({ beadId: 'bd-2', files: ['docs/v2/'], error: undefined }));
+  const other = port({ canResume: true });
+  await expect(other.driver.resend(crowded, 'bd-1', bead('active', 'bd-1'), undefined, ['docs/v2/index.md'])).rejects.toThrow(/overlap: bd-1 and bd-2/);
+  await expect(other.driver.resend(crowded, 'bd-1', bead('active', 'bd-1'), undefined, ['../escape.md'])).rejects.toThrow(/invalid worker file scope/);
+  expect(blocked.files).toEqual(['a/**']);
+  expect(other.calls).toEqual([]);
+});
+
 test('release gives the bead back: aborts, unclaims, and closes the worker record so a fresh one can start', async () => {
   const w = worker({ error: 'worker reported it is not done: blocked' });
   const { driver, calls } = port();

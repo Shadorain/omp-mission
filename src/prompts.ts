@@ -17,13 +17,13 @@ Implementation edits, including verification fixes, belong to scoped workers. Re
 }
 const HINTS: Partial<Record<Action['kind'], string>> = {
  isolate: 'Run mission_control bind_workspace with no arguments.',
- graph: 'Create scoped leaves with bd create --parent, then mission_control bind_graph. Not an OMP todo.',
+ graph: 'Create scoped leaves with bd create --parent, then mission_control bind_graph. Scope every file a leaf must touch, including docs, indexes and audit files its text names. Not an OMP todo.',
  dispatch: 'Run mission_control dispatch.',
- resend: 'Inspect the worker, then mission_control resend once. A second failure is a blocker.',
+ resend: 'Inspect the worker, then mission_control resend once. Stopped on edits outside its allowed paths that the leaf needs: pass files to widen its scope. Otherwise say in detail what to change. A second failure with the same cause is a blocker.',
  verify: 'Run the repository gate and record_verification. passed=false stops the mission.',
  deliver: 'Deliver against the bound base. Refs, never Closes/Fixes. record_delivery. Linear: lin only, never Done.',
  review: 'The extension runs run_review. /mission review retries a failure. Do not self-review.',
- repairs: 'Bind repair leaves to open findings via bind_repairs, then dispatch. reject_finding records a rejection.',
+ repairs: 'Bind repair leaves to open findings via bind_repairs, then dispatch. Scope every file a repair touches, including the audit or doc it updates. reject_finding records a rejection.',
 };
 /** One line, and only for the step in front of the model. Recovery details live on the action, not here. */
 export function guide(kind: Action['kind'], action?: Pick<Action, 'ids' | 'detail'>): string | undefined {

@@ -18,8 +18,8 @@ export interface WorkerDriver {
   reconcile(mission: Mission, beadStates: Map<string, Bead>): Promise<Worker[]>;
   focus(worker: Worker): Promise<void>;
   reap(mission: Mission, beadId: string, bead: Bead): Promise<void>;
-  /** `note` is operator guidance; only subagent workers can take it (they are resumed with it as the prompt). */
-  resend(mission: Mission, beadId: string, bead: Bead, note?: string): Promise<void>;
+  /** `note` is operator guidance; only subagent workers can take it (they are resumed with it as the prompt). `files` widens a subagent worker's allowed paths first. */
+  resend(mission: Mission, beadId: string, bead: Bead, note?: string, files?: readonly string[]): Promise<void>;
   /** Gives a stopped subagent worker's bead back (abort, unclaim, close the record) so a fresh worker can take it. */
   release(mission: Mission, beadId: string, bead: Bead): Promise<void>;
   recover(mission: Mission, beadId: string, bead: Bead): Promise<void>;
@@ -395,13 +395,28 @@ export function createWorkerDriver(run: Run, hooks: WorkerHooks): WorkerDriver {
       worker.error = `released: ${worker.error ?? 'by operator'}`;
       await persist(mission);
     },
-    async resend(mission, beadId, bead, note) {
+    async resend(mission, beadId, bead, note, files) {
       const latest = mission.workers.findLast(item => item.beadId === beadId);
-      if (latest && hostOf(latest) === 'subagent' && latest.state !== 'closed') {
+      const subagent = latest && hostOf(latest) === 'subagent' && latest.state !== 'closed';
+      if (files?.length && !subagent) throw new Error('files widens a subagent worker that is running or stopped');
+      if (latest && subagent) {
         // The bead is in_progress under the worker's own claim, so the ready-bead rule below does not apply.
         if (bead.id !== beadId || bead.category !== 'active' || bead.claimActor !== beadId) throw new Error('resend requires the worker\'s own active bead');
         if (!hooks.subagent) throw new Error('subagent runner unavailable');
-        if (hooks.subagent.isLive(beadId)) { if (note) await hooks.subagent.steer(beadId, note); else await send(latest, mission, true); return; }
+        // A leaf that legitimately needs one more file (an index row, the audit doc it updates) used to stop twice and block
+        // the mission: a resend could only repeat the instruction. Widening is checked against every other open worker.
+        if (files?.length) {
+          const added = [...new Set(files.map(normalizeScope))].filter(path => !latest.files.some(own => normalizeScope(own) === path));
+          if (added.length) {
+            const widened = [...latest.files, ...added];
+            const others = mission.workers.filter(item => item !== latest && item.state !== 'closed').map(item => ({ beadId: item.beadId, cwd: item.cwd, files: item.files }));
+            assertNonOverlapping([{ beadId, cwd: latest.cwd, files: widened }, ...others]);
+            latest.files = widened;
+            mission.scopes[beadId] = [...new Set([...(mission.scopes[beadId] ?? []), ...added])];
+            note = [`Your allowed paths now also include ${JSON.stringify(added)}.`, note].filter(Boolean).join(' ');
+          }
+        }
+        if (hooks.subagent.isLive(beadId)) { if (note) await hooks.subagent.steer(beadId, note); else await send(latest, mission, true); if (files?.length) await persist(mission); return; }
         // Not running: either a failed result waiting for the operator, or a session lost to a restart.
         const rejected = latest.error ? `Your last result was rejected: ${latest.error}.` : '';
         const prompt = [rejected, note, 'Finish by calling yield.'].filter(Boolean).join(' ');

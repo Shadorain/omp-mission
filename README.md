@@ -98,7 +98,7 @@ The extension, not the worker, owns `bd`. It claims the bead as the bead's own a
 
 A clean result stages only the worker's own changes and closes the bead with its summary and verification. `done: false`, a missing yield, or a failed `bd close` leaves the bead claimed and surfaces `resend` with the reason.
 
-`/mission resend <bead-id> [guidance]` continues the same session with the rejection and guidance (a live session is steered). `/mission release <bead-id>` aborts it, unclaims the bead, and closes the worker record so a fresh worker can take the next dispatch.
+`/mission resend <bead-id> [guidance]` continues the same session with the rejection and guidance (a live session is steered). `mission_control resend` and the socket `resend` also take `files`: extra workspace-relative paths added to that worker's allowed paths and the bead's scope before it continues, refused when they overlap another open worker's scope. A leaf whose text asks it to update a doc, index or audit file outside its scope finishes on one resend instead of stopping twice and blocking the mission. `/mission release <bead-id>` aborts it, unclaims the bead, and closes the worker record so a fresh worker can take the next dispatch.
 
 Sibling scopes do not authorize a worker's own edits: mutating tools naming a changed file outside its assigned paths are rejected even when the sibling owning it is already closed. Scope checks attribute changes after execution; they are not a filesystem sandbox.
 

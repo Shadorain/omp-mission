@@ -518,6 +518,7 @@ export class HolotableBridge {
 				const extra: Record<string, unknown> = {};
 				if (typeof args.beadId === 'string') extra.beadId = args.beadId;
 				if (typeof args.detail === 'string') extra.detail = args.detail;
+				if (Array.isArray(args.files) && args.files.every(file => typeof file === 'string')) extra.files = args.files;
 				await this.hooks.request(context, op, extra);
 			}
 		} catch (error) {

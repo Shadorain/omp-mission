@@ -497,7 +497,7 @@ async function finishMission(context:ExtensionContext){
   operation:z.enum(['start','clear','continue','bind_workspace','bind_graph','dispatch','record_verification','record_delivery','run_review','accept_repairs','bind_repairs','resend','release','reap','reject_finding']),
   cwd:z.string().optional(),base:z.string().optional(),beadsDir:z.string().optional(),delivery:z.enum(['pr','local']).optional(),
   epicId:z.string().optional(),scopes:scopesSchema.optional(),repairLinks:z.record(z.string(),z.array(z.string())).optional(),
-  beadId:z.string().optional(),detail:z.string().optional(),passed:z.boolean().optional(),url:z.string().optional(),
+  beadId:z.string().optional(),detail:z.string().optional(),files:z.array(z.string()).max(50).optional().describe('resend only: extra workspace-relative paths the stopped subagent worker may edit'),passed:z.boolean().optional(),url:z.string().optional(),
   mode:z.enum(['auto','pause','force']).optional(),keep:z.boolean().optional(),findingId:z.string().optional()
  });
  async function control(rawParams:unknown,context:ExtensionContext,_signal?:AbortSignal,internal:{reuseOnly?:boolean;operator?:boolean}={}){
@@ -629,7 +629,7 @@ async function finishMission(context:ExtensionContext){
     }else if(params.operation==='resend'||params.operation==='release'||params.operation==='reap'){
      requireBeadsGraph(mission);if(!params.beadId)throw new Error('beadId required');await refresh(false);
      const bead=snapshot?.beads.find(b=>b.id===params.beadId);if(!bead||snapshot?.error)throw new Error('Fresh mission bead required');
-     if(params.operation==='resend')await driver.resend(mission,params.beadId,bead,params.detail);
+     if(params.operation==='resend')await driver.resend(mission,params.beadId,bead,params.detail,params.files);
      else if(params.operation==='release'){await driver.release(mission,params.beadId,bead);await refresh(false);}
      else await driver.reap(mission,params.beadId,bead);
     }
