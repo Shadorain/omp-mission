@@ -140,6 +140,11 @@ test('the status builder maps each hold state and the C5 field list', async () =
 	expect(held.hold).toBe('resume');
 	expect(held.next).toBe('/mission continue — Take control of this resumed mission');
 
+	const completed = await input(baseMission(cwd, { phase: 'complete' }), { resumeHold: true, policy: { ...idlePolicy, resumeHold: true } });
+	expect(completed.complete).toBe(true);
+	expect(completed.hold).toBe('none');
+	expect(completed.actions).not.toContain('continue');
+
 	const gated = await input(baseMission(cwd, { gate: { kind: 'wave', token: 'tok', detail: 'wave', approved: false } }), { step: { command: '/mission approve', text: 'wave' }, ctl: { socket: '/tmp/x.sock', generation: 7 } });
 	expect(gated.hold).toBe('gate');
 	expect(gated.gate).toEqual({ kind: 'wave', id: gateTokenId('tok') });

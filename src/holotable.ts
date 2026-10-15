@@ -220,7 +220,7 @@ export async function buildContactStatus(input: StatusInput): Promise<ContactSta
 	const graphDown = phase !== 'complete' && !!m.epicId && effectiveGraph(m) === 'beads' && !!input.snapshot?.error;
 	const hold = quotaBlocked(m) ? 'quota'
 		: input.pending ? 'plan-approval'
-		: input.resumeHold ? 'resume'
+		: input.resumeHold && phase !== 'complete' ? 'resume'
 		: m.gate ? 'gate'
 		: m.blocker || graphDown ? 'blocked'
 		: 'none';
