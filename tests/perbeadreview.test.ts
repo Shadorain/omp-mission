@@ -422,3 +422,26 @@ test('a timeout finishing first cannot hide a later provider cooldown', async ()
  };
  await expect(new Reviewer(failing).runPerBead(m, ctx, real, 'default', [], targets, 1)).rejects.toThrow('429 rate_limit_error retry-after-ms=28800000');
 });
+
+test('operator model recovery retains valid finished reviews across save/load with honest model provenance', async () => {
+ const m=await missionAt();
+ const failing:ReviewOpener=async(...args)=>{
+  const opened=await opener([],()=>({summary:'Retained review',findings:[finding('kept')]}))(...args);
+  if(args[6]?.label==='bd-b')opened.session.prompt=async()=>{throw new Error('quota exhausted');};
+  return opened;
+ };
+ await expect(new Reviewer(failing).runPerBead(m,ctx,real,'default',undefined,targets)).rejects.toThrow('quota exhausted');
+ for(const target of Object.values(m.reviewProgress!.targets))delete target.model;
+ m.modelOverrides={review:'p/replacement'};
+ m.reviewProgress!.retryModel='p/replacement';
+ const restored=validateMission(JSON.parse(JSON.stringify(m)));
+ const next={...ctx,modelRegistry:{getAvailable:()=>[{provider:'p',id:'replacement'}]}} as unknown as ExtensionContext;
+ const sent:Array<{note:string;payload:Record<string,unknown>}>=[];
+ const round=await new Reviewer(opener(sent,()=>({summary:'New review',findings:[]}))).runPerBead(restored,next,real,'default',undefined,targets);
+ expect(sent.map(item=>beadOf(item.payload)??'integration')).toEqual(['bd-b']);
+ expect(round.findings.map(item=>item.id)).toContain('bd-a:kept');
+ expect(round.model.split(', ').sort()).toEqual(['p/m','p/replacement']);
+ expect(restored.reviewProgress).toBeUndefined();
+ restored.modelOverrides={review:'missing/unavailable'};
+ await expect(new Reviewer().runPerBead(restored,next,real,'default',undefined,targets)).rejects.toThrow('Selected recovery model is unavailable');
+});

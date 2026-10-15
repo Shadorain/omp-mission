@@ -450,7 +450,7 @@ test('a terminal quota end persists before agent_end resolves, does not wake, an
     const before = mission.sent.length;
     await mission.event('agent_end', { willContinue: false, messages: [{ role: 'assistant', stopReason: 'error', errorMessage: '403 You have run out of credits' }] });
     const parked = await mission.state();
-    expect(parked.blocker).toBe('Provider quota exhausted. Restore quota or change the model, then /mission continue');
+    expect(parked.blocker).toBe('Provider quota exhausted. Restore quota or change the model, then /mission continue\n403 You have run out of credits');
     expect(parked.evidence.verify?.outcome).toBe('failed');
     expect(parked.phase).not.toBe('complete');
     flags.idle = true;

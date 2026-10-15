@@ -10,14 +10,14 @@ export interface Worker { beadId: string; attempt: string; cwd: string; files: s
 export interface Finding { id: string; severity: 'critical' | 'high' | 'medium' | 'low'; path: string; line: number; title: string; body: string; rejection?: string; beadId?: string }
 export interface ReviewRound { round: number; revision: string; model: string; summary: string; findings: Finding[]; at: string; invalidated?: string; /** Per-bead scope hashes, so a later round reviews only beads whose files changed. */ beads?: Record<string, string>; /** Reviewer label (bead id, `integration`, `review`) to the saved transcript file, so a finished review can be opened. */ transcripts?: Record<string, string> }
 /** One finished per-target review kept while its round is incomplete. */
-export interface ReviewTargetResult { summary: string; findings: Finding[]; transcript?: string }
+export interface ReviewTargetResult { summary: string; findings: Finding[]; transcript?: string; model?: string }
 /**
  * Survivable state of an incomplete per-bead review: which targets finished, with output bound to the
  * exact revision, model and serialized target input. A retry reuses only entries whose inputs still
  * match; anything else reruns. Never present on a completed round and never proof of a passed review.
  */
-export interface ReviewProgress { round: number; revision: string; model: string; inputs: Record<string, string>; targets: Record<string, ReviewTargetResult>; failures: Record<string, string>; at: string }
-export interface Mission { version: 1; id: string; source: Source; workspace: Workspace; epicId?: string; graph?: Graph; scopes: Record<string,string[]>; phase: Phase; evidence: Partial<Record<Phase,Evidence>>; mode: Mode; keep: boolean; reviewRequested: boolean; gate?: Gate; workers: Worker[]; reviews: ReviewRound[]; reviewProgress?: ReviewProgress; repairLinks: Record<string,string[]>; round: number; controllerNonce?: string; createdAt: string; updatedAt: string; blocker?: string }
+export interface ReviewProgress { round: number; revision: string; model: string; retryModel?: string; inputs: Record<string, string>; targets: Record<string, ReviewTargetResult>; failures: Record<string, string>; at: string }
+export interface Mission { version: 1; id: string; source: Source; workspace: Workspace; epicId?: string; graph?: Graph; scopes: Record<string,string[]>; phase: Phase; evidence: Partial<Record<Phase,Evidence>>; mode: Mode; keep: boolean; reviewRequested: boolean; gate?: Gate; workers: Worker[]; reviews: ReviewRound[]; reviewProgress?: ReviewProgress; modelOverrides?: Partial<Record<'coordinator' | 'worker' | 'review', string>>; repairLinks: Record<string,string[]>; round: number; controllerNonce?: string; createdAt: string; updatedAt: string; blocker?: string }
 export interface Bead { id: string; title: string; status: string; assignee?: string; claimActor?: string; description?: string; acceptance?: string; issue_type?: string; children: string[]; parent?: string; ready: boolean; category: 'closed' | 'active' | 'ready' | 'blocked' | 'waiting' | 'deferred' | 'group' }
 export interface AuditEvent { timestamp: string; actor: string; event: string; summary: string }
 export interface Snapshot { beads: Bead[]; leaves: Bead[]; ready: string[]; closed: number; active: number; blocked: number; fetchedAt: number; error?: string }
@@ -28,7 +28,7 @@ export type Frontend = 'none' | 'orca' | 'herdr' | 'custom' | 'subagent';
 export type ContextMode = 'project' | 'all' | 'none';
 export type Graph = 'local' | 'beads';
 export interface SubagentRow { id: string; name: string; kind: 'task' | 'eval'; state: 'running' | 'closed' | 'error' }
-export interface MissionConfig { version: 1; controls: boolean; maxWorkers: number; frontend: Frontend; graph: Graph; modelRole: string; workerRole: string; workerContext: ContextMode; reviewContext: ContextMode; autoDispatch: boolean; customCommand?: string; keys: { expand: string | null; fullscreen: string | null; mode: string | null } }
+export interface MissionConfig { version: 1; controls: boolean; maxWorkers: number; reviewConcurrency: number; frontend: Frontend; graph: Graph; modelRole: string; workerRole: string; workerContext: ContextMode; reviewContext: ContextMode; autoDispatch: boolean; customCommand?: string; keys: { expand: string | null; fullscreen: string | null; mode: string | null } }
 /** What the operator should do now: a slash command to run, or just a status when the coordinator is working. */
 export interface Step { command?: string; text: string }
 export interface Projection { mission: Mission; snapshot?: Snapshot; resumeHold: boolean; ownershipError?: string; selected?: string; history?: AuditEvent[]; expanded?: boolean; outlineOffset?: number; nativePlan?: boolean; step?: Step; frontend?: Frontend; expandKey?: string | null; subagents?: SubagentRow[] }

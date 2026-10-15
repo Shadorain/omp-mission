@@ -121,10 +121,12 @@ export function validateMission(value: unknown): Mission {
       const target = object(rawTarget, `reviewProgress.targets[${label}]`);
       if (!Array.isArray(target.findings)) invalid(`reviewProgress.targets[${label}].findings must be an array`);
       targets[text(label, "reviewProgress.targets label", 1000)] = { summary: text(target.summary, "reviewProgress.targets summary", 50_000), findings: target.findings.map(validateFinding), ...(target.transcript === undefined ? {} : { transcript: text(target.transcript, "reviewProgress.targets transcript", 4000) }) };
+      if (target.model !== undefined) targets[label]!.model = text(target.model, "reviewProgress.targets model", 1000);
     }
     const failures: Record<string, string> = {};
     for (const [label, reason] of Object.entries(failuresRow)) failures[text(label, "reviewProgress.failures label", 1000)] = text(reason, "reviewProgress.failures reason", 10_000);
     reviewProgress = { round: item.round, revision: text(item.revision, "reviewProgress.revision", 1000), model: text(item.model, "reviewProgress.model", 1000), inputs, targets, failures, at: text(item.at, "reviewProgress.at", 100) };
+    if (item.retryModel !== undefined) reviewProgress.retryModel = text(item.retryModel, "reviewProgress.retryModel", 1000);
   }
   const repairLinksRow = object(row.repairLinks, "repairLinks");
   const repairLinks: Record<string, string[]> = {};
@@ -141,6 +143,13 @@ export function validateMission(value: unknown): Mission {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(missionId)) invalid("id contains unsafe path characters");
   const mission: Mission = { version: 1, id: missionId, source: validSource(row.source), workspace: validWorkspace(row.workspace), scopes, phase: row.phase as Phase, evidence, mode: row.mode as Mode, keep: row.keep, reviewRequested: row.reviewRequested, workers, reviews, repairLinks, round, createdAt: text(row.createdAt, "createdAt", 100), updatedAt: text(row.updatedAt, "updatedAt", 100) };
   if (reviewProgress !== undefined) mission.reviewProgress = reviewProgress;
+  if (row.modelOverrides !== undefined) {
+    const models = object(row.modelOverrides, "modelOverrides");
+    mission.modelOverrides = {};
+    for (const key of ['coordinator', 'worker', 'review'] as const) {
+      if (models[key] !== undefined) mission.modelOverrides[key] = text(models[key], `modelOverrides.${key}`, 1000);
+    }
+  }
   const epicId = optionalText(row.epicId, "epicId", 1000);
   const controllerNonce = optionalText(row.controllerNonce, "controllerNonce", 100);
   const blocker = optionalText(row.blocker, "blocker", 20_000);

@@ -138,7 +138,7 @@ test('a quota end parks the pending plan without sending another turn', async ()
   if (!pending || pending.type !== 'custom') throw new Error('Pending entry missing');
   const recovered = validateMission(pending.data);
   expect(recovered.source.body).toContain('keep this plan');
-  expect(recovered.blocker).toBe('Provider quota exhausted. Restore quota or change the model, then /mission continue');
+ expect(recovered.blocker).toBe('Provider quota exhausted. Restore quota or change the model, then /mission continue\nYour weekly usage quota has been exhausted');
   expect(recovered.phase).toBe('plan');
   expect(run.sent.length).toBe(before);
   await run.events.get('session_shutdown')!({}, run.context);

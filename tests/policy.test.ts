@@ -1,5 +1,5 @@
 import {test,expect} from 'bun:test';
-import {nextAction,operatorStep,operatorCommands,setMode,approveGate,enforceMutation,enforceGate,waveGate,terminalCapacity,QUOTA_BLOCKER} from '../src/controller';
+import {nextAction,operatorStep,operatorCommands,modelRetryTargets,setMode,approveGate,enforceMutation,enforceGate,waveGate,terminalCapacity,QUOTA_BLOCKER} from '../src/controller';
 import type {Mission,Snapshot,PolicyContext} from '../src/types';
 export function fixture(): Mission {return {version:1,id:'freeform-test',source:{kind:'freeform',id:'test',title:'test',body:'test',comments:'',extra:''},workspace:{key:'key',cwd:'/tmp',delivery:'local'},epicId:'epic',scopes:{a:['a.ts'],b:['b.ts']},phase:'execute',evidence:{},mode:'auto',keep:false,reviewRequested:false,workers:[],reviews:[],repairLinks:{},round:1,createdAt:'now',updatedAt:'now'};}
 const ready:Snapshot={beads:[{id:'a',title:'a',status:'open',children:[],ready:true,category:'ready'},{id:'b',title:'b',status:'open',children:[],ready:true,category:'ready'}],leaves:[],ready:['a','b'],closed:0,active:0,blocked:0,fetchedAt:Date.now()};ready.leaves=ready.beads;
@@ -188,3 +188,28 @@ test('a terminal quota error parks; a clean stop and an in-flight retry do not',
  expect(operatorStep(m,action,policy).command).toBe('/mission continue');
 });
 
+
+test('model recovery respects holds and targets only failed owned subagents',()=>{
+ const m=fixture();m.graph='beads';
+ m.workers=[
+  {beadId:'a',attempt:'1',cwd:'/tmp',files:['a.ts'],state:'running',frontend:'subagent',assignment:'worker',error:'quota exhausted'},
+  {beadId:'b',attempt:'2',cwd:'/tmp',files:['b.ts'],state:'running',frontend:'subagent',assignment:'worker'},
+ ];
+ const activeBeads=ready.beads.map(bead=>({...bead,category:'active' as const,claimActor:bead.id}));
+ const active={...ready,beads:activeBeads,leaves:activeBeads};
+ expect(modelRetryTargets(m,active,policy)).toEqual({coordinator:false,review:false,workers:['a']});
+ for(const guard of [{resumeHold:true},{owned:false},{nativePlan:true},{fresh:false}])
+  expect(modelRetryTargets(m,active,{...policy,...guard})).toBeUndefined();
+ expect(modelRetryTargets(m,{...active,error:'graph offline'},policy)).toBeUndefined();
+ activeBeads[0]!.claimActor='someone-else';
+ expect(modelRetryTargets(m,active,policy)).toBeUndefined();
+ activeBeads[0]!.claimActor='a';
+ m.gate={kind:'wave',token:'scope',detail:'Approve',approved:false};
+ expect(modelRetryTargets(m,active,policy)).toBeUndefined();
+ delete m.gate;
+ m.evidence.verify={outcome:'failed',detail:'tests failed',at:'now'};
+ expect(modelRetryTargets(m,active,policy)).toBeUndefined();
+ delete m.evidence.verify;
+ m.blocker='Unrelated ownership conflict';
+ expect(modelRetryTargets(m,active,policy)).toBeUndefined();
+});

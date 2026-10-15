@@ -12,6 +12,10 @@ export function providerCapacity(detail: string): 'quota' | 'rate' | undefined {
 }
 /** Persisted coordinator park. `/mission continue` clears it; it is not a completed mission. */
 export const QUOTA_BLOCKER = 'Provider quota exhausted. Restore quota or change the model, then /mission continue';
+export const RATE_BLOCKER = 'Provider rate limit exceeded. Wait for cooldown or switch the model, then /mission continue';
+export function isProviderBlocker(blocker: string | undefined): boolean {
+ return !!blocker && (blocker.startsWith(QUOTA_BLOCKER) || blocker.startsWith(RATE_BLOCKER));
+}
 export function quotaBlocked(m: Pick<Mission, 'blocker' | 'workers' | 'evidence'>): boolean {
  if (m.blocker && providerCapacity(m.blocker) === 'quota') return true;
  if (m.evidence.review?.outcome === 'failed' && providerCapacity(m.evidence.review.detail) === 'quota') return true;
@@ -190,12 +194,25 @@ export function nextAction(m: Mission, snapshot: Snapshot | undefined, policy: P
  if (m.mode === 'pause' && (m.gate?.token !== gate.token || !m.gate.approved)) return {kind: 'hold', detail: gate.detail, gate};
  return {kind: 'review', detail: 'Run independent revision-bound review'};
 }
+export function modelRetryTargets(m: Mission, snapshot: Snapshot | undefined, p: PolicyContext) {
+ if (m.phase === 'complete' || p.nativePlan || p.resumeHold || !p.owned || m.evidence.verify?.outcome === 'failed' || m.gate && !m.gate.approved) return undefined;
+ if (effectiveGraph(m) === 'beads' && (!p.fresh || !snapshot || snapshot.error)) return undefined;
+ const coordinator = isProviderBlocker(m.blocker);
+ if (m.blocker && !coordinator) return undefined;
+ const review = m.phase === 'review' && m.evidence.review?.outcome === 'failed' && m.evidence.verify?.outcome === 'passed' && m.evidence.deliver?.outcome === 'passed';
+ const workers = p.fresh && snapshot && !snapshot.error ? m.workers.filter(worker =>
+  worker.state !== 'closed' && worker.frontend === 'subagent' && worker.error &&
+  snapshot.leaves.some(bead => bead.id === worker.beadId && bead.category === 'active' && bead.claimActor === worker.beadId)
+ ).map(worker => worker.beadId) : [];
+ return coordinator || review || workers.length ? {coordinator, review, workers} : undefined;
+}
 /**
  * Every /mission verb valid right now: always-on controls, contextual commands, then
  * commands bound to the selected bead as full strings (`focus bd-1`). Mutating verbs
  * mirror the guards their control operation enforces, so the menu never offers a
  * command that can only fail on ownership, holds, plan mode, or a stale snapshot.
  */
+
 export function operatorCommands(m: Mission | undefined, pending: boolean, snapshot: Snapshot | undefined, p: PolicyContext, selected?: string, operation = false): string[] {
  const commands = ['show', 'config', 'history'];
  if (pending || m?.phase === 'complete') {
@@ -207,7 +224,7 @@ export function operatorCommands(m: Mission | undefined, pending: boolean, snaps
  // worker or a frontend without a tab would surface a guaranteed failure instead.
  if (worker?.handle && worker.state !== 'closed' && ['orca', 'herdr'].includes(worker.frontend ?? 'orca')) commands.push(`focus ${worker.beadId}`);
  if (!m || m.phase === 'complete' || p.nativePlan || operation) return commands;
- if (p.resumeHold || !p.owned || m.evidence.verify?.outcome==='failed' || m.blocker?.startsWith(QUOTA_BLOCKER)) commands.push('continue');
+ if (p.resumeHold || !p.owned || m.evidence.verify?.outcome==='failed' || isProviderBlocker(m.blocker)) commands.push('continue');
  commands.push('mode');
  // A scheduled automatic retry is the extension's step, so the operator is not asked for it.
  if (m.evidence.deliver?.outcome === 'passed' && m.evidence.verify?.outcome !== 'failed' && !m.blocker &&
@@ -236,7 +253,7 @@ export function operatorStep(m: Mission, action: Action, p: PolicyContext, owner
  if (ownershipError) return {command: '/mission continue', text: `Lost control of the mission (${ownershipError}); take it back`};
  if (p.resumeHold) return {command: '/mission continue', text: 'Take control of this resumed mission'};
  if (action.gate) return {command: '/mission approve', text: action.gate.detail};
- if (m.blocker) return {command: m.blocker.startsWith(QUOTA_BLOCKER) ? '/mission continue' : '/mission', text: m.blocker};
+ if (m.blocker) return {command: isProviderBlocker(m.blocker) ? '/mission continue' : '/mission', text: m.blocker};
  if(verificationParked(m))return {command:'/mission continue',text:`Verification blocked: ${m.evidence.verify!.detail}. Continue releases the hold so the fix can be bound and dispatched; it does not mark the blocker fixed`};
  if (action.kind === 'resend' && action.ids?.length) return {command: `/mission resend ${action.ids[0]}`, text: action.detail};
  if (action.kind === 'hold') {

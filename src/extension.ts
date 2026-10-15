@@ -14,7 +14,7 @@ import { acquireOwnership, listMissions, loadMission, missionId, missionPath, sa
 import type { Ownership } from './store';
 import { readClaimActor, readGraph, readHistory } from './beads';
 import { createWorkerDriver } from './workers';
-import { approveGate, autoDispatchAllowed, consumeGate, displayPhase, effectiveGraph, enforceGate, enforceMutation, nextAction, operatorCommands, operatorStep, QUOTA_BLOCKER, requireBeadsGraph, revisionGate, reviewFailureStep, setMode, terminalCapacity, waveGate } from './controller';
+import { approveGate, autoDispatchAllowed, consumeGate, displayPhase, effectiveGraph, enforceGate, enforceMutation, isProviderBlocker, modelRetryTargets, nextAction, operatorCommands, operatorStep, QUOTA_BLOCKER, RATE_BLOCKER, requireBeadsGraph, revisionGate, reviewFailureStep, setMode, terminalCapacity, waveGate } from './controller';
 import { alignVerifiedRevision, captureRevision, Reviewer, roleModelString } from './review';
 import { beadTask, coordinatorPrompt, guide, planSlug, workerPrompt } from './prompts';
 import { createMissionWidget, createMissionInspector, phaseLabel } from './ui';
@@ -40,7 +40,7 @@ export function nativePlan(ctx: ExtensionContext): boolean {
 export default async function missionExtension(pi: ExtensionAPI) {
  if(process.env.OMP_MISSION_WORKER==='1')return;
  const agentDir=resolveAgentDir();let config:MissionConfig;let configError:string|undefined;
- try{config=await readMissionConfig(agentDir);}catch(error){configError=String(error);config={version:1,controls:false,maxWorkers:2,frontend:'none',graph:'local',modelRole:'default',workerRole:'default',workerContext:'project',reviewContext:'project',autoDispatch:false,keys:{expand:null,fullscreen:null,mode:null}};}
+ try{config=await readMissionConfig(agentDir);}catch(error){configError=String(error);config={version:1,controls:false,maxWorkers:2,reviewConcurrency:3,frontend:'none',graph:'local',modelRole:'default',workerRole:'default',workerContext:'project',reviewContext:'project',autoDispatch:false,keys:{expand:null,fullscreen:null,mode:null}};}
  let ctx:ExtensionContext|undefined;let mission:Mission|undefined;let path:string|undefined;let pending:Mission|undefined;
  let snapshot:Snapshot|undefined;let ownership:Ownership|undefined;let resumeHold=true;let ownershipError:string|undefined;
  let ignoredPaths=new Set<string>();
@@ -495,11 +495,12 @@ async function finishMission(context:ExtensionContext){
  const scopesSchema=z.record(z.string(),z.array(z.string()).min(1));
  pi.registerTool({name:'mission_status',defaultInactive:true,loadMode:'essential',label:'Mission status',description:'Inspect authoritative cached mission graph, hold, gates and next coordinator action.',approval:'read',parameters:z.object({}),execute:async(_id,_params,_signal,_update,context)=>{if(!eligible(context))throw new Error('Mission coordinator only');if(!operation)await refresh(false);return {content:[{type:'text',text:JSON.stringify(status(context))}],details:{}};}});
  const controlSchema=z.object({
-  operation:z.enum(['start','clear','continue','bind_workspace','bind_graph','dispatch','record_verification','record_delivery','run_review','accept_repairs','bind_repairs','resend','release','reap','reject_finding']),
+  operation:z.enum(['start','clear','continue','retry-model','bind_workspace','bind_graph','dispatch','record_verification','record_delivery','run_review','accept_repairs','bind_repairs','resend','release','reap','reject_finding']),
   cwd:z.string().optional(),base:z.string().optional(),beadsDir:z.string().optional(),delivery:z.enum(['pr','local']).optional(),
   epicId:z.string().optional(),scopes:scopesSchema.optional(),repairLinks:z.record(z.string(),z.array(z.string())).optional(),
   beadId:z.string().optional(),detail:z.string().optional(),files:z.array(z.string()).max(50).optional().describe('resend only: extra workspace-relative paths the stopped subagent worker may edit'),passed:z.boolean().optional(),url:z.string().optional(),
-  mode:z.enum(['auto','pause','force']).optional(),keep:z.boolean().optional(),findingId:z.string().optional()
+  mode:z.enum(['auto','pause','force']).optional(),keep:z.boolean().optional(),findingId:z.string().optional(),
+  model:z.string().min(1).max(1000).optional()
  });
  async function control(rawParams:unknown,context:ExtensionContext,_signal?:AbortSignal,internal:{reuseOnly?:boolean;operator?:boolean}={}){
   const params=controlSchema.parse(rawParams);
@@ -520,11 +521,42 @@ async function finishMission(context:ExtensionContext){
    if(params.operation==='start'){if(mission)throw new Error('Mission already started');if(!pending)throw new Error('Resolve /mission source first');mission=pending;pending=undefined;path=missionPath(agentDir,mission);await acquire();resumeHold=false;providerHold=undefined;mission.phase='isolate';mission.evidence.plan={outcome:'passed',detail:'Operator approved plan or explicit Force start',at:new Date().toISOString()};await persist(mission);pi.appendEntry('mission:pointer',{path,ignoredPaths:[...ignoredPaths]});await writeSourceFile(mission);}
    else if(params.operation==='continue'){
     if(mission?.evidence.verify?.outcome==='failed'&&!internal.operator)throw new Error('Verification is held; the operator must run /mission continue after resolving the blocker');
-    if(!mission)throw new Error('No saved mission');await acquire();const mode=params.mode??inspectionIntent.mode;if(mode)setMode(mission,mode);
+    if(!mission)throw new Error('No saved mission');
+    if(mission.modelOverrides?.coordinator){
+     const model=context.modelRegistry.getAvailable().find(model=>`${model.provider}/${model.id}`===mission!.modelOverrides!.coordinator);
+     if(!model||!await pi.setModel(model))throw new Error(`Selected recovery model is unavailable: ${mission.modelOverrides.coordinator}`);
+    }
+    await acquire();const mode=params.mode??inspectionIntent.mode;if(mode)setMode(mission,mode);
     if(inspectionIntent.reviewRequested){mission.reviewRequested=true;if(mission.evidence.review?.outcome==='failed')delete mission.evidence.review;}
     if(mission.evidence.verify?.outcome==='failed')mission.evidence.verify={...mission.evidence.verify,outcome:'pending'};
-    if(params.keep!==undefined)mission.keep=params.keep;resumeHold=false;if(mission.blocker?.startsWith(QUOTA_BLOCKER))delete mission.blocker;providerHold=undefined;await persist(mission);inspectionIntent={};pi.appendEntry('mission:pointer',{path,ignoredPaths:[...ignoredPaths]});
+    if(params.keep!==undefined)mission.keep=params.keep;resumeHold=false;if(isProviderBlocker(mission.blocker))delete mission.blocker;providerHold=undefined;await persist(mission);inspectionIntent={};pi.appendEntry('mission:pointer',{path,ignoredPaths:[...ignoredPaths]});
     await refresh(false);
+   }
+   else if(params.operation==='retry-model'){
+    if(!internal.operator)throw new Error('Model recovery requires an explicit operator choice');
+    if(!mission)throw new Error('No active mission');
+    await refresh(false);
+    const targets=modelRetryTargets(mission,snapshot,policy(context));
+    if(!targets)throw new Error('No retryable failed work, or a gate, ownership, verification, or resume hold prevents recovery');
+    await ownership!.assertOwned();
+    const model=context.modelRegistry.getAvailable().find(model=>`${model.provider}/${model.id}`===params.model);
+    if(!model)throw new Error(`Selected recovery model is unavailable: ${params.model}`);
+    if(targets.workers.some(id=>workerAgents.isLive(id)))throw new Error('A failed worker is still running; wait for it to stop');
+    if(!context.isIdle()||!await pi.setModel(model))throw new Error('Coordinator is busy or the selected model has no credentials');
+    const selector=`${model.provider}/${model.id}`;
+    mission.modelOverrides={coordinator:selector,worker:selector,review:selector};
+    if(targets.coordinator){delete mission.blocker;providerHold=undefined;}
+    if(targets.review){
+     if(mission.reviewProgress)mission.reviewProgress.retryModel=selector;
+     delete mission.evidence.review;mission.reviewRequested=true;
+    }
+    await persist(mission);
+    const failures:string[]=[];
+    for(const id of targets.workers){
+     try{await driver.resend(mission,id,snapshot!.leaves.find(bead=>bead.id===id)!);}
+     catch(error){failures.push(`${id}: ${String(error)}`);}
+    }
+    if(failures.length)throw new Error(`Recovery model saved; some workers could not resume: ${failures.join('; ')}`);
    }
    else{
     if(!mission)throw new Error('No active mission');enforceMutation(mission,policy(context));await ownership!.assertOwned();
@@ -588,7 +620,7 @@ async function finishMission(context:ExtensionContext){
      const revision=alignVerifiedRevision(mission,await captureRevision(mission,run));
      const prior=mission.evidence.review;const failedBefore=prior?.outcome==='failed'&&prior.revision===mission.evidence.verify?.revision?prior.attempts??1:0;
      enforceGate(mission,revisionGate(mission,'review',revision));mission.phase='review';mission.evidence.review={outcome:'active',detail:'Independent reviewer running',revision,at:new Date().toISOString(),...(failedBefore?{attempts:failedBefore}:{})};await persist(mission);reviewStarted=true;reviewRows=[];await render();
-     const reviewFiles=await contextFilesFor(config.reviewContext,mission.workspace.cwd,agentDir);const targets=config.frontend==='subagent'&&mission.graph==='beads'&&snapshot?snapshot.leaves.filter(b=>mission!.scopes[b.id]?.length).map(b=>({id:b.id,title:b.title,text:beadTask(b)??b.title,files:mission!.scopes[b.id]!})):[];const result=targets.length>1?await reviewer.runPerBead(mission,context,run,config.modelRole,reviewFiles,targets):await reviewer.run(mission,context,run,config.modelRole,reviewFiles);if(epoch!==generation)throw new Error('Session changed during review');
+     const reviewFiles=await contextFilesFor(config.reviewContext,mission.workspace.cwd,agentDir);const targets=config.frontend==='subagent'&&mission.graph==='beads'&&snapshot?snapshot.leaves.filter(b=>mission!.scopes[b.id]?.length).map(b=>({id:b.id,title:b.title,text:beadTask(b)??b.title,files:mission!.scopes[b.id]!})):[];const result=targets.length>1?await reviewer.runPerBead(mission,context,run,config.modelRole,reviewFiles,targets,config.reviewConcurrency):await reviewer.run(mission,context,run,config.modelRole,reviewFiles);if(epoch!==generation)throw new Error('Session changed during review');
      consumeGate(mission);
      mission.reviews.push(result);
      mission.evidence.review = {outcome:'passed',detail:result.summary,revision:result.revision,at:result.at};
@@ -722,19 +754,19 @@ async function finishMission(context:ExtensionContext){
  pi.on('tool_execution_end',(event)=>{subagents=noteSubagentToolEnd(subagents,event);void render();});
  async function noteProviderStop(messages: readonly unknown[]){
   const kind=terminalCapacity(messages);
-  if(kind==='rate'){providerHold='rate';await render();return;}
-  if(kind!=='quota'){providerHold=undefined;return;}
-  providerHold='quota';
+  if(!kind){providerHold=undefined;return;}
+  providerHold=kind;
   const target=mission??pending;
   if(target&&!target.blocker){
-   target.blocker=QUOTA_BLOCKER;
-   if(target===pending)pi.appendEntry('mission:pending',pending);
-   if(target===mission&&ownership&&!resumeHold){try{await persist(mission);}catch{/* in-memory park still stops the next wake */}}
+   const last=messages.findLast(message=>isRecord(message)&&message.role==='assistant');
+   const detail=isRecord(last)&&typeof last.errorMessage==='string'?last.errorMessage.slice(0,12000):'';
+   target.blocker=`${kind==='quota'?QUOTA_BLOCKER:RATE_BLOCKER}${detail?`\n${detail}`:''}`;
+   if(target===mission&&ownership&&!resumeHold)try{await persist(mission);await publishStatus();}catch{/* in-memory park still stops the next wake */}
   }
   await render();
  }
  pi.on('agent_end',async(event)=>{subagents=noteSubagentTurnEnd(subagents);if(!event.willContinue)await noteProviderStop(event.messages);else await render();});
- pi.on('turn_start',async()=>{const parked=(mission??pending)?.blocker;const ours=parked?.startsWith(QUOTA_BLOCKER)===true;if(ours){if(mission?.blocker?.startsWith(QUOTA_BLOCKER))delete mission.blocker;if(pending?.blocker?.startsWith(QUOTA_BLOCKER)){delete pending.blocker;pi.appendEntry('mission:pending',pending);}}providerHold=undefined;if(ours&&mission&&ownership&&!resumeHold){try{await persist(mission);}catch{/* the in-memory park is already cleared */}}});
+ pi.on('turn_start',async()=>{const parked=(mission??pending)?.blocker;const ours=isProviderBlocker(parked);if(ours){if(mission&&isProviderBlocker(mission.blocker))delete mission.blocker;if(pending&&isProviderBlocker(pending.blocker)){delete pending.blocker;pi.appendEntry('mission:pending',pending);}}providerHold=undefined;if(ours&&mission&&ownership&&!resumeHold){try{await persist(mission);}catch{/* the in-memory park is already cleared */}}});
  pi.events.on('mission:query',(request:unknown)=>{
   if(!isRecord(request)||typeof request.cwd!=='string'||typeof request.reply!=='function'||!ctx||!eligible(ctx)||!mission||request.cwd!==ctx.cwd)return;
   request.reply({workspace:mission.workspace.cwd,beadsDir:mission.workspace.beadsDir,epicId:mission.epicId,graph:effectiveGraph(mission),mode:mission.mode,hold:nativePlan(ctx)?'Native plan mode':resumeHold?'Resume hold':ownershipError??(!ownership?'Controller ownership required':false),projection:snapshot?{ready:snapshot.ready,closed:snapshot.closed,total:snapshot.leaves.length,error:snapshot.error}:undefined});

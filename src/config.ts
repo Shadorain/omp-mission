@@ -8,6 +8,7 @@ export const DEFAULT_MISSION_CONFIG: MissionConfig = {
   version: 1,
   controls: false,
   maxWorkers: 2,
+  reviewConcurrency: 3,
   frontend: "none",
   graph: "local",
   modelRole: "default",
@@ -50,6 +51,8 @@ export function validateMissionConfig(value: unknown, path = "mission.json"): Mi
   if (value.controls !== undefined && typeof value.controls !== "boolean") return fail("controls must be boolean");
   const maxWorkers = value.maxWorkers === undefined ? 2 : value.maxWorkers;
   if (typeof maxWorkers !== "number" || !Number.isInteger(maxWorkers) || maxWorkers < 1 || maxWorkers > 8) return fail("maxWorkers must be an integer from 1 through 8");
+  const reviewConcurrency = value.reviewConcurrency === undefined ? DEFAULT_MISSION_CONFIG.reviewConcurrency : value.reviewConcurrency;
+  if (typeof reviewConcurrency !== "number" || !Number.isInteger(reviewConcurrency) || reviewConcurrency < 1 || reviewConcurrency > 8) return fail("reviewConcurrency must be an integer from 1 through 8");
   const keys = value.keys === undefined ? DEFAULT_MISSION_CONFIG.keys : value.keys;
   if (!isRecord(keys)) return fail("keys must be an object");
   const normalized: Record<"expand" | "fullscreen" | "mode", string | null> = { expand: null, fullscreen: null, mode: null };
@@ -83,7 +86,7 @@ export function validateMissionConfig(value: unknown, path = "mission.json"): Mi
     contexts[name] = raw;
   }
   if (value.autoDispatch !== undefined && typeof value.autoDispatch !== "boolean") return fail("autoDispatch must be boolean");
-  return { version: 1, controls: value.controls ?? false, maxWorkers, frontend, graph, modelRole: roles.modelRole, workerRole: roles.workerRole, ...contexts, autoDispatch: value.autoDispatch ?? false, ...(customCommand ? { customCommand } : {}), keys: normalized };
+  return { version: 1, controls: value.controls ?? false, maxWorkers, reviewConcurrency, frontend, graph, modelRole: roles.modelRole, workerRole: roles.workerRole, ...contexts, autoDispatch: value.autoDispatch ?? false, ...(customCommand ? { customCommand } : {}), keys: normalized };
 }
 
 export async function readMissionConfig(agentDir: string): Promise<MissionConfig> {
@@ -125,6 +128,7 @@ export function formatMissionConfig(config: MissionConfig, path: string, mission
 		`  version: ${config.version}`,
 		`  controls: ${config.controls}`,
 		`  maxWorkers: ${config.maxWorkers}`,
+		`  reviewConcurrency: ${config.reviewConcurrency}`,
 		`  frontend: ${config.frontend}`,
 		`  modelRole: ${config.modelRole}`,
 		`  workerRole: ${config.workerRole}`,

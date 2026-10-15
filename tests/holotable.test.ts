@@ -7,10 +7,11 @@ import { createConnection } from 'node:net';
 import { resolveLocalUrlToPath } from '@oh-my-pi/pi-coding-agent/internal-urls/local-protocol';
 import type { ExtensionAPI, ExtensionContext } from '@oh-my-pi/pi-coding-agent';
 import missionExtension from '../src/extension';
-import { listMissions, missionPath, saveMission } from '../src/store';
+import { listMissions, loadMission, missionPath, saveMission } from '../src/store';
 import { buildContactStatus, gateTokenId, autostartMessage, envBase, envCheckout, envDelivery, envGraph, planRevision, parseUsageLines, sumAssistantUsage, UsageProbe, type ContactStatus } from '../src/holotable';
 import { planSlug } from '../src/prompts';
 import type { Mission } from '../src/types';
+import { QUOTA_BLOCKER } from '../src/controller';
 
 type Handler = (event: unknown, context: ExtensionContext) => Promise<any>;
 const roots: string[] = [];
@@ -59,7 +60,7 @@ function ctl(socket: string, request: unknown): Promise<Record<string, any>> {
 }
 
 // Real extension, real store; pi.exec/UI faked as in autostart.test.ts.
-async function session(options: { plan?: boolean; child?: boolean; autostart?: string; mission?: Mission; entries?: Array<Record<string, unknown>>; beforeLoad?: (root: string) => Promise<void> | void } = {}) {
+async function session(options: { plan?: boolean; child?: boolean; autostart?: string; mission?: Mission; models?: Array<{provider:string;id:string}>; entries?: Array<Record<string, unknown>>; beforeLoad?: (root: string) => Promise<void> | void } = {}) {
 	const root = await realpath(await mkdtemp(join(tmpdir(), 'holotable-')));
 	roots.push(root);
 	const cwd = join(root, 'workspace');
@@ -83,6 +84,7 @@ async function session(options: { plan?: boolean; child?: boolean; autostart?: s
 	];
 	const context = {
 		agent: { kind: 'main' }, cwd, hasUI: false,
+		modelRegistry: { getAvailable: () => options.models ?? [] },
 		sessionManager: { getBranch: () => branch, getEntries: () => branch, getSessionName: () => undefined },
 		localProtocolOptions: { getArtifactsDir: () => join(root, 'artifacts'), getSessionId: () => 'test-session' },
 		ui: { notify: (message: string) => { notices.push(message); }, setWidget: () => {} },
@@ -97,6 +99,7 @@ async function session(options: { plan?: boolean; child?: boolean; autostart?: s
 		appendEntry: (customType: string, data: unknown) => { branch.push({ type: 'custom', customType, data }) },
 		sendUserMessage: (message: string) => { sent.push(message); },
 		sendMessage: async () => {}, setSessionName: async () => {},
+		setModel: async () => true,
 		exec: async (name: string, args: string[]) => {
 			if (name === 'git') return { code: 128, stdout: '', stderr: 'not a git repository' };
 			if (name === 'lin') return { code: 0, stdout: JSON.stringify({ issue: { identifier: 'CHR-123', title: 'Startup', description: '', comments: { nodes: [] } } }), stderr: '' };
@@ -698,4 +701,30 @@ test('disabled compact approval still permits native refinement without bypassin
 	expect((await ctl(socket, { v: 1, op: 'plan-refine', operator: true, args: { message: 'Narrow scope' } })).ok).toBe(true);
 	expect(calls).toEqual([['disabled', 'refine', { feedback: 'Narrow scope' }]]);
 	await run.event('session_shutdown', {});
+});
+
+test('operator model recovery uses the live socket, preserves holds and refuses stale or unavailable retries', async () => {
+ const mission=baseMission('/tmp',{blocker:QUOTA_BLOCKER});
+ const run=await session({child:true,mission,models:[{provider:'p',id:'replacement'}]});
+ try{
+  let status=await statusOf(run,mission);
+  const socket=status.ctl!.socket;
+  const retry=(model='p/replacement',operator=true)=>ctl(socket,{v:1,op:'retry-model',operator,args:{model}});
+  expect((await loadMission(missionPath(run.root,mission))).modelOverrides).toBeUndefined();
+  status=await statusOf(run,mission);
+  await run.command('continue');
+  await run.event('agent_end',{messages:[{role:'assistant',stopReason:'error',errorMessage:'usage_limit_reached'}]});
+  status=await statusOf(run,mission);
+  expect(status.hold).toBe('quota');
+  expect(status.actions).toContain('retry-model');
+  expect((await retry('missing/model')).ok).toBe(false);
+  expect((await loadMission(missionPath(run.root,mission))).blocker).toBe(`${QUOTA_BLOCKER}\nusage_limit_reached`);
+  expect((await retry()).ok).toBe(true);
+  const saved=await loadMission(missionPath(run.root,mission));
+  expect(saved.blocker).toBeUndefined();
+  expect(saved.modelOverrides).toEqual({coordinator:'p/replacement',worker:'p/replacement',review:'p/replacement'});
+  expect(saved.mode).toBe(mission.mode);
+  expect(saved.phase).toBe(mission.phase);
+  expect((await retry()).ok).toBe(false);
+ }finally{await run.event('session_shutdown',{});}
 });

@@ -4,15 +4,15 @@ import { createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ExtensionContext, PlanReviewChoice } from '@oh-my-pi/pi-coding-agent';
-import { displayPhase, effectiveGraph, operatorCommands, providerCapacity, quotaBlocked, reviewRetryAt } from './controller';
+import { displayPhase, effectiveGraph, modelRetryTargets, operatorCommands, providerCapacity, quotaBlocked, reviewRetryAt } from './controller';
 import { isRecord } from './guards';
 import { displaySourceId } from './sources';
 import { missionDirectory } from './store';
 import { phases, type Evidence, type Mission, type Mode, type PolicyContext, type Snapshot, type Step } from './types';
 
 // The holotable fleet contract (omp-holotable/docs/contract.md). Kept local: the repos do not import across.
-export const OPERATOR_OPS = ['approve', 'continue', 'mode', 'review', 'dispatch', 'resend', 'release', 'reap', 'clear', 'plan-approve'] as const;
-const SOCKET_OPS: Record<string, true> = { ping: true, approve: true, continue: true, mode: true, review: true, dispatch: true, resend: true, release: true, reap: true, clear: true, plan: true, 'plan-edit': true, 'plan-refine': true, 'plan-approve': true };
+export const OPERATOR_OPS = ['approve', 'continue', 'mode', 'review', 'dispatch', 'resend', 'release', 'reap', 'clear', 'plan-approve', 'retry-model'] as const;
+const SOCKET_OPS: Record<string, true> = { ping: true, approve: true, continue: true, mode: true, review: true, dispatch: true, resend: true, release: true, reap: true, clear: true, plan: true, 'plan-edit': true, 'plan-refine': true, 'plan-approve': true, 'retry-model': true };
 // 1 MiB: a plan-edit request carries up to 256 KiB of text plus JSON escaping overhead.
 const MAX_LINE = 1024 * 1024;
 const MAX_PLAN = 256 * 1024;
@@ -232,6 +232,7 @@ export async function buildContactStatus(input: StatusInput): Promise<ContactSta
 				.map(command => command.split(' ')[0]!)
 				.filter((verb): verb is (typeof OPERATOR_OPS)[number] => (OPERATOR_OPS as readonly string[]).includes(verb)),
 		)];
+	if (!input.pending && !input.operation && modelRetryTargets(m, input.snapshot, input.policy)) actions.push('retry-model');
 	const detail = m.evidence.deliver?.detail ?? '';
 	const first = detail.split('\n', 1)[0]!.trim();
 	const url = /^https?:\/\/\S+$/.test(first) ? first : null;
@@ -548,6 +549,10 @@ export class HolotableBridge {
 				} else this.hooks.sendUserMessage(args.message);
 			} else {
 				const extra: Record<string, unknown> = {};
+				if (op === 'retry-model') {
+					if (typeof args.model !== 'string' || !args.model.trim() || args.model.length > 1000) return fail('bad-request', 'retry-model requires a concrete args.model');
+					extra.model = args.model;
+				}
 				if (typeof args.beadId === 'string') extra.beadId = args.beadId;
 				if (typeof args.detail === 'string') extra.detail = args.detail;
 				if (Array.isArray(args.files) && args.files.every(file => typeof file === 'string')) extra.files = args.files;
