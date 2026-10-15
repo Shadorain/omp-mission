@@ -56,7 +56,7 @@ export interface ContactStatus {
 	base: string | null;
 	phase: string;
 	progress: { step: number; of: number } | null;
-	hold: 'none' | 'plan-approval' | 'resume' | 'gate' | 'blocked' | 'quota';
+	hold: 'none' | 'plan-approval' | 'resume' | 'gate' | 'blocked' | 'quota' | 'question';
 	gate: { kind: string; id: string } | null;
 	next: string | null;
 	actions: string[];
@@ -209,6 +209,7 @@ export interface StatusInput {
 	usage: UsageTotals | null;
 	planPath?: string;
 	planReview?: boolean;
+	question?: string;
 }
 
 // Pure projection of mission state into the fleet status file. Async only for the worktree realpath.
@@ -218,26 +219,30 @@ export async function buildContactStatus(input: StatusInput): Promise<ContactSta
 	const worktree = await realpath(m.workspace.cwd).catch(() => m.workspace.cwd);
 	// An unreadable bead graph stops the controller (nextAction holds on snapshot.error) even though no blocker is saved.
 	const graphDown = phase !== 'complete' && !!m.epicId && effectiveGraph(m) === 'beads' && !!input.snapshot?.error;
-	const hold = quotaBlocked(m) ? 'quota'
-		: input.pending ? 'plan-approval'
+	const question = phase !== 'complete' ? input.question : undefined;
+	const hold = question ? 'question'
+		: quotaBlocked(m) ? 'quota'
+		: input.pending ? (m.blocker ? 'blocked' : 'plan-approval')
 		: input.resumeHold && phase !== 'complete' ? 'resume'
 		: m.gate ? 'gate'
 		: m.blocker || graphDown ? 'blocked'
 		: 'none';
-	const actions = input.pending
-		// plan-approve answers OMP's interactive plan review; it is advertised only while a review is actually open and resolvable.
-		? (input.planReview ? ['plan-approve'] : [])
+	const actions = question ? [] : input.pending
+		// plan-approve answers OMP's interactive plan review, never a question or a parked planning turn.
+		? (!m.blocker && input.planReview ? ['plan-approve'] : [])
 		: [...new Set(
 			operatorCommands(m, false, input.snapshot, input.policy, input.selected, input.operation)
 				.map(command => command.split(' ')[0]!)
 				.filter((verb): verb is (typeof OPERATOR_OPS)[number] => (OPERATOR_OPS as readonly string[]).includes(verb)),
 		)];
-	if (!input.pending && !input.operation && modelRetryTargets(m, input.snapshot, input.policy)) actions.push('retry-model');
+	if (!question && !input.pending && !input.operation && modelRetryTargets(m, input.snapshot, input.policy)) actions.push('retry-model');
 	const detail = m.evidence.deliver?.detail ?? '';
 	const first = detail.split('\n', 1)[0]!.trim();
 	const url = /^https?:\/\/\S+$/.test(first) ? first : null;
 	const branch = m.workspace.branch ?? null;
-	const next = input.step ? `${input.step.command ? `${input.step.command} — ` : ''}${input.step.text}`.replace(/\s*\n\s*/g, ' ').slice(0, 240) : null;
+	const next = question ? `Answer in mission: ${question}`.replace(/\s+/g, ' ').slice(0, 240)
+		: m.blocker ? m.blocker.replace(/\s+/g, ' ').slice(0, 240)
+		: input.step ? `${input.step.command ? `${input.step.command} — ` : ''}${input.step.text}`.replace(/\s*\n\s*/g, ' ').slice(0, 240) : null;
 	return {
 		schema: 1,
 		id: m.id,
@@ -302,6 +307,7 @@ export interface HolotableHooks {
 	owned(): boolean;
 	selected(): string | undefined;
 	operation(): boolean;
+	question(): string | undefined;
 	gateId(): string | undefined;
 	decide(context: ExtensionContext, verb: string, arg?: string): Promise<void>;
 	request(context: ExtensionContext, op: string, extra?: Record<string, unknown>): Promise<void>;
@@ -373,6 +379,7 @@ export class HolotableBridge {
 			usage: await this.usage.measure(current, coordinatorEntries),
 			planPath: this.hooks.planPath(),
 			planReview: this.hooks.planReview()?.canApprove === true,
+			question: this.hooks.question(),
 		});
 		const serialized = `${JSON.stringify(status, null, 2)}\n`;
 		const file = statusFilePath(this.agentDir, current);
@@ -493,6 +500,7 @@ export class HolotableBridge {
 		if (request.operator !== true) return fail('bad-request', 'Operator operations require "operator":true');
 		const context = this.hooks.context();
 		if (!context) return fail('no-session', 'No main-session context is attached');
+		if (this.hooks.question()) return fail('question-waiting', 'Answer the pending question in the mission pane before controlling the mission');
 		const args = (request.args ?? {}) as Record<string, unknown>;
 		const op = request.op;
 		try {

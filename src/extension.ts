@@ -49,6 +49,8 @@ export default async function missionExtension(pi: ExtensionAPI) {
  let inspectionIntent:{mode?:Mode;reviewRequested?:boolean}={};
  let reviewRows:SubagentRow[]=[];
  let planReview:PlanReviewRequestedEvent|undefined;
+ const pendingQuestions=new Map<string,string>();
+ const question=()=>[...pendingQuestions.values()].join(' · ')||undefined;
  let openedPlanRevision:string|undefined;
  let openingPlanReview=false;
  // Reviewers are in-process sessions: list them in the mission outline while they run, and keep their transcripts (also in Agent Hub) so a finished review can be inspected.
@@ -84,6 +86,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
  };
  // A pending mission has no saved action yet; a saved one asks the controller what a person can do now.
  function currentStep(context:ExtensionContext){
+  if(question())return {text:`Answer in mission: ${question()}`};
   if(operation&&mission)return {text:mission.evidence.review?.outcome==='active'?'Independent review running; the result is reported here when it ends':'Mission operation running'};
   if(mission){const p=policy(context);return operatorStep(mission,nextAction(mission,snapshot,p),p,ownershipError);}
   return pending&&nativePlan(context)?{text:'Approve the plan to start the mission'}:undefined;
@@ -114,6 +117,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
   owned:()=>!!ownership&&!ownershipError,
   selected:()=>selected,
   operation:()=>operation,
+  question,
   gateId:()=>mission?.gate?gateTokenId(mission.gate.token):undefined,
   decide:(context,verb,arg)=>decision(context,verb,arg),
   request:(context,op,extra)=>request(context,op,extra),
@@ -169,7 +173,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
   context.ui.setWidget('mission',(tui,theme)=>createMissionWidget(()=>projection()!,()=>tui.terminal.rows,theme),{placement:'aboveEditor'});
  }
  async function acquire(){if(!mission||!path)throw new Error('No saved mission');if(ownership){await ownership.assertOwned();return;}ownershipError=undefined;ownership=await acquireOwnership(path,mission,error=>{ownershipError=`Controller lost: ${error.message}`;resumeHold=true;lastWake='';void reviewer.dispose();void render();});mission=ownership.mission;mission.controllerNonce=ownership.nonce;}
- async function release(){const current=ownership;ownership=undefined;await current?.release();await holotable.close();}
+ async function release(){pendingQuestions.clear();const current=ownership;ownership=undefined;await current?.release();await holotable.close();}
  async function detach(context?:ExtensionContext){generation++;providerHold=undefined;coordinatorShells.clear();lifetime.abort();lifetime=new AbortController();terminalInputDispose?.();terminalInputDispose=undefined;overlayAbort?.abort();overlayAbort=undefined;if(timer&&ctx)ctx.clearTimer(timer);timer=undefined;await reviewer.dispose();await workerAgents.abortAll();await release();await publishStatus();ctx?.ui.setWidget('mission',undefined);ctx=context;mission=undefined;pending=undefined;path=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;lastWake='';guided='';selected=undefined;history=undefined;lastPoll=0;outlineOffset=0;inspectionIntent={};subagents=[];reviewRows=[];planReview=undefined;openedPlanRevision=undefined;openingPlanReview=false;}
  async function attach(file:string,context:ExtensionContext,announce=true){providerHold=undefined;await release();mission=await loadMission(file);path=file;pending=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;ctx=context;await refresh(false);await render();await openSocket(mission.id);await publishStatus();
   const step=announce?currentStep(context):undefined;
@@ -750,23 +754,32 @@ async function finishMission(context:ExtensionContext){
   return {isError:true,content:[...event.content,{type:'text' as const,text:`${detail}\n${changed.join('\n')}`}],additionalContext:`Mission verification recorded a coordinator edit. ${exit}`};
  });
  pi.on('before_subagent_spawn',(event)=>{subagents=noteSubagentSpawn(subagents,{agent:event.agent,invocationKind:event.invocationKind,spawnKey:event.spawnKey});void render();});
- pi.on('tool_execution_start',(event)=>{subagents=noteSubagentToolStart(subagents,event);void render();});
- pi.on('tool_execution_end',(event)=>{subagents=noteSubagentToolEnd(subagents,event);void render();});
+ pi.on('tool_execution_start',async(event,context)=>{
+  subagents=noteSubagentToolStart(subagents,event);
+  if(eligible(context)&&event.toolName==='ask'&&(mission||pending)){
+   const args=isRecord(event.args)?event.args:{};
+   const prompts=Array.isArray(args.questions)?args.questions.filter(isRecord).map(value=>value.question).filter((value):value is string=>typeof value==='string'&&!!value.trim()):[];
+   pendingQuestions.set(event.toolCallId,prompts.join(' · ')||'A question needs your answer');
+  }
+  await render();
+ });
+ pi.on('tool_execution_end',async(event,context)=>{subagents=noteSubagentToolEnd(subagents,event);if(eligible(context))pendingQuestions.delete(event.toolCallId);await render();});
  async function noteProviderStop(messages: readonly unknown[]){
   const kind=terminalCapacity(messages);
-  if(!kind){providerHold=undefined;return;}
+  if(!kind){providerHold=undefined;await render();return;}
   providerHold=kind;
   const target=mission??pending;
   if(target&&!target.blocker){
    const last=messages.findLast(message=>isRecord(message)&&message.role==='assistant');
    const detail=isRecord(last)&&typeof last.errorMessage==='string'?last.errorMessage.slice(0,12000):'';
    target.blocker=`${kind==='quota'?QUOTA_BLOCKER:RATE_BLOCKER}${detail?`\n${detail}`:''}`;
+   if(target===pending){target.updatedAt=new Date().toISOString();pi.appendEntry('mission:pending',target);}
    if(target===mission&&ownership&&!resumeHold)try{await persist(mission);await publishStatus();}catch{/* in-memory park still stops the next wake */}
   }
   await render();
  }
- pi.on('agent_end',async(event)=>{subagents=noteSubagentTurnEnd(subagents);if(!event.willContinue)await noteProviderStop(event.messages);else await render();});
- pi.on('turn_start',async()=>{const parked=(mission??pending)?.blocker;const ours=isProviderBlocker(parked);if(ours){if(mission&&isProviderBlocker(mission.blocker))delete mission.blocker;if(pending&&isProviderBlocker(pending.blocker)){delete pending.blocker;pi.appendEntry('mission:pending',pending);}}providerHold=undefined;if(ours&&mission&&ownership&&!resumeHold){try{await persist(mission);}catch{/* the in-memory park is already cleared */}}});
+ pi.on('agent_end',async(event)=>{subagents=noteSubagentTurnEnd(subagents);if(!event.willContinue){pendingQuestions.clear();await noteProviderStop(event.messages);}else await render();});
+ pi.on('turn_start',async()=>{const parked=(mission??pending)?.blocker;const ours=isProviderBlocker(parked);if(ours){if(mission&&isProviderBlocker(mission.blocker))delete mission.blocker;if(pending&&isProviderBlocker(pending.blocker)){delete pending.blocker;pi.appendEntry('mission:pending',pending);}}providerHold=undefined;if(ours&&mission&&ownership&&!resumeHold){try{await persist(mission);}catch{/* the in-memory park is already cleared */}}await render();});
  pi.events.on('mission:query',(request:unknown)=>{
   if(!isRecord(request)||typeof request.cwd!=='string'||typeof request.reply!=='function'||!ctx||!eligible(ctx)||!mission||request.cwd!==ctx.cwd)return;
   request.reply({workspace:mission.workspace.cwd,beadsDir:mission.workspace.beadsDir,epicId:mission.epicId,graph:effectiveGraph(mission),mode:mission.mode,hold:nativePlan(ctx)?'Native plan mode':resumeHold?'Resume hold':ownershipError??(!ownership?'Controller ownership required':false),projection:snapshot?{ready:snapshot.ready,closed:snapshot.closed,total:snapshot.leaves.length,error:snapshot.error}:undefined});

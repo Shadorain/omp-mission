@@ -127,6 +127,44 @@ function socketName(missionId: string): string {
 	return `${createHash('sha256').update(missionId).digest('hex').slice(0, 16)}.sock`;
 }
 
+test('pending questions replace plan approval until the matching tool finishes', async () => {
+ const run = await session({ plan: true, child: true, autostart: 'CHR-123' });
+ try {
+  const pending = run.pending()!;
+  let approvals = 0;
+  run.context.getPendingPlanReview = () => ({ reviewId: 'review', options: [] }) as any;
+  run.context.resolvePlanReview = () => { approvals++; return true; };
+  await run.event('tool_execution_start', { toolName: 'ask', toolCallId: 'question', args: { questions: [{ question: 'Where should the parent hub live?' }] } });
+  const waiting = await statusOf(run, pending);
+  expect(waiting.hold).toBe('question');
+  expect(waiting.next).toContain('Where should the parent hub live?');
+  expect(waiting.actions).toEqual([]);
+  expect((await ctl(waiting.ctl!.socket, { v: 1, op: 'plan-approve', operator: true })).ok).toBe(false);
+  expect(approvals).toBe(0);
+  await run.event('tool_execution_end', { toolName: 'read', toolCallId: 'other', result: {} });
+  expect((await statusOf(run, pending)).hold).toBe('question');
+  await run.event('tool_execution_end', { toolName: 'ask', toolCallId: 'question', result: {} });
+  expect((await statusOf(run, pending)).hold).toBe('plan-approval');
+ } finally { await run.event('session_shutdown', {}); }
+});
+
+test('planning rate limits replace plan approval and clear when a new turn starts', async () => {
+ const run = await session({ plan: true, child: true, autostart: 'CHR-123' });
+ try {
+  const pending = run.pending()!;
+  await run.event('agent_end', { willContinue: false, messages: [{ role: 'assistant', stopReason: 'error', errorMessage: '429 rate_limit_error: Please try again later' }] });
+  const stopped = await statusOf(run, pending);
+  expect(stopped.hold).toBe('blocked');
+  expect(stopped.problem?.kind).toBe('rate-limit');
+  expect(stopped.next).toContain('rate limit');
+  expect(stopped.actions).toEqual([]);
+  await run.event('turn_start', {});
+  const resumed = await statusOf(run, pending);
+  expect(resumed.hold).toBe('plan-approval');
+  expect(resumed.problem).toBeNull();
+ } finally { await run.event('session_shutdown', {}); }
+});
+
 test('the status builder maps each hold state and the C5 field list', async () => {
 	const cwd = '/tmp';
 	const input = (mission: Mission, over: Partial<Parameters<typeof buildContactStatus>[0]> = {}) => buildContactStatus({

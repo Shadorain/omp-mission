@@ -170,6 +170,8 @@ Every session with an active or pending mission publishes a read model at `<agen
 
 Status also carries `problem` for failed reviews, active-worker errors, coordinator blockers, verification failures and graph outages: kind, source, full detail, automatic retry timestamp, failed attempt and retained review counts. A null problem means healthy; missing means an older producer. Closed-worker historical errors are not current failures. A beads mission with a readable, fully closed implementation graph reports Verify rather than Running while awaiting verification.
 
+A main-agent `ask` wait publishes `hold: question`, the question text and no control actions. Holotable surfaces **Answer in mission** to focus the original OMP prompt; answering there clears the hold. Planning rate-limit and provider failures publish their blocker instead of inviting plan approval.
+
 A completed mission stays Complete after its pane restarts; the resumed session's inspection-only flag is not published as unfinished work. This does not authorize Continue or clear gates, blockers or quota holds.
 
 A pane launched by the board (`OMP_HOLOTABLE_CHILD=1`) also listens on a unix control socket (`<tmpdir>/omp-mission-ctl-<uid>/<hash>.sock`, mode `0600`) advertised in the status file's `ctl` field. It is a newline-delimited JSON protocol, one request per connection: `ping`, or an operator op (`approve`, `continue`, `mode`, `review`, `dispatch`, `resend`, `release`, `reap`, `clear`, `plan-approve`) with `"operator": true`. Each op runs through the same `control()`/`decision()` path as the slash commands — resume hold, plan mode, Pause gates and ownership are enforced identically, and `approve` may carry `args.gate` to guard against a stale board render (`stale` on mismatch).
