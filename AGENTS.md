@@ -42,3 +42,6 @@ Both MUST pass before a commit, except failures you can show are pre-existing: n
 - Conventional commits: `feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `chore:`; optional scope, e.g. `fix(workers): ...`.
 - One commit per work slice. Do not bundle unrelated slices; split dirty files by slice when needed.
 - Commit freely. NEVER push until the user approves, unless they directed it.
+
+## Resource limits (daedalus)
+- Memory-heavy tooling on daedalus (RAM is finite): wrap large local commands in `memcap [SIZE] -- <cmd>` (`~/.local/bin/memcap`; `SIZE` like `2G`, default `3G`). Use it for `tsc`, `tsgo`, `bunx`-launched typecheckers/builders, `vitest`, workspace-wide scans. Kernel kills only the scope on exceed, never the container. Hard rule: unwrapped `tsc`/`tsgo` OOM-killed daedalus services repeatedly on 2026-10-15.
