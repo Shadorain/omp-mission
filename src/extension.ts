@@ -14,9 +14,9 @@ import { acquireOwnership, listMissions, loadMission, missionId, missionPath, sa
 import type { Ownership } from './store';
 import { readClaimActor, readGraph, readHistory } from './beads';
 import { createWorkerDriver } from './workers';
-import { approveGate, autoDispatchAllowed, consumeGate, displayPhase, effectiveGraph, enforceGate, enforceMutation, isProviderBlocker, modelRetryTargets, nextAction, operatorCommands, operatorStep, QUOTA_BLOCKER, RATE_BLOCKER, requireBeadsGraph, revisionGate, reviewFailureStep, setMode, terminalCapacity, waveGate } from './controller';
+import { approveGate, autoDispatchAllowed, consumeGate, deliverUrl, displayPhase, effectiveGraph, enforceGate, enforceMutation, isProviderBlocker, modelRetryTargets, nextAction, operatorCommands, operatorStep, QUOTA_BLOCKER, RATE_BLOCKER, requireBeadsGraph, revisionGate, reviewFailureStep, setMode, terminalCapacity, waveGate } from './controller';
 import { alignVerifiedRevision, captureRevision, Reviewer, roleModelString } from './review';
-import { beadTask, coordinatorPrompt, guide, planSlug, workerPrompt } from './prompts';
+import { beadTask, checkPrompt, coordinatorPrompt, guide, planSlug, workerPrompt } from './prompts';
 import { createMissionWidget, createMissionInspector, phaseLabel } from './ui';
 import { briefView, statusView, type NextView } from './status';
 import { missionArgumentCompletions, VERBS, type MissionCompletionState } from './completions';
@@ -29,7 +29,7 @@ import { checkToolCall, fingerprintScopes, implementationScopes, isImplementatio
 import { autostartMessage, envBase, envCheckout, envDelivery, envGraph, gateTokenId, HolotableBridge, planRevision } from './holotable';
 import { mergeConflictPaths } from './mergecheck';
 
-const controls = ['show','clear','continue','mode','approve','review','history','focus','resend','release','dispatch','reap','actions','config'];
+const controls = ['show','clear','continue','mode','approve','review','check','history','focus','resend','release','dispatch','reap','actions','config'];
 export function nativePlan(ctx: ExtensionContext): boolean {
  let mode = 'none';
  for (const entry of ctx.sessionManager.getBranch()) {
@@ -463,6 +463,7 @@ async function finishMission(context:ExtensionContext){
     if(verb==='continue')return await request(context,'continue');
     if(verb==='resend'){const note=args.trim().split(/\s+/).slice(2).join(' ');return await request(context,'resend',{beadId:arg,...(note?{detail:note}:{})});}
     if(['release','reap'].includes(verb!))return await request(context,verb!,{beadId:arg});
+    if(verb==='check')return await request(context,'check');
     return await request(context,'dispatch');
    }
  const parsed=parseMissionInput(args);if(parsed.force&&nativePlan(context))throw new Error('Force cannot execute inside native plan mode');const saved=await availableMissions();let target=parsed;
@@ -499,11 +500,13 @@ async function finishMission(context:ExtensionContext){
  const scopesSchema=z.record(z.string(),z.array(z.string()).min(1));
  pi.registerTool({name:'mission_status',defaultInactive:true,loadMode:'essential',label:'Mission status',description:'Inspect authoritative cached mission graph, hold, gates and next coordinator action.',approval:'read',parameters:z.object({}),execute:async(_id,_params,_signal,_update,context)=>{if(!eligible(context))throw new Error('Mission coordinator only');if(!operation)await refresh(false);return {content:[{type:'text',text:JSON.stringify(status(context))}],details:{}};}});
  const controlSchema=z.object({
-  operation:z.enum(['start','clear','continue','retry-model','bind_workspace','bind_graph','dispatch','record_verification','record_delivery','run_review','accept_repairs','bind_repairs','resend','release','reap','reject_finding']),
+  operation:z.enum(['start','clear','continue','retry-model','bind_workspace','bind_graph','dispatch','check','record_check','record_verification','record_delivery','run_review','accept_repairs','bind_repairs','resend','release','reap','reject_finding']),
   cwd:z.string().optional(),base:z.string().optional(),beadsDir:z.string().optional(),delivery:z.enum(['pr','local']).optional(),
   epicId:z.string().optional(),scopes:scopesSchema.optional(),repairLinks:z.record(z.string(),z.array(z.string())).optional(),
   beadId:z.string().optional(),detail:z.string().optional(),files:z.array(z.string()).max(50).optional().describe('resend only: extra workspace-relative paths the stopped subagent worker may edit'),passed:z.boolean().optional(),url:z.string().optional(),
   mode:z.enum(['auto','pause','force']).optional(),keep:z.boolean().optional(),findingId:z.string().optional(),
+  checkState:z.enum(['clean','merged','closed','conflict','threads','checks','fixing','unknown']).optional(),
+  conflicts:z.array(z.string()).max(200).optional(),threads:z.object({open:z.number().int().min(0),total:z.number().int().min(0)}).optional(),
   model:z.string().min(1).max(1000).optional()
  });
  async function control(rawParams:unknown,context:ExtensionContext,_signal?:AbortSignal,internal:{reuseOnly?:boolean;operator?:boolean}={}){
@@ -561,6 +564,25 @@ async function finishMission(context:ExtensionContext){
      catch(error){failures.push(`${id}: ${String(error)}`);}
     }
     if(failures.length)throw new Error(`Recovery model saved; some workers could not resume: ${failures.join('; ')}`);
+   }
+   else if(params.operation==='check'){
+    // Board "Check PR": an operator click only. The pane inspects the delivered PR and reports back with record_check.
+    if(!internal.operator)throw new Error('Checking a delivered PR requires an operator');
+    if(!mission||mission.phase!=='complete')throw new Error('Only a completed mission with a delivered PR can be checked');
+    const url=deliverUrl(mission);if(!url)throw new Error('Mission recorded no pull request to check');
+    await acquire();
+    if(!context.isIdle())throw new Error('Coordinator is busy; check again once it is idle');
+    mission.check={at:new Date().toISOString(),state:'fixing',detail:'Operator requested a PR check',conflicts:[],threads:{open:0,total:0}};
+    await persist(mission);
+    pi.sendUserMessage(checkPrompt(mission,url),{attribution:'agent'});
+   }
+   else if(params.operation==='record_check'){
+    if(!mission||mission.phase!=='complete')throw new Error('No completed mission to record a check for');
+    if(!params.checkState||!params.detail?.trim())throw new Error('checkState and detail are required');
+    const threads=params.threads??{open:0,total:0};
+    if(threads.open>threads.total)throw new Error('threads.open cannot exceed threads.total');
+    mission.check={at:new Date().toISOString(),state:params.checkState,detail:params.detail.trim().slice(0,2000),conflicts:params.conflicts??[],threads};
+    await persist(mission);
    }
    else{
     if(!mission)throw new Error('No active mission');enforceMutation(mission,policy(context));await ownership!.assertOwned();

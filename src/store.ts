@@ -3,12 +3,13 @@ import { chmod, mkdir, open, readFile, readdir, realpath, rename, rm, stat } fro
 import { basename, dirname, resolve, join } from "node:path";
 import { lock } from "proper-lockfile";
 import { isRecord, isNonNegativeSafeInteger, isPositiveSafeInteger } from "./guards";
-import type { Evidence, Finding, Frontend, Mission, Mode, Phase, Source, Workspace } from "./types";
+import type { Evidence, Finding, Frontend, Mission, MissionCheck, Mode, Phase, Source, Workspace } from "./types";
 
 const MAX_STATE_BYTES = 5_000_000;
 const MODES: Mode[] = ["auto", "pause", "force"];
 const PHASES: Phase[] = ["plan", "isolate", "graph", "execute", "verify", "deliver", "review", "repair", "complete"];
 const EVIDENCE_OUTCOMES = ["pending", "active", "passed", "failed", "skipped"] as const;
+const CHECK_STATES: MissionCheck["state"][] = ["clean", "merged", "closed", "conflict", "threads", "checks", "fixing", "unknown"];
 
 function invalid(message: string): never { throw new Error(`Invalid mission state: ${message}`); }
 function workerFrontend(value: unknown, index: number): Frontend {
@@ -160,6 +161,13 @@ export function validateMission(value: unknown): Mission {
   }
   if (controllerNonce !== undefined) mission.controllerNonce = controllerNonce;
   if (blocker !== undefined) mission.blocker = blocker;
+  if (row.check !== undefined && row.check !== null) {
+    const item = object(row.check, "check");
+    if (!(CHECK_STATES as readonly string[]).includes(String(item.state))) invalid(`check.state is unsupported`);
+    const threads = object(item.threads ?? { open: 0, total: 0 }, "check.threads");
+    if (!isNonNegativeSafeInteger(threads.open) || !isNonNegativeSafeInteger(threads.total) || (threads.open as number) > (threads.total as number)) invalid("check.threads is invalid");
+    mission.check = { at: text(item.at, "check.at", 100), state: item.state as MissionCheck["state"], detail: content(item.detail, "check.detail", 5000), conflicts: stringArray(item.conflicts ?? [], "check.conflicts", 4000), threads: { open: threads.open as number, total: threads.total as number } };
+  }
   if (gate) mission.gate = gate;
   return mission;
 }

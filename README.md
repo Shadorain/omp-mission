@@ -44,6 +44,8 @@ Autocomplete keeps `show`, `config`, and `history` visible. `continue`, `approve
 
 Saved-ticket lookup matches repository **and worktree path**, not just repository and ticket ID. A new worktree for the same ticket does not inherit an older worktree's completed mission.
 
+**After delivery:** `/mission check` on a completed mission with a pull request sends the pane to inspect it: it merges the base into the PR head (a merge commit, never a force push), resolves conflicts, answers and resolves open review threads, then records the outcome (`clean`, `merged`, `closed`, `conflict`, `threads`, `checks`, `fixing`, `unknown` with open/total thread counts) as `mission.check`. The result republishes to the status file, so the board's **Check PR** button shows it under the card's Delivery section. The socket op is `check` (operator only); the pane reports through `record_check`, which the board socket cannot reach.
+
 The row under the mission summary shows the next action, for example `/mission continue` for a resumed mission, `/mission approve` at a Pause gate, or `/mission review` after a failed review. Commands appear only when the operator can act; quota blocks explain the prerequisite instead of offering a blind retry. Tab completion lists the next-step command first; worker-level recommendations remain in the action menu. Attaching a saved mission also prints the next step.
 
 Commands you type run directly, with no model turn. Only model-initiated operations go through the `mission_control` tool and its native approval. Tool results are compact; the full source and worker assignments stay in the saved mission, not in context.

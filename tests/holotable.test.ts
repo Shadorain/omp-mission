@@ -766,3 +766,64 @@ test('operator model recovery uses the live socket, preserves holds and refuses 
   expect((await retry()).ok).toBe(false);
  }finally{await run.event('session_shutdown',{});}
 });
+
+const PR_URL = 'https://github.com/acme/lab/pull/242';
+const prMission = (cwd: string, over: Partial<Mission> = {}): Mission => baseMission(cwd, {
+	phase: 'complete',
+	workspace: { key: 'workspace', cwd, delivery: 'pr', base: 'main', branch: 'feat/smoke' },
+	evidence: {
+		verify: { outcome: 'passed', detail: 'ok', revision: 'rev', at: 'now' },
+		deliver: { outcome: 'passed', detail: `${PR_URL}\ndelivered`, revision: 'rev', at: 'now' },
+	},
+	...over,
+});
+
+test('a completed mission with a delivered PR advertises check and publishes its result', async () => {
+	const cwd = '/tmp';
+	const input = (mission: Mission) => buildContactStatus({
+		mission, pending: false, resumeHold: false, snapshot: undefined, policy: idlePolicy, step: undefined,
+		owned: true, selected: undefined, operation: false, ctl: null, usage: null,
+	});
+	const delivered = await input(prMission(cwd));
+	expect(delivered.actions).toContain('check');
+	expect(delivered.check).toBeNull();
+	// No PR URL means no check; local delivery never gets the button.
+	expect((await input(prMission(cwd, { evidence: { deliver: { outcome: 'passed', detail: 'local merge', at: 'now' } } }))).actions).not.toContain('check');
+	const check = { at: '2026-10-15T20:00:00Z', state: 'threads' as const, detail: '2 threads open', conflicts: [], threads: { open: 2, total: 3 } };
+	expect((await input(prMission(cwd, { check }))).check).toEqual(check);
+});
+
+test('check over the socket marks the PR fixing, asks the pane, and record_check lands the outcome', async () => {
+	const mission = prMission('/tmp');
+	const run = await session({ child: true, mission });
+	try {
+		const socket = (await statusOf(run, mission)).ctl!.socket;
+		// The coordinator's own bookkeeping op is never reachable over the board socket.
+		expect((await ctl(socket, { v: 1, op: 'record_check', operator: true })).error.code).toBe('bad-request');
+		expect((await ctl(socket, { v: 1, op: 'check' })).error.code).toBe('bad-request');
+		const reply = await ctl(socket, { v: 1, op: 'check', operator: true, args: {} });
+		expect(reply).toMatchObject({ ok: true });
+		expect(run.sent.some(m => m.includes(PR_URL) && m.includes('record_check'))).toBe(true);
+		expect((await statusOf(run, mission)).check).toMatchObject({ state: 'fixing' });
+		const saved = await loadMission(missionPath(run.root, mission));
+		expect(saved.check?.state).toBe('fixing');
+	} finally { await run.event('session_shutdown', {}); }
+});
+
+test('check is refused on an unfinished mission, or a completed one without a PR', async () => {
+	const workingMission = baseMission('/tmp', { phase: 'execute' });
+	const noPrMission = prMission('/tmp', { evidence: { deliver: { outcome: 'passed', detail: 'local merge', at: 'now' } } });
+	const working = await session({ child: true, mission: workingMission });
+	const done = await session({ child: true, mission: noPrMission });
+	try {
+		for (const [run, mission] of [[working, workingMission], [done, noPrMission]] as const) {
+			const socket = (await statusOf(run, mission)).ctl!.socket;
+			const reply = await ctl(socket, { v: 1, op: 'check', operator: true, args: {} });
+			expect(reply.ok).toBe(false);
+			expect(['rejected', 'busy']).toContain(reply.error.code);
+		}
+	} finally {
+		await working.event('session_shutdown', {});
+		await done.event('session_shutdown', {});
+	}
+});

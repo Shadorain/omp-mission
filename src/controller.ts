@@ -217,6 +217,8 @@ export function operatorCommands(m: Mission | undefined, pending: boolean, snaps
  const commands = ['show', 'config', 'history'];
  if (pending || m?.phase === 'complete') {
   if (!operation) commands.push('clear');
+  // A delivered PR can still be checked by the operator: the pane inspects it and records what it did.
+  if (m?.phase === 'complete' && p.owned && !operation && deliverUrl(m)) commands.push('check');
  }
  if (m && effectiveGraph(m) === 'beads' && selected && snapshot?.beads.some(bead => bead.id === selected)) commands.push(`history ${selected}`);
  const worker = m && selected ? m.workers.findLast(item => item.beadId === selected) : undefined;
@@ -242,6 +244,12 @@ export function operatorCommands(m: Mission | undefined, pending: boolean, snaps
   if (!m.keep && worker.handle && snapshot?.leaves.some(bead => bead.id === worker.beadId && bead.category === 'closed')) commands.push(`reap ${worker.beadId}`);
  }
  return commands;
+}
+
+/** The PR URL a successful delivery recorded, or null when the mission never delivered one. */
+export function deliverUrl(m: Mission): string | null {
+ const first = (m.evidence.deliver?.detail ?? '').split('\n', 1)[0]!.trim();
+ return /^https?:\/\/\S+$/.test(first) ? first : null;
 }
 /**
  * The one thing the operator can do now. Holds that wait on a person get a command; states the

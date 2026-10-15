@@ -4,15 +4,15 @@ import { createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ExtensionContext, PlanReviewChoice } from '@oh-my-pi/pi-coding-agent';
-import { displayPhase, effectiveGraph, modelRetryTargets, operatorCommands, providerCapacity, quotaBlocked, reviewRetryAt } from './controller';
+import { deliverUrl, displayPhase, effectiveGraph, modelRetryTargets, operatorCommands, providerCapacity, quotaBlocked, reviewRetryAt } from './controller';
 import { isRecord } from './guards';
 import { displaySourceId } from './sources';
 import { missionDirectory } from './store';
-import { phases, type Evidence, type Mission, type Mode, type PolicyContext, type Snapshot, type Step } from './types';
+import { phases, type Evidence, type Mission, type MissionCheck, type Mode, type PolicyContext, type Snapshot, type Step } from './types';
 
 // The holotable fleet contract (omp-holotable/docs/contract.md). Kept local: the repos do not import across.
-export const OPERATOR_OPS = ['approve', 'continue', 'mode', 'review', 'dispatch', 'resend', 'release', 'reap', 'clear', 'plan-approve', 'retry-model'] as const;
-const SOCKET_OPS: Record<string, true> = { ping: true, approve: true, continue: true, mode: true, review: true, dispatch: true, resend: true, release: true, reap: true, clear: true, plan: true, 'plan-edit': true, 'plan-refine': true, 'plan-approve': true, 'retry-model': true };
+export const OPERATOR_OPS = ['approve', 'continue', 'mode', 'review', 'dispatch', 'check', 'resend', 'release', 'reap', 'clear', 'plan-approve', 'retry-model'] as const;
+const SOCKET_OPS: Record<string, true> = { ping: true, approve: true, continue: true, mode: true, review: true, dispatch: true, check: true, resend: true, release: true, reap: true, clear: true, plan: true, 'plan-edit': true, 'plan-refine': true, 'plan-approve': true, 'retry-model': true };
 // 1 MiB: a plan-edit request carries up to 256 KiB of text plus JSON escaping overhead.
 const MAX_LINE = 1024 * 1024;
 const MAX_PLAN = 256 * 1024;
@@ -69,6 +69,8 @@ export interface ContactStatus {
 	/** Latest verification outcome; 'failed' means `continue` would re-open broken work, so automation must not send it. */
 	verify: Evidence['outcome'] | null;
  problem?: MissionProblem | null;
+	/** Latest operator-requested PR check; absent until the first check or on older missions. */
+	check?: MissionCheck | null;
 	usage: UsageTotals | null;
 	ctl: { socket: string; generation: number } | null;
 	updatedAt: string;
@@ -236,9 +238,7 @@ export async function buildContactStatus(input: StatusInput): Promise<ContactSta
 				.filter((verb): verb is (typeof OPERATOR_OPS)[number] => (OPERATOR_OPS as readonly string[]).includes(verb)),
 		)];
 	if (!question && !input.pending && !input.operation && modelRetryTargets(m, input.snapshot, input.policy)) actions.push('retry-model');
-	const detail = m.evidence.deliver?.detail ?? '';
-	const first = detail.split('\n', 1)[0]!.trim();
-	const url = /^https?:\/\/\S+$/.test(first) ? first : null;
+	const url = deliverUrl(m);
 	const branch = m.workspace.branch ?? null;
 	const next = question ? `Answer in mission: ${question}`.replace(/\s+/g, ' ').slice(0, 240)
 		: m.blocker ? m.blocker.replace(/\s+/g, ' ').slice(0, 240)
@@ -264,6 +264,7 @@ export async function buildContactStatus(input: StatusInput): Promise<ContactSta
 		mode: m.mode ?? null,
 		verify: m.evidence.verify?.outcome ?? null,
 		problem: missionProblem(m, graphDown ? input.snapshot?.error : undefined),
+		check: m.check ?? null,
 		usage: input.usage,
 		ctl: input.ctl,
 		updatedAt: m.updatedAt,

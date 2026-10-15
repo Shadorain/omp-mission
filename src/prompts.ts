@@ -43,3 +43,11 @@ export function workerPrompt(m: Mission, w: Worker, frontend: Frontend = 'orca',
 Allowed paths: ${JSON.stringify(w.files)}. Do not edit or stage other files, use git add -A, take another bead, create workers, change external issue status, merge, or bypass approvals. Shared file dependencies must already serialize work; report an overlap as a blocker. Use existing patterns and real task smoke; capture failing-before and passing-after for bugs and UI. Stage only allowed paths without overwriting other panes' changes. Close only your bead after proof: BEADS_ACTOR=${w.beadId} bd close ${w.beadId} --reason '<change and verification>' --json. Report exact commands and output.
 ${close}`;
 }
+
+/** One shot of PR maintenance on a delivered, complete mission. The coordinator reports with record_check, never mission_control judgment ops. */
+export function checkPrompt(m: Mission, url: string): string {
+ return `PR check requested by the operator. Inspect ${url} end to end and record the outcome with mission_control {operation:'record_check', checkState, detail, conflicts, threads:{open,total}} — state is one of clean | merged | closed | conflict | threads | checks | fixing | unknown, conflicts lists paths still conflicting, threads counts review threads.
+Probe first: gh pr view ${url} --json state,mergeable,statusCheckRollup,reviews and gh api graphql for reviewThreads. Report merged or closed immediately; do nothing else.
+For an open PR: merge the base (${m.workspace.base ?? 'base branch'}) into the PR head with a merge commit, never a rebase or force push; on conflict paths fix them and push. Answer every open review thread in one reply each, resolve the ones you fixed; implement requested changes on the branch and push. A failing CI check you cannot fix goes in detail, not a silent pass.
+Then record_check with state fixing and what you changed, or clean when nothing was needed, threads when open threads remain unanswered, checks when CI fails, conflict when merges still conflict, unknown when gh cannot answer.`;
+}
