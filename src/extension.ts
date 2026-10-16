@@ -103,6 +103,9 @@ export default async function missionExtension(pi: ExtensionAPI) {
  function policy(context:ExtensionContext){return {resumeHold,owned:!!ownership&&!ownershipError,nativePlan:nativePlan(context),fresh:!!snapshot&&!snapshot.error&&Date.now()-snapshot.fetchedAt<35000,maxWorkers:config.maxWorkers};}
  // A hint is attached once per distinct text. The action detail is always sent, so recovery does not depend on it.
  let guided='';
+ function measurements(m:Mission,since=new Date().toISOString()){
+  return m.measurements??=( {v:1,since,recordedPassed:0,recordedFailed:0,repeatedFailedRevision:0,mergePreflightFailures:0,boundaryFailures:0,reviewFailures:0,acceptedRepairs:0} );
+ }
  let providerHold: 'quota' | 'rate' | undefined;
  function withGuide(next:Action|undefined,always:boolean):NextView|undefined{if(!next)return undefined;const text=guide(next.kind,next);const key=text?`${next.kind}:${text}`:'';if(!text||(!always&&guided===key))return next;guided=key;return {...next,guide:text};}
  function status(context:ExtensionContext,brief=false){const action=mission?nextAction(mission,snapshot,policy(context)):undefined;const running=action?extensionRuns(context,action):undefined;const next=withGuide(running?{kind:'hold',detail:`The extension is running ${running==='review'?'the review':'the wave'} itself and wakes you when it ends. Do not call ${running==='review'?'run_review':'dispatch'}; wait.`}:action,!brief);return (brief?briefView:statusView)({mission,pending,snapshot,resumeHold,ownershipError,next});}
@@ -117,6 +120,19 @@ export default async function missionExtension(pi: ExtensionAPI) {
   owned:()=>!!ownership&&!ownershipError,
   selected:()=>selected,
   operation:()=>operation,
+  measurementConfig:()=>({graph:mission?effectiveGraph(mission):pending?effectiveGraph(pending):config.graph,frontend:config.frontend,maxWorkers:config.maxWorkers,reviewConcurrency:config.reviewConcurrency,mode:mission?.mode??pending?.mode??'auto'}),
+  review:()=>{
+   const m=mission;if(!m||m.evidence.review?.outcome!=='active'||!operation)return null;
+   const running=reviewer.running();
+   const progress=m.reviewProgress;
+   return {
+    startedAt:m.evidence.review.at,
+    deadlineAt:running.reduce((latest,item)=>item.deadlineAt>latest?item.deadlineAt:latest,m.evidence.review.at),
+    active:running.length,completed:Object.keys(progress?.targets??{}).length,
+    total:progress?Object.keys(progress.inputs).length:Math.max(1,running.length),
+    models:[...new Set(running.map(item=>item.model))],
+   };
+  },
   question,
   gateId:()=>mission?.gate?gateTokenId(mission.gate.token):undefined,
   decide:(context,verb,arg)=>decision(context,verb,arg),
@@ -128,7 +144,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
   onNotify:message=>ctx?.ui.notify(message,'warning'),
   planReview:()=>{const context=ctx&&eligible(ctx)?ctx:undefined;const review=context?.getPendingPlanReview?context.getPendingPlanReview():planReview;return context?.resolvePlanReview&&review?{reviewId:review.reviewId,canApprove:!review.options?.find(option=>option.id==='compact')?.disabled,resolve:(choice,input)=>context.resolvePlanReview(review.reviewId,choice,input)}:undefined;},
  });
- async function publishStatus(){await holotable.publish();}
+ async function publishStatus(forceUsage=false){await holotable.publish(forceUsage);}
  async function openSocket(id:string){try{await holotable.open(id);}catch(error){ctx?.ui.notify(`Holotable control socket failed: ${error instanceof Error?error.message:String(error)}`,'warning');}}
  async function assertPrBase(m:Mission,url?:string){
   if(!m.workspace.base)throw new Error('Repository base unresolved; bind the workspace before delivery or review');
@@ -174,7 +190,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
  }
  async function acquire(){if(!mission||!path)throw new Error('No saved mission');if(ownership){await ownership.assertOwned();return;}ownershipError=undefined;ownership=await acquireOwnership(path,mission,error=>{ownershipError=`Controller lost: ${error.message}`;resumeHold=true;lastWake='';void reviewer.dispose();void render();});mission=ownership.mission;mission.controllerNonce=ownership.nonce;}
  async function release(){pendingQuestions.clear();const current=ownership;ownership=undefined;await current?.release();await holotable.close();}
- async function detach(context?:ExtensionContext){generation++;providerHold=undefined;coordinatorShells.clear();lifetime.abort();lifetime=new AbortController();terminalInputDispose?.();terminalInputDispose=undefined;overlayAbort?.abort();overlayAbort=undefined;if(timer&&ctx)ctx.clearTimer(timer);timer=undefined;await reviewer.dispose();await workerAgents.abortAll();await release();await publishStatus();ctx?.ui.setWidget('mission',undefined);ctx=context;mission=undefined;pending=undefined;path=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;lastWake='';guided='';selected=undefined;history=undefined;lastPoll=0;outlineOffset=0;inspectionIntent={};subagents=[];reviewRows=[];planReview=undefined;openedPlanRevision=undefined;openingPlanReview=false;}
+ async function detach(context?:ExtensionContext){generation++;providerHold=undefined;coordinatorShells.clear();lifetime.abort();lifetime=new AbortController();terminalInputDispose?.();terminalInputDispose=undefined;overlayAbort?.abort();overlayAbort=undefined;if(timer&&ctx)ctx.clearTimer(timer);timer=undefined;await reviewer.dispose();await workerAgents.abortAll();await release();await publishStatus(true);ctx?.ui.setWidget('mission',undefined);ctx=context;mission=undefined;pending=undefined;path=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;lastWake='';guided='';selected=undefined;history=undefined;lastPoll=0;outlineOffset=0;inspectionIntent={};subagents=[];reviewRows=[];planReview=undefined;openedPlanRevision=undefined;openingPlanReview=false;}
  async function attach(file:string,context:ExtensionContext,announce=true){providerHold=undefined;await release();mission=await loadMission(file);path=file;pending=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;ctx=context;await refresh(false);await render();await openSocket(mission.id);await publishStatus();
   const step=announce?currentStep(context):undefined;
   if(step)context.ui.notify(`${displaySourceId(mission.source)} · ${phaseLabel(displayPhase(mission,snapshot))}. ${step.command?`Next: ${step.command} — `:''}${step.text}. /mission opens the action menu.`,'info');
@@ -213,8 +229,9 @@ export default async function missionExtension(pi: ExtensionAPI) {
   startPolling(context);
  }
  function startPolling(context:ExtensionContext){
+  let lastReviewPublish=0;
   timer=context.setInterval(async()=>{
-   if(operation)return;
+   if(operation){if(Date.now()-lastReviewPublish>=10_000){lastReviewPublish=Date.now();void publishStatus();}return;}
    if(pending&&ctx)await openPendingPlanReview(ctx).catch(error=>ctx?.ui.notify(`Could not open plan review: ${String(error)}`,'warning'));
    const interval=mission&&(mission.phase==='execute'||mission.phase==='repair')?5000:30000;
    if(Date.now()-lastPoll>=interval)void refresh(true);
@@ -293,6 +310,7 @@ async function tryComplete(m:Mission,evidence:Omit<Evidence,'outcome'>){
  const conflicts=await mergeConflictPaths(m,run);
  if(conflicts&&conflicts.length){
   m.evidence.verify={outcome:'failed',detail:`Branch conflicts with ${m.workspace.base}: ${conflicts.join(', ')}. Merge ${m.workspace.base} into this branch and resolve before completion.`,at:new Date().toISOString()};
+  measurements(m).mergePreflightFailures++;
   delete m.evidence.deliver;
   m.phase='verify';
   return false;
@@ -483,6 +501,7 @@ async function finishMission(context:ExtensionContext){
  const bound=saved.find(item=>item.mission.workspace.cwd===workspace.cwd&&item.mission.source.id!==source.id&&item.mission.phase!=='complete');if(bound)throw new Error(`Checkout is bound to ${bound.mission.source.id}`);
  if(!parsed.force&&!nativePlan(context))throw new Error('Start through /plan /mission, or use --force outside plan mode');
  const planned: Mission = {version:1,id:missionId(source),source,workspace,graph:envGraph()??config.graph,scopes:{},phase:'plan',evidence:{},mode:parsed.pause?'pause':parsed.force?'force':'auto',keep:parsed.keep,reviewRequested:parsed.force,workers:[],reviews:[],repairLinks:{},round:1,createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()};
+ measurements(planned,planned.createdAt);
  await writeSourceFile(planned);
  pi.appendEntry('mission:pending',planned);
  pending = planned;
@@ -625,6 +644,10 @@ async function finishMission(context:ExtensionContext){
       at: new Date().toISOString(),
      };
      mission.evidence.verify = evidence;
+     const measured=measurements(mission,evidence.at);
+     if(params.passed)measured.recordedPassed++;
+     else{measured.recordedFailed++;if(measured.lastVerification?.outcome==='failed'&&measured.lastVerification.revision===captured.revision)measured.repeatedFailedRevision++;}
+     measured.lastVerification={revision:captured.revision,outcome:params.passed?'passed':'failed'};
      if (mission.evidence.repair && mission.evidence.repair.outcome !== 'skipped' && previous && mission.round > previous.round) {
       mission.evidence.repair = { ...evidence };
      }
@@ -659,6 +682,7 @@ async function finishMission(context:ExtensionContext){
      if ((await captureRevision(mission, run)).revision !== review.revision) throw new Error('Review revision changed; reverify/rereview');
      enforceGate(mission, revisionGate(mission, 'repairs', review.revision));
      const local = effectiveGraph(mission) === 'local';
+     if(mission.evidence.repair?.outcome!=='active')measurements(mission).acceptedRepairs++;
      if (local) {
       mission.round = Math.max(mission.round, review.round + 1);
       delete mission.evidence.verify;
@@ -696,7 +720,7 @@ async function finishMission(context:ExtensionContext){
     if(epoch!==generation)throw new Error('Session changed during operation');await persist(mission);
    }
    await render();return status(context,true);
-  }catch(error){if(epoch===generation&&mission&&ownership&&reviewStarted){mission.evidence.review={outcome:'failed',detail:String(error),revision:mission.evidence.verify?.revision,at:new Date().toISOString(),attempts:(mission.evidence.review?.attempts??0)+1};await persist(mission);}await render();throw error;}
+  }catch(error){if(epoch===generation&&mission&&ownership&&reviewStarted){mission.evidence.review={outcome:'failed',detail:String(error),revision:mission.evidence.verify?.revision,at:new Date().toISOString(),attempts:(mission.evidence.review?.attempts??0)+1};measurements(mission).reviewFailures++;await persist(mission);}await render();throw error;}
   finally{_signal?.removeEventListener('abort',cancelReview);operation=false;operationSignal=undefined;if(epoch===generation){lastWake='';await wakeCoordinator();}}
  }
  pi.registerTool({name:'mission_control',defaultInactive:true,loadMode:'essential',label:'Mission control',description:'Drive approved mission phases/workers/review. Every operation preserves native approvals, Pause gates, resume hold and ownership.',approval:'exec',parameters:controlSchema,execute:async(_id,rawParams,signal,_update,context)=>({content:[{type:'text',text:JSON.stringify(await control(rawParams,context,signal))}],details:{}})});
@@ -768,6 +792,7 @@ async function finishMission(context:ExtensionContext){
   if(!changed.length&&!boundaryError)return;
   const detail=boundaryError??`Implementation paths changed during coordinator command: ${changed.slice(0,20).join(', ')}${changed.length>20?` (+${changed.length-20} more; listed in tool output)`:''}. No rollback performed.`;
   mission.phase='verify';mission.evidence.verify={outcome:'failed',detail,at:new Date().toISOString()};
+  measurements(mission).boundaryFailures++;
   delete mission.evidence.deliver;delete mission.evidence.review;delete mission.evidence.complete;delete mission.reviewProgress;
   if(ownership)await persist(mission).catch(error=>{ownershipError=String(error);resumeHold=true;});
   else resumeHold=true;

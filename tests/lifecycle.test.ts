@@ -189,6 +189,7 @@ test('a coordinator shell write to an unbound implementation file holds verifica
   const saved=await mission.state();
   expect(saved.evidence.verify?.outcome).toBe('failed');
   expect(saved.evidence.verify?.detail).toContain('new.rs');
+  expect(saved.measurements).toMatchObject({recordedPassed:1,recordedFailed:0,boundaryFailures:1});
   expect(saved.evidence.deliver).toBeUndefined();
   expect((await mission.status()).next.kind).toBe('graph');
   expect(await readFile(join(mission.cwd,'new.rs'),'utf8')).toBe('unexpected');
@@ -293,12 +294,34 @@ test('done implementation leaves can be verified; empty graphs cannot', async ()
   }
 });
 
+test('explicit verification counters survive restore, exclude rejected calls and distinguish repeat revisions',async()=>{
+ const mission=await fixture('beads',true,{reviewRequested:false});
+ try{
+  expect((await mission.state()).measurements).toBeUndefined();
+  await expect(mission.execute({operation:'record_verification',passed:false})).rejects.toThrow('Actual command/result');
+  expect((await mission.state()).measurements).toBeUndefined();
+  await mission.execute({operation:'record_verification',passed:false,detail:'Fail 1'});
+  await mission.command('continue');
+  await mission.execute({operation:'record_verification',passed:false,detail:'Fail 2'});
+  await mission.restore();await mission.command('continue');
+  await writeFile(join(mission.cwd,'task.txt'),'new revision');
+  await mission.execute({operation:'record_verification',passed:false,detail:'Fail different revision'});
+  await mission.command('continue');
+  await mission.execute({operation:'record_verification',passed:true,detail:'Pass'});
+  const saved=await mission.state();
+  expect(saved.measurements).toMatchObject({v:1,recordedPassed:1,recordedFailed:3,repeatedFailedRevision:1,mergePreflightFailures:0,boundaryFailures:0});
+  expect(saved.measurements?.lastVerification?.outcome).toBe('passed');
+  expect(Number.isFinite(Date.parse(saved.measurements!.since))).toBe(true);
+ }finally{await mission.dispose();}
+});
+
 test('local repairs require changed output and fresh verification/delivery', async () => {
   const mission = await fixture('local');
   try {
     await mission.execute({ operation: 'accept_repairs' });
     const accepted = await mission.state();
     expect(accepted.round).toBe(2);
+    expect(accepted.measurements?.acceptedRepairs).toBe(1);
     expect(accepted.evidence.verify).toBeUndefined();
     expect(accepted.evidence.deliver).toBeUndefined();
     await expect(mission.execute({ operation: 'record_verification', passed: true, detail: 'Unchanged' })).rejects.toThrow();
@@ -387,6 +410,7 @@ test('a branch that conflicts with its base cannot complete: verification reopen
     expect(saved.evidence.complete).toBeUndefined();
     expect(saved.evidence.verify?.outcome).toBe('failed');
     expect(saved.evidence.verify?.detail).toContain('task.txt');
+    expect(saved.measurements).toMatchObject({mergePreflightFailures:1,recordedFailed:0,recordedPassed:0});
   } finally { await mission.dispose(); }
 });
 
@@ -397,10 +421,12 @@ test('a requested review starts in the extension without waking the model, and /
     await mission.errorCount(1);
     expect(mission.sent).toEqual([]);
     expect((await mission.state()).evidence.review?.outcome).toBe('failed');
+    expect((await mission.state()).measurements?.reviewFailures).toBe(1);
     const retried = mission.errorCount(2);
     await mission.command('review');
     await retried;
     expect(mission.sent).toEqual([]);
+    expect((await mission.state()).measurements?.reviewFailures).toBe(2);
   } finally { await mission.dispose(); }
 });
 

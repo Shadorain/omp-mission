@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ExtensionContext } from '@oh-my-pi/pi-coding-agent';
@@ -444,4 +444,78 @@ test('operator model recovery retains valid finished reviews across save/load wi
  expect(restored.reviewProgress).toBeUndefined();
  restored.modelOverrides={review:'missing/unavailable'};
  await expect(new Reviewer().runPerBead(restored,next,real,'default',undefined,targets)).rejects.toThrow('Selected recovery model is unavailable');
+});
+
+function reviewTimers() {
+ const timers=new Set<{callback:()=>void;ms:number}>();
+ return {
+  schedule:(callback:()=>void,ms:number)=>{const timer={callback,ms};timers.add(timer);return ()=>{timers.delete(timer);};},
+  expire:(ms:number)=>{for(const timer of [...timers])if(timer.ms===ms){timers.delete(timer);timer.callback();}},
+ };
+}
+
+test('a stuck reviewer and stuck disposal settle as failure, never a late clean verdict', async()=>{
+ const m=await missionAt();
+ const clock=reviewTimers();
+ const started=Promise.withResolvers<void>(),disposeStarted=Promise.withResolvers<void>(),resume=Promise.withResolvers<void>();
+ const messages:unknown[]=[];
+ let disposals=0;
+ const stuck:ReviewOpener=async()=>({session:{
+  state:{messages} as never,
+  async prompt(text:string){started.resolve();await resume.promise;const payload=JSON.parse(text);messages.push({role:'assistant',content:[{type:'text',text:JSON.stringify({reviewedRevision:payload.reviewedRevision,summary:'too late',findings:[]})}]});},
+  // Only the timed-out session hangs disposal; a queued target's clean dispose keeps settle itself deterministic.
+  async dispose(){disposeStarted.resolve();if(disposals++===0)await new Promise(()=>{});},
+ } as never});
+ const reviewer=new Reviewer(stuck,{schedule:clock.schedule});
+ const result=reviewer.runPerBead(m,ctx,real,'default',[],targets,1);
+ const rejected=result.then(()=>{throw new Error('review unexpectedly passed')},(e:Error)=>e);
+ await started.promise;
+ // bd-a owns a/one.txt: budget is reviewBudgetMs(1)=315_000.
+ clock.expire(315_000);
+ await disposeStarted.promise;
+ // Cancel the queued bd-b/integration jobs before their opener re-arms a stuck timer.
+ const settling=reviewer.dispose();
+ clock.expire(5_000);
+ await settling;
+ expect((await rejected).message).toContain('deadline exceeded');
+ resume.resolve();
+ await Promise.resolve();
+ expect(m.reviewProgress!.targets).toEqual({});
+ expect(m.reviewProgress!.failures['bd-a']).toContain('deadline exceeded');
+ expect(m.reviews).toEqual([]);
+});
+
+test('cancellation settles an opening reviewer and disposes a session that arrives late',async()=>{
+ const m=await missionAt();
+ const opening=Promise.withResolvers<void>(),opened=Promise.withResolvers<Awaited<ReturnType<ReviewOpener>>>(),disposed=Promise.withResolvers<void>();
+ const reviewer=new Reviewer(async()=>{opening.resolve();return opened.promise;});
+ const result=reviewer.runPerBead(m,ctx,real,'default',[],targets,1);
+ await opening.promise;
+ await reviewer.dispose();
+ await result.catch(()=>{});
+ let prompted=false;
+ opened.resolve({session:{state:{messages:[]} as never,prompt:async()=>{prompted=true;},dispose:async()=>{disposed.resolve();}} as never});
+ await disposed.promise;
+ expect(prompted).toBe(false);
+ expect(m.reviewProgress!.targets).toEqual({});
+});
+
+test('timeout retries expand only failed targets and retain completed reviews',async()=>{
+ await writeFile(join(root,'a','one.txt'),'changed a');
+ await writeFile(join(root,'b','two.txt'),'changed b');
+ const m=await missionAt();
+ const budgets:Record<string,number>={};
+ const first:ReviewOpener=async(...args)=>{
+  const opened=await opener([],()=>({summary:'retained',findings:[]}))(...args);
+  if(args[6]!.label==='bd-b')opened.session.prompt=async()=>{throw new Error('Reviewer aborted: Deadline exceeded');};
+  return opened;
+ };
+ await expect(new Reviewer(first).runPerBead(m,ctx,real,'default',[],targets,1)).rejects.toThrow('Deadline exceeded');
+ m.evidence.review={outcome:'active',detail:'Independent reviewer running',attempts:2,at:'now',revision:m.evidence.verify!.revision};
+ const second:ReviewOpener=async(...args)=>{budgets[args[6]!.label]=args[5]!;return opener([],()=>({summary:'recovered',findings:[]}))(...args);};
+ const round=await new Reviewer(second).runPerBead(m,ctx,real,'default',[],targets,1);
+ expect(budgets).toEqual({'bd-b':1_260_000});
+ expect(round.summary).toContain('[bd-a] retained');
+ expect(round.summary).toContain('[bd-b] recovered');
+ expect(round.summary).toContain('[integration] retained');
 });

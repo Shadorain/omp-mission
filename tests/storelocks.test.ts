@@ -429,3 +429,14 @@ describe("mission config", () => {
     expect(resolveAgentDir({ PI_CODING_AGENT_DIR: "  ", OMP_AGENT_DIR: "/omp" }, "/h")).toBe("/omp");
   });
 });
+
+test('measurement counters and failed revision identity survive persistence; malformed counters are rejected',async()=>{
+ const root=mkdtempSync(join(tmpdir(),TMP_PREFIX)),m=mkMission('m1'),path=missionPath(root,m);
+ try{
+  m.measurements={v:1,since:'2026-01-01T00:00:00Z',recordedPassed:1,recordedFailed:2,repeatedFailedRevision:1,mergePreflightFailures:0,boundaryFailures:0,reviewFailures:3,acceptedRepairs:1,lastVerification:{revision:'revision-2',outcome:'failed'}};
+  await saveMission(path,m);expect((await loadMission(path)).measurements).toEqual(m.measurements);
+  for(const patch of [{v:2},{since:'bad'},{recordedFailed:-1},{reviewFailures:1.5},{recordedPassed:Number.MAX_SAFE_INTEGER+1},{lastVerification:{revision:'r',outcome:'active'}}])
+   expect(()=>validateMission({...m,measurements:{...m.measurements,...patch}})).toThrow(/measurements/);
+  delete m.measurements;await saveMission(path,m);expect((await loadMission(path)).measurements).toBeUndefined();
+ }finally{rmSync(root,{recursive:true,force:true});}
+});

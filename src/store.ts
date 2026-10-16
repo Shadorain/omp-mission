@@ -144,6 +144,18 @@ export function validateMission(value: unknown): Mission {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(missionId)) invalid("id contains unsafe path characters");
   const mission: Mission = { version: 1, id: missionId, source: validSource(row.source), workspace: validWorkspace(row.workspace), scopes, phase: row.phase as Phase, evidence, mode: row.mode as Mode, keep: row.keep, reviewRequested: row.reviewRequested, workers, reviews, repairLinks, round, createdAt: text(row.createdAt, "createdAt", 100), updatedAt: text(row.updatedAt, "updatedAt", 100) };
   if (reviewProgress !== undefined) mission.reviewProgress = reviewProgress;
+  if (row.measurements !== undefined) {
+    const raw = object(row.measurements, "measurements");
+    if(raw.v!==1||typeof raw.since!=="string"||raw.since.length>64||!Number.isFinite(Date.parse(raw.since)))invalid("measurements version or since is invalid");
+    const keys = ["recordedPassed", "recordedFailed", "repeatedFailedRevision", "mergePreflightFailures", "boundaryFailures", "reviewFailures", "acceptedRepairs"] as const;
+    for (const key of keys) if (!isNonNegativeSafeInteger(raw[key])) invalid(`measurements.${key} must be a nonnegative safe integer`);
+    mission.measurements = { v: 1, since: raw.since as string, recordedPassed: raw.recordedPassed as number, recordedFailed: raw.recordedFailed as number, repeatedFailedRevision: raw.repeatedFailedRevision as number, mergePreflightFailures: raw.mergePreflightFailures as number, boundaryFailures: raw.boundaryFailures as number, reviewFailures: raw.reviewFailures as number, acceptedRepairs: raw.acceptedRepairs as number };
+    if (raw.lastVerification !== undefined) {
+      const last = object(raw.lastVerification, "measurements.lastVerification");
+      if (last.outcome !== "passed" && last.outcome !== "failed") invalid("measurements.lastVerification.outcome is invalid");
+      mission.measurements.lastVerification = { revision: text(last.revision, "measurements.lastVerification.revision", 1000), outcome: last.outcome as "passed" | "failed" };
+    }
+  }
   if (row.modelOverrides !== undefined) {
     const models = object(row.modelOverrides, "modelOverrides");
     mission.modelOverrides = {};

@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { appendFile, lstat, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { appendFile, lstat, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createConnection } from 'node:net';
@@ -8,7 +8,7 @@ import { resolveLocalUrlToPath } from '@oh-my-pi/pi-coding-agent/internal-urls/l
 import type { ExtensionAPI, ExtensionContext } from '@oh-my-pi/pi-coding-agent';
 import missionExtension from '../src/extension';
 import { listMissions, loadMission, missionPath, saveMission } from '../src/store';
-import { buildContactStatus, gateTokenId, autostartMessage, envBase, envCheckout, envDelivery, envGraph, planRevision, parseUsageLines, sumAssistantUsage, UsageProbe, type ContactStatus } from '../src/holotable';
+import { buildContactStatus, gateTokenId, autostartMessage, envBase, envCheckout, envDelivery, envGraph, planRevision, sumAssistantUsage, UsageProbe, type ContactStatus } from '../src/holotable';
 import { planSlug } from '../src/prompts';
 import type { Mission } from '../src/types';
 import { QUOTA_BLOCKER } from '../src/controller';
@@ -85,7 +85,7 @@ async function session(options: { plan?: boolean; child?: boolean; autostart?: s
 	const context = {
 		agent: { kind: 'main' }, cwd, hasUI: false,
 		modelRegistry: { getAvailable: () => options.models ?? [] },
-		sessionManager: { getBranch: () => branch, getEntries: () => branch, getSessionName: () => undefined },
+  sessionManager:{getBranch:()=>branch,getEntries:()=>branch,getSessionName:()=>undefined,getSessionFile:()=>join(root,'coordinator.jsonl')},
 		localProtocolOptions: { getArtifactsDir: () => join(root, 'artifacts'), getSessionId: () => 'test-session' },
 		ui: { notify: (message: string) => { notices.push(message); }, setWidget: () => {} },
 		isIdle: () => true, hasPendingMessages: () => false,
@@ -278,51 +278,80 @@ test('usage sums assistant message usage and tolerates foreign and partial recor
 	expect(sumAssistantUsage([{ type: 'mode_change', mode: 'plan' }, { type: 'message', message: { role: 'user' } }, { type: 'message', message: { role: 'assistant' } }])).toBeNull();
 	const totals = sumAssistantUsage([usageEntry(100, 10, 0.5), usageEntry(200, 20), { type: 'model_usage', usage: { input: 9, output: 9 } }, 'junk', null]);
 	expect(totals).toEqual({ tokens: { input: 300, output: 30, cacheRead: 8, cacheWrite: 4 }, costUsd: 0.5, sessions: 1 });
-	expect(parseUsageLines('')).toBeNull();
-	expect(parseUsageLines(`{"type":"message","message":{"role":"assistant","usage":{"input":7,"output":3}}}\n{broken\n${JSON.stringify(usageEntry(1, 1, 0.25))}\n`))
-		.toEqual({ tokens: { input: 8, output: 4, cacheRead: 4, cacheWrite: 2 }, costUsd: 0.25, sessions: 1 });
 });
 
-test('the usage probe sums worker session files, throttles, resumes mid-file and restarts on mission switch', async () => {
-	const root = await realpath(await mkdtemp(join(tmpdir(), 'holotable-usage-')));
-	roots.push(root);
-	const mission = baseMission(root);
-	const other = baseMission(root, { id: 'second-run' });
-	const workerDir = join(root, 'missions', mission.workspace.key, 'workers');
-	const workerFile = join(workerDir, 'b1.jsonl');
-	let now = 1_000;
-	const probe = new UsageProbe(root, () => now, 30_000);
-	const none = () => undefined;
+test('usage isolates mission-owned workers, includes independent reviews and deduplicates lazy snapshots', async () => {
+ const root=await realpath(await mkdtemp(join(tmpdir(),'holotable-usage-')));roots.push(root);
+ const mission=baseMission(root),other=baseMission(root,{id:'second-run'});
+ const workerDir=join(root,'missions',mission.workspace.key,'workers'),workerFile=join(workerDir,'b1.jsonl');
+ const reviewDir=join(root,'missions',mission.workspace.key,'reviews',mission.id);
+ await mkdir(workerDir,{recursive:true});await mkdir(reviewDir,{recursive:true});
+ mission.workers.push({beadId:'b1',attempt:'1',cwd:root,files:[],state:'closed',assignment:'test',frontend:'subagent',incarnationId:workerFile});
+ await writeFile(workerFile,`${JSON.stringify(usageEntry(100,10,.5))}\n{"type":"message","mes`);
+ await writeFile(join(workerDir,'foreign.jsonl'),`${JSON.stringify(usageEntry(900,900,9))}\n`);
+ await writeFile(join(reviewDir,'failed-review.jsonl'),`${JSON.stringify(usageEntry(20,2,.2))}\n`);
+ let now=1_000;const probe=new UsageProbe(root,()=>now);
+ const coordinator=()=>({sessionFile:'/private/coordinator.jsonl',entries:[usageEntry(50,5,.25)]});
+ const first=await probe.measure(mission,coordinator);
+ expect(first.usage).toEqual({tokens:{input:170,output:17,cacheRead:12,cacheWrite:6},costUsd:.95,sessions:3});
+ expect(first.evidence.sources.map(s=>s.role)).toEqual(['coordinator','worker','review']);
+ expect(JSON.stringify(first.evidence)).not.toContain('/private/');
+ expect(first.evidence.backlogBytes).toBeGreaterThan(0);
+ await appendFile(workerFile,`sage":{}}\n${JSON.stringify(usageEntry(10,1,.1))}\n`);
+ expect(await probe.measure(mission,()=>{throw Error('must be lazy');})).toBe(first);
+ now+=40_000;
+ const second=await probe.measure(mission,coordinator);
+ expect(second.usage?.tokens.input).toBe(180);expect(second.evidence.backlogBytes).toBe(0);
+ expect((await probe.measure(other,()=>({sessionFile:'/another.jsonl',entries:[usageEntry(7,7)]})) ).usage?.tokens.input).toBe(7);
+ expect((await probe.measure(mission,coordinator)).usage?.tokens.input).toBe(180);
+ await rm(workerFile);now+=40_000;
+ const deleted=await probe.measure(mission,coordinator);
+ expect(deleted.usage?.tokens.input).toBe(180);expect(deleted.evidence.missing).toBe(1);
+ expect((await new UsageProbe(root,()=>now).measure(mission,coordinator)).usage?.tokens.input).toBe(70);
+});
 
-	expect(await probe.measure(mission, none)).toBeNull(); // no coordinator entries, no workers dir
-	now += 40_000;
-	await mkdir(workerDir, { recursive: true });
-	await writeFile(join(workerDir, 'b1.baseline.json'), '{}'); // sidecars in the dir are not session files
-	expect(await probe.measure(mission, none)).toBeNull();
+test('usage reads bounded deltas, preserves split UTF8 and counts completed lines exactly once',async()=>{
+ const root=await realpath(await mkdtemp(join(tmpdir(),'holotable-usage-')));roots.push(root);
+ const mission=baseMission(root),dir=join(root,'missions',mission.workspace.key,'workers'),path=join(dir,'worker.jsonl');
+ await mkdir(dir,{recursive:true});
+ mission.workers.push({beadId:'b',attempt:'a',cwd:root,files:[],state:'running',assignment:'test',frontend:'subagent',incarnationId:path});
+ const record={...usageEntry(3,4,0),text:'é'.repeat(35_000)},text=JSON.stringify(record);
+ await writeFile(path,text);
+ const probe=new UsageProbe(root,()=>1000),coordinator=()=>({sessionFile:'/session',entries:[]});
+ expect((await probe.measure(mission,coordinator)).usage).toBeNull();
+ await appendFile(path,'\n');
+ const complete=await probe.measure(mission,coordinator,true);
+ expect(complete.usage?.tokens.input).toBe(3);expect(complete.evidence.backlogBytes).toBe(0);
+ expect(complete.evidence.partial).toBe(false);expect(complete.evidence.sources[0]?.pricedMessages).toBe(1);
+ expect((await probe.measure(mission,coordinator,true)).usage).toEqual(complete.usage);
+ await appendFile(path,`x`.repeat(5*1024*1024)+`\n${JSON.stringify(usageEntry(8,2,.1))}\n`);
+ const reset=await probe.measure(mission,coordinator,true);
+ expect(reset.evidence.resets).toBe(0);
+ expect(reset.evidence.backlogBytes).toBeGreaterThan(1024*1024);
+ const caught=await probe.measure(mission,coordinator,true);
+ expect(caught.usage?.tokens.input).toBe(11);expect(caught.evidence.backlogBytes).toBe(0);
+ expect(caught.evidence.malformedLines).toBe(1);
+ await writeFile(path,`${JSON.stringify(usageEntry(1,2,.1))}\n`);
+ const shrunk=await probe.measure(mission,coordinator,true);
+ expect(shrunk.usage?.tokens.input).toBe(1);expect(shrunk.evidence.resets).toBe(1);
+ await rm(path);await writeFile(path,`${JSON.stringify(usageEntry(9,2,.1))}\n`);
+ const replaced=await probe.measure(mission,coordinator,true);
+ expect(replaced.usage?.tokens.input).toBe(9);expect(replaced.evidence.resets).toBe(2);
+});
 
-	// A mid-write tail line is skipped; the offset stops at the last newline.
-	await writeFile(workerFile, `${JSON.stringify(usageEntry(100, 10, 0.5))}\n{"type":"message","mes`);
-	now += 40_000;
-	const first = await probe.measure(mission, () => [usageEntry(50, 5, 0.25)]);
-	expect(first).toEqual({ tokens: { input: 150, output: 15, cacheRead: 8, cacheWrite: 4 }, costUsd: 0.75, sessions: 2 });
-
-	// Inside the window the coordinator thunk is not consulted and nothing is re-read.
-	await appendFile(workerFile, 'sage":{}}\n');
-	expect(await probe.measure(mission, () => { throw new Error('throttled'); })).toEqual(first);
-
-	// The deferred tail completes; only the new bytes are parsed.
-	await appendFile(workerFile, `${JSON.stringify(usageEntry(10, 1, 0.1))}\n`);
-	now += 40_000;
-	expect(await probe.measure(mission, none)).toEqual({ tokens: { input: 110, output: 11, cacheRead: 8, cacheWrite: 4 }, costUsd: 0.6, sessions: 1 });
-
-	// A mission switch recomputes immediately even inside the window.
-	expect(await probe.measure(other, () => [usageEntry(7, 7)])).toEqual({ tokens: { input: 117, output: 18, cacheRead: 12, cacheWrite: 6 }, costUsd: 0.6, sessions: 2 });
-
-	// A deleted worker file keeps its already-counted usage; a new probe reads it as foreign.
-	await rm(workerFile);
-	now += 40_000;
-	expect(await probe.measure(other, none)).toEqual({ tokens: { input: 110, output: 11, cacheRead: 8, cacheWrite: 4 }, costUsd: 0.6, sessions: 1 });
-	expect(await new UsageProbe(root, () => now).measure(other, none)).toBeNull();
+test('usage rejects escaped worker paths, reports unsupported workers and malformed or unpriced usage',async()=>{
+ const root=await realpath(await mkdtemp(join(tmpdir(),'holotable-usage-')));roots.push(root);
+ const mission=baseMission(root),dir=join(root,'missions',mission.workspace.key,'workers');
+ await mkdir(dir,{recursive:true});
+ const outside=join(root,'outside.jsonl'),link=join(dir,'escape.jsonl');
+ await writeFile(outside,`${JSON.stringify(usageEntry(900,9,9))}\n`);await symlink(outside,link);
+ for(const [attempt,frontend,incarnationId] of [['a','subagent',link],['b','none',undefined]] as const)
+  mission.workers.push({beadId:attempt,attempt,cwd:root,files:[],state:'closed',assignment:'test',frontend,incarnationId});
+ const bad={type:'message',message:{role:'assistant',usage:{input:-1,output:9}}};
+ const result=await new UsageProbe(root,()=>1000).measure(mission,()=>({sessionFile:'/session',entries:[bad,usageEntry(2,3)]}));
+ expect(result.usage?.tokens.input).toBe(2);expect(result.usage?.costUsd).toBeNull();
+ expect(result.evidence).toMatchObject({missing:1,unsupportedWorkers:1,malformedLines:1,partial:true});
+ expect(result.evidence.sources[0]).toMatchObject({pricedMessages:0,unpricedMessages:1});
 });
 
 test('a resume hold over failed verification still says verification failed', async () => {
@@ -363,6 +392,8 @@ test('the status file reports mission mode and estimated usage', async () => {
 	const run = await session({ mission, entries: [usageEntry(50, 5, 0.25)], beforeLoad: async root => {
 		await mkdir(join(root, workerDir), { recursive: true });
 		await writeFile(join(root, workerDir, 'b1.jsonl'), `${JSON.stringify(usageEntry(100, 10, 0.5))}\n`);
+  mission.workers.push({beadId:'b1',attempt:'a',cwd:root,files:[],state:'closed',assignment:'test',frontend:'subagent',incarnationId:join(root,workerDir,'b1.jsonl')});
+  await saveMission(missionPath(root,mission),mission);
 	} });
 	const published = await statusOf(run, mission);
 	expect(published.mode).toBe('auto');
@@ -826,4 +857,28 @@ test('check is refused on an unfinished mission, or a completed one without a PR
 		await working.event('session_shutdown', {});
 		await done.event('session_shutdown', {});
 	}
+});
+
+test('bounded status measurements distinguish historic findings from invalidated current evidence',async()=>{
+ const m=baseMission('/tmp');
+ m.measurements={v:1,since:'2026-01-01T00:00:00Z',recordedPassed:2,recordedFailed:1,repeatedFailedRevision:0,mergePreflightFailures:0,boundaryFailures:0,reviewFailures:1,acceptedRepairs:1};
+ const finding={id:'f',severity:'high' as const,path:'a',line:1,title:'Defect',body:'Detail'};
+ m.reviews=[{round:1,revision:'old',model:'test',summary:'Defect',findings:[finding],at:'then'},{round:2,revision:'new',model:'test',summary:'Stale',findings:[finding],at:'then',invalidated:'revision changed'}];
+ m.repairLinks={f:['repair-a','repair-b']};
+ const status=await buildContactStatus({mission:m,pending:false,resumeHold:false,snapshot:undefined,policy:idlePolicy,step:undefined,owned:true,selected:undefined,operation:false,ctl:null,usage:null,measurementConfig:{graph:'local',frontend:'none',maxWorkers:2,reviewConcurrency:3,mode:'auto'}});
+ expect(status.measurements).toMatchObject({completedRounds:2,invalidatedRounds:1,findingOccurrences:2,latestActionable:0,latestRejected:0,severity:{critical:0,high:2,medium:0,low:0},repairLinks:2,recordedPassed:2,recordedFailed:1});
+ expect(Buffer.byteLength(JSON.stringify({measurements:status.measurements,usageEvidence:status.usageEvidence})) ).toBeLessThanOrEqual(4096);
+});
+
+test('detach flushes late coordinator usage inside the normal sampling window',async()=>{
+ const m=baseMission('/tmp'),run=await session({mission:m,entries:[usageEntry(1,2,.1)]});
+ expect((await statusOf(run,m)).usage?.tokens.input).toBe(1);
+ run.branch.push(usageEntry(8,2,.2));
+ await run.poll();
+ expect((await statusOf(run,m)).usage?.tokens.input).toBe(1);
+ await run.event('session_shutdown',{});
+ const final=await statusOf(run,m);
+ expect(final.usage?.tokens.input).toBe(9);
+ expect(final.usageEvidence?.sources[0]?.pricedMessages).toBe(2);
+ expect(final.ctl).toBeNull();
 });

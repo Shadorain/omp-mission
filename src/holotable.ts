@@ -1,14 +1,14 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { chmod, lstat, mkdir, readdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, open, readdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 import type { ExtensionContext, PlanReviewChoice } from '@oh-my-pi/pi-coding-agent';
 import { deliverUrl, displayPhase, effectiveGraph, modelRetryTargets, operatorCommands, providerCapacity, quotaBlocked, reviewRetryAt } from './controller';
 import { isRecord } from './guards';
 import { displaySourceId } from './sources';
 import { missionDirectory } from './store';
-import { phases, type Evidence, type Mission, type MissionCheck, type Mode, type PolicyContext, type Snapshot, type Step } from './types';
+import { phases, type Evidence, type Frontend, type Mission, type MissionCheck, type MissionMeasurements, type Mode, type PolicyContext, type Snapshot, type Step } from './types';
 
 // The holotable fleet contract (omp-holotable/docs/contract.md). Kept local: the repos do not import across.
 export const OPERATOR_OPS = ['approve', 'continue', 'mode', 'review', 'dispatch', 'check', 'resend', 'release', 'reap', 'clear', 'plan-approve', 'retry-model'] as const;
@@ -47,6 +47,9 @@ function missionProblem(m: Mission, graphError?: string): MissionProblem | null 
   total: source === 'review' && m.reviewProgress ? Object.keys(m.reviewProgress.inputs).length : null,
  };
 }
+export interface ReviewStatus {
+ startedAt:string; deadlineAt:string; active:number; completed:number; total:number; models:string[];
+}
 export interface ContactStatus {
 	schema: 1;
 	id: string;
@@ -69,9 +72,13 @@ export interface ContactStatus {
 	/** Latest verification outcome; 'failed' means `continue` would re-open broken work, so automation must not send it. */
 	verify: Evidence['outcome'] | null;
  problem?: MissionProblem | null;
+ review?:ReviewStatus|null;
+ model?:string|null;
 	/** Latest operator-requested PR check; absent until the first check or on older missions. */
 	check?: MissionCheck | null;
 	usage: UsageTotals | null;
+ measurements?: Measurements | null;
+ usageEvidence?: UsageEvidence | null;
 	ctl: { socket: string; generation: number } | null;
 	updatedAt: string;
 }
@@ -80,6 +87,40 @@ export interface UsageTotals {
 	tokens: { input: number; output: number; cacheRead: number; cacheWrite: number };
 	costUsd: number | null;
 	sessions: number;
+}
+
+export interface MeasurementConfig { graph:'local'|'beads'; frontend:Frontend; maxWorkers:number; reviewConcurrency:number; mode:Mode }
+export interface Measurements extends Omit<MissionMeasurements,'lastVerification'> {
+ completedRounds:number; invalidatedRounds:number; findingOccurrences:number; latestActionable:number; latestRejected:number;
+ severity:{critical:number;high:number;medium:number;low:number};
+ workerAttempts:number; workerBeads:number; repairRound:number; repairLinks:number; config:MeasurementConfig;
+}
+export interface UsageSource extends UsageTotals { role:'coordinator'|'worker'|'review'; id:string; pricedMessages:number; unpricedMessages:number }
+export interface UsageEvidence {
+ v:1; measuredAt:string; sources:UsageSource[]; missing:number; unsupportedWorkers:number;
+ malformedLines:number; resets:number; backlogBytes:number; partial:boolean;
+}
+export interface UsageMeasurement { usage:UsageTotals|null; evidence:UsageEvidence }
+interface UsageAccumulator { totals:UsageTotals; pricedMessages:number; unpricedMessages:number; malformedLines:number }
+
+function usageAccumulator():UsageAccumulator {
+ return {totals:{tokens:{input:0,output:0,cacheRead:0,cacheWrite:0},costUsd:null,sessions:0},pricedMessages:0,unpricedMessages:0,malformedLines:0};
+}
+function consumeUsage(acc:UsageAccumulator,record:unknown):void {
+ if(!isRecord(record)||record.type!=='message'||!isRecord(record.message)||record.message.role!=='assistant')return;
+ const usage=record.message.usage;
+ if(!isRecord(usage)){acc.malformedLines++;return;}
+ for(const key of TOKEN_KEYS){
+  const value=usage[key];
+  if(value===undefined&&(key==='cacheRead'||key==='cacheWrite'))continue;
+  if(typeof value!=='number'||!Number.isSafeInteger(value)||value<0){acc.malformedLines++;return;}
+ }
+ const cost=isRecord(usage.cost)?usage.cost.total:undefined;
+ if(cost!==undefined&&(typeof cost!=='number'||!Number.isFinite(cost)||cost<0)){acc.malformedLines++;return;}
+ for(const key of TOKEN_KEYS)acc.totals.tokens[key]+=(usage[key] as number|undefined)??0;
+ acc.totals.sessions=1;
+ if(typeof cost==='number'){acc.totals.costUsd=(acc.totals.costUsd??0)+cost;acc.pricedMessages++;}
+ else acc.unpricedMessages++;
 }
 
 const TOKEN_KEYS = ['input', 'output', 'cacheRead', 'cacheWrite'] as const;
@@ -91,34 +132,9 @@ function mergeUsage(target: UsageTotals, source: UsageTotals | null): void {
 	target.sessions += source.sessions;
 }
 
-// One session counts once when at least one of its records is a {type:'message', message:{role:'assistant'}}
-// entry whose message carries a usage object — the OMP AssistantMessage.usage shape. Anything else is skipped.
-export function sumAssistantUsage(records: readonly unknown[]): UsageTotals | null {
-	const totals: UsageTotals = { tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, costUsd: null, sessions: 0 };
-	let found = false;
-	for (const record of records) {
-		if (!isRecord(record) || record.type !== 'message' || !isRecord(record.message) || record.message.role !== 'assistant') continue;
-		const usage = record.message.usage;
-		if (!isRecord(usage)) continue;
-		found = true;
-		for (const key of TOKEN_KEYS) if (typeof usage[key] === 'number' && Number.isFinite(usage[key])) totals.tokens[key] += usage[key];
-		if (isRecord(usage.cost) && typeof usage.cost.total === 'number' && Number.isFinite(usage.cost.total)) totals.costUsd = (totals.costUsd ?? 0) + usage.cost.total;
-	}
-	if (!found) return null;
-	totals.sessions = 1;
-	return totals;
-}
-
-// Worker transcripts are OMP session files: one JSON object per line. A mid-write tail line is skipped,
-// so offset bookkeeping only ever ends on a newline boundary.
-export function parseUsageLines(text: string): UsageTotals | null {
-	const records: unknown[] = [];
-	for (const line of text.split('\n')) {
-		const trimmed = line.trim();
-		if (!trimmed) continue;
-		try { records.push(JSON.parse(trimmed)); } catch { /* partial or foreign line */ }
-	}
-	return sumAssistantUsage(records);
+export function sumAssistantUsage(records:readonly unknown[],acc=usageAccumulator()):UsageTotals|null {
+ for(const record of records)consumeUsage(acc,record);
+ return acc.totals.sessions?acc.totals:null;
 }
 
 export function gateTokenId(token: string): string {
@@ -132,69 +148,115 @@ export function statusFilePath(agentDir: string, mission: Pick<Mission, 'id' | '
 	return join(missionDirectory(agentDir, mission.workspace.key), 'status', `${mission.id}.json`);
 }
 
-interface FileUsage { offset: number; counted: boolean; tokens: { input: number; output: number; cacheRead: number; cacheWrite: number }; costUsd: number | null }
+interface FileUsage extends UsageAccumulator { offset:number; size:number; dev:number; ino:number; discard:boolean; role:'worker'|'review' }
 
-/**
- * Usage probe for the status file. Sums assistant-message usage in the coordinator session
- * (`SessionManager.getEntries()`) and in the mission's worker session files under
- * missions/<key>/workers/*.jsonl (read-only). Recomputed at most once per `intervalMs` (default
- * 30 s): worker files are re-parsed incrementally from the byte offset after the last newline.
- * A mission switch recomputes immediately. Null means nothing has recorded usage yet.
- */
 export class UsageProbe {
-	private readonly files = new Map<string, FileUsage>();
-	private stamp = 0;
-	private key = '';
-	private cache: UsageTotals | null = null;
+ private readonly files=new Map<string,FileUsage>();
+ private stamp=0;
+ private key='';
+ private cursor=0;
+ private resetCount=0;
+ private cache:UsageMeasurement|undefined;
+ private scratch:{chunk:Buffer;line:Buffer}|undefined;
+ constructor(private readonly agentDir:string,private readonly now:()=>number=Date.now,private readonly intervalMs=30_000){}
 
-	constructor(private readonly agentDir: string, private readonly now: () => number = Date.now, private readonly intervalMs = 30_000) {}
+ async measure(mission:Mission,coordinator:()=>{sessionFile:string|null;entries:readonly unknown[]}|undefined,force=false):Promise<UsageMeasurement>{
+  const key=`${mission.workspace.key} ${mission.id}`,now=this.now();
+  if(!force&&this.key===key&&this.cache&&now-this.stamp<this.intervalMs)return this.cache;
+  if(this.key!==key){this.files.clear();this.cursor=0;this.resetCount=0;}
+  this.key=key;this.stamp=now;
+  const evidence:UsageEvidence={v:1,measuredAt:new Date(now).toISOString(),sources:[],missing:0,unsupportedWorkers:0,malformedLines:0,resets:0,backlogBytes:0,partial:false};
+  const totals:UsageTotals={tokens:{input:0,output:0,cacheRead:0,cacheWrite:0},costUsd:null,sessions:0};
+  const coord=coordinator(),acc=usageAccumulator();
+  const coordinatorUsage=sumAssistantUsage(coord?.entries??[],acc);
+  mergeUsage(totals,coordinatorUsage);
+  evidence.malformedLines+=acc.malformedLines;
+  if(!coord?.sessionFile)evidence.missing++;
+  else if(coordinatorUsage)evidence.sources.push({role:'coordinator',id:`coordinator:${createHash('sha256').update(coord.sessionFile).digest('hex').slice(0,32)}`,...coordinatorUsage,pricedMessages:acc.pricedMessages,unpricedMessages:acc.unpricedMessages});
+  const base=missionDirectory(this.agentDir,mission.workspace.key);
+  const workerDir=await realpath(join(base,'workers')).catch(()=>resolve(base,'workers'));
+  const reviewDir=await realpath(join(base,'reviews',mission.id)).catch(()=>resolve(base,'reviews',mission.id));
+  const owned=new Map<string,'worker'|'review'>();
+  const add=async(path:string,root:string,role:'worker'|'review')=>{
+   const canonical=await realpath(path).catch(()=>resolve(path));
+   if(!canonical.startsWith(`${root}${sep}`)||!canonical.endsWith('.jsonl')){evidence.missing++;return;}
+   owned.set(canonical,role);
+  };
+  for(const worker of mission.workers){
+   if(worker.frontend!=='subagent'){evidence.unsupportedWorkers++;continue;}
+   if(!worker.incarnationId){evidence.missing++;continue;}
+   await add(worker.incarnationId,workerDir,'worker');
+  }
+  let reviewNames:string[]=[];
+  try{reviewNames=await readdir(reviewDir);}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')evidence.missing++;}
+  for(const name of reviewNames)if(name.endsWith('.jsonl'))await add(join(reviewDir,name),reviewDir,'review');
+  if(![...owned.values()].includes('review')&&mission.evidence.review&&['active','passed','failed'].includes(mission.evidence.review.outcome))evidence.missing++;
+  const paths=[...owned.keys()].sort(),seen=new Set<string>();
+  const scratch=paths.length?(this.scratch??={chunk:Buffer.allocUnsafe(64*1024),line:Buffer.allocUnsafe(1024*1024)}):undefined;
+  const budget={remaining:4*1024*1024};
+  for(let i=0;i<paths.length;i++){
+   const path=paths[(this.cursor+i)%paths.length]!;
+   seen.add(path);
+   await this.readUsageFile(path,owned.get(path)!,budget,scratch!.chunk,scratch!.line,evidence);
+  }
+  if(paths.length)this.cursor=(this.cursor+1)%paths.length;
+  for(const [path] of this.files)if(!seen.has(path))evidence.missing++;
+  for(const role of ['worker','review'] as const){
+   const aggregate=usageAccumulator();
+   for(const entry of this.files.values())if(entry.role===role){
+    mergeUsage(aggregate.totals,entry.totals);
+    aggregate.pricedMessages+=entry.pricedMessages;aggregate.unpricedMessages+=entry.unpricedMessages;aggregate.malformedLines+=entry.malformedLines;
+   }
+   evidence.malformedLines+=aggregate.malformedLines;
+   if(aggregate.totals.sessions){
+    const source:UsageSource={role,id:`${role}:${createHash('sha256').update(mission.id).digest('hex').slice(0,32)}`,...aggregate.totals,pricedMessages:aggregate.pricedMessages,unpricedMessages:aggregate.unpricedMessages};
+    evidence.sources.push(source);mergeUsage(totals,source);
+   }
+  }
+  evidence.resets=this.resetCount;
+  evidence.partial=evidence.missing>0||evidence.unsupportedWorkers>0||evidence.malformedLines>0||evidence.resets>0||evidence.backlogBytes>0||acc.unpricedMessages>0||evidence.sources.some(s=>s.unpricedMessages>0);
+  this.cache={usage:totals.sessions?totals:null,evidence};
+  return this.cache;
+ }
 
-	async measure(mission: Mission, coordinatorEntries: () => readonly unknown[] | undefined): Promise<UsageTotals | null> {
-		const key = `${mission.workspace.key} ${mission.id}`;
-		const now = this.now();
-		if (this.key === key && now - this.stamp < this.intervalMs) return this.cache;
-		if (this.key !== key) this.files.clear();
-		this.key = key;
-		this.stamp = now;
-		this.cache = await this.compute(mission, coordinatorEntries);
-		return this.cache;
-	}
-
-	private async compute(mission: Mission, coordinatorEntries: () => readonly unknown[] | undefined): Promise<UsageTotals | null> {
-		const totals: UsageTotals = { tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, costUsd: null, sessions: 0 };
-		mergeUsage(totals, sumAssistantUsage(coordinatorEntries() ?? []));
-		const dir = join(missionDirectory(this.agentDir, mission.workspace.key), 'workers');
-		const names = new Set(await readdir(dir).catch(() => [] as string[]));
-		for (const name of [...names].sort()) {
-			if (!name.endsWith('.jsonl')) continue;
-			mergeUsage(totals, await this.file(join(dir, name)));
-		}
-		// A worker file deleted since the last pass keeps the usage already parsed from it.
-		for (const [path, entry] of this.files) {
-			if (path.startsWith(`${dir}/`) && !names.has(path.slice(dir.length + 1)) && entry.counted) {
-				mergeUsage(totals, { tokens: { ...entry.tokens }, costUsd: entry.costUsd, sessions: 1 });
-			}
-		}
-		return totals.sessions > 0 ? totals : null;
-	}
-
-	private async file(path: string): Promise<UsageTotals | null> {
-		let entry = this.files.get(path);
-		const data = await readFile(path).catch(() => null);
-		if (data === null) return entry ? { tokens: { ...entry.tokens }, costUsd: entry.costUsd, sessions: entry.counted ? 1 : 0 } : null;
-		const end = data.lastIndexOf(0x0a);
-		if (!entry) { entry = { offset: 0, counted: false, tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, costUsd: null }; this.files.set(path, entry); }
-		if (end > entry.offset) {
-			const parsed = parseUsageLines(data.toString('utf8', entry.offset, end + 1));
-			entry.offset = end + 1;
-			if (parsed) {
-				for (const key of TOKEN_KEYS) entry.tokens[key] += parsed.tokens[key];
-				if (parsed.costUsd !== null) entry.costUsd = (entry.costUsd ?? 0) + parsed.costUsd;
-				entry.counted = true;
-			}
-		}
-		return { tokens: { ...entry.tokens }, costUsd: entry.costUsd, sessions: entry.counted ? 1 : 0 };
-	}
+ private async readUsageFile(path:string,role:'worker'|'review',budget:{remaining:number},chunk:Buffer,line:Buffer,evidence:UsageEvidence):Promise<void>{
+  let file;
+  try{file=await open(path,'r');}catch{evidence.missing++;return;}
+  try{
+   const stat=await file.stat();
+   let entry=this.files.get(path);
+   if(entry&&(entry.dev!==stat.dev||entry.ino!==stat.ino||stat.size<entry.size)){this.resetCount++;entry=undefined;}
+   if(!entry){entry={...usageAccumulator(),offset:0,size:stat.size,dev:stat.dev,ino:stat.ino,discard:false,role};this.files.set(path,entry);}
+   entry.size=stat.size;
+   let position=entry.offset,length=0;
+   while(position<stat.size&&budget.remaining>0){
+    const size=Math.min(chunk.length,stat.size-position,budget.remaining);
+    const {bytesRead}=await file.read(chunk,0,size,position);
+    if(!bytesRead)break;
+    budget.remaining-=bytesRead;
+    let start=0;
+    while(start<bytesRead){
+     const newline=chunk.indexOf(0x0a,start),end=newline===-1||newline>=bytesRead?bytesRead:newline;
+     const bytes=end-start;
+     if(!entry.discard){
+      if(length+bytes>line.length){entry.discard=true;entry.malformedLines++;length=0;}
+      else{chunk.copy(line,length,start,end);length+=bytes;}
+     }
+     if(end<bytesRead){
+      if(!entry.discard&&length){
+       try{consumeUsage(entry,JSON.parse(line.toString('utf8',0,length)));}catch{entry.malformedLines++;}
+      }
+      entry.discard=false;length=0;entry.offset=position+end+1;
+     }
+     start=end+1;
+    }
+    position+=bytesRead;
+    if(entry.discard)entry.offset=position;
+   }
+   evidence.backlogBytes+=Math.max(0,stat.size-entry.offset);
+  }catch{evidence.missing++;}
+  finally{await file.close();}
+ }
 }
 
 export interface StatusInput {
@@ -209,6 +271,10 @@ export interface StatusInput {
 	operation: boolean;
 	ctl: { socket: string; generation: number } | null;
 	usage: UsageTotals | null;
+ usageEvidence?:UsageEvidence;
+ measurementConfig?:MeasurementConfig;
+ review?:ReviewStatus|null;
+ model?:string|null;
 	planPath?: string;
 	planReview?: boolean;
 	question?: string;
@@ -243,6 +309,22 @@ export async function buildContactStatus(input: StatusInput): Promise<ContactSta
 	const next = question ? `Answer in mission: ${question}`.replace(/\s+/g, ' ').slice(0, 240)
 		: m.blocker ? m.blocker.replace(/\s+/g, ' ').slice(0, 240)
 		: input.step ? `${input.step.command ? `${input.step.command} — ` : ''}${input.step.text}`.replace(/\s*\n\s*/g, ' ').slice(0, 240) : null;
+ const measured=m.measurements;
+ const latest=m.reviews.at(-1);
+ const severity={critical:0,high:0,medium:0,low:0};
+ let findingOccurrences=0,invalidatedRounds=0,repairLinks=0;
+ for(const round of m.reviews){if(round.invalidated)invalidatedRounds++;for(const finding of round.findings){findingOccurrences++;severity[finding.severity]++;}}
+ for(const links of Object.values(m.repairLinks))repairLinks+=links.length;
+ const measurements:Measurements|null=measured&&input.measurementConfig?{
+  v:1,since:measured.since,recordedPassed:measured.recordedPassed,recordedFailed:measured.recordedFailed,
+  repeatedFailedRevision:measured.repeatedFailedRevision,mergePreflightFailures:measured.mergePreflightFailures,
+  boundaryFailures:measured.boundaryFailures,reviewFailures:measured.reviewFailures,acceptedRepairs:measured.acceptedRepairs,
+  completedRounds:m.reviews.length,invalidatedRounds,findingOccurrences,
+  latestActionable:latest&&!latest.invalidated?latest.findings.filter(f=>!f.rejection).length:0,
+  latestRejected:latest&&!latest.invalidated?latest.findings.filter(f=>!!f.rejection).length:0,
+  severity,workerAttempts:m.workers.length,workerBeads:new Set(m.workers.map(w=>w.beadId)).size,
+  repairRound:m.round,repairLinks,config:input.measurementConfig,
+ }:null;
 	return {
 		schema: 1,
 		id: m.id,
@@ -264,8 +346,12 @@ export async function buildContactStatus(input: StatusInput): Promise<ContactSta
 		mode: m.mode ?? null,
 		verify: m.evidence.verify?.outcome ?? null,
 		problem: missionProblem(m, graphDown ? input.snapshot?.error : undefined),
+  review:input.review??null,
+  model:input.model??null,
 		check: m.check ?? null,
 		usage: input.usage,
+  measurements,
+  usageEvidence:input.usageEvidence??null,
 		ctl: input.ctl,
 		updatedAt: m.updatedAt,
 	};
@@ -308,6 +394,8 @@ export interface HolotableHooks {
 	owned(): boolean;
 	selected(): string | undefined;
 	operation(): boolean;
+ measurementConfig?():MeasurementConfig;
+ review?():ReviewStatus|null;
 	question(): string | undefined;
 	gateId(): string | undefined;
 	decide(context: ExtensionContext, verb: string, arg?: string): Promise<void>;
@@ -344,6 +432,7 @@ export class HolotableBridge {
 	private failed = false;
 	private writing: Promise<void> = Promise.resolve();
 	private readonly usage: UsageProbe;
+ private completedKey='';
 
 	constructor(private readonly agentDir: string, private readonly hooks: HolotableHooks) {
 		this.usage = new UsageProbe(agentDir);
@@ -354,18 +443,22 @@ export class HolotableBridge {
 	}
 
 	// Fire-and-forget status publication; serialized so concurrent renders cannot interleave the tmp file.
-	publish(): Promise<void> {
-		this.writing = this.writing.then(() => this.write()).catch(() => undefined);
+ publish(forceUsage=false):Promise<void> {
+  this.writing=this.writing.then(()=>this.write(forceUsage)).catch(()=>undefined);
 		return this.writing;
 	}
 
-	private async write(): Promise<void> {
+ private async write(forceUsage:boolean):Promise<void> {
 		const { mission, pending } = this.hooks.source();
 		const current = mission ?? pending;
 		if (!current) return;
 		// getEntries() (not getBranch()): every assistant message in the coordinator session counts toward spend.
 		// Lazy so a publish inside the probe's throttle window does not pay for the copy.
-		const coordinatorEntries = () => { try { return this.hooks.context()?.sessionManager.getEntries(); } catch { return undefined; } };
+  const coordinator=()=>{try{const context=this.hooks.context();if(!context)return undefined;const manager=context.sessionManager;return {sessionFile:typeof manager.getSessionFile==='function'?manager.getSessionFile()??null:null,entries:manager.getEntries()};}catch{return undefined;}};
+  const key=`${current.workspace.key} ${current.id}`;
+  const complete=current.phase==='complete';
+  const measured=await this.usage.measure(current,coordinator,forceUsage||(complete&&this.completedKey!==key));
+  this.completedKey=complete?key:'';
 		const status = await buildContactStatus({
 			mission: current,
 			pending: !mission && !!pending,
@@ -377,7 +470,11 @@ export class HolotableBridge {
 			selected: this.hooks.selected(),
 			operation: this.hooks.operation(),
 			ctl: this.ctlFor(current.id),
-			usage: await this.usage.measure(current, coordinatorEntries),
+   usage:measured.usage,
+   usageEvidence:measured.evidence,
+   measurementConfig:this.hooks.measurementConfig?.(),
+   review:this.hooks.review?.(),
+   model:(()=>{const model=this.hooks.context()?.model;return model?`${model.provider}/${model.id}`:null;})(),
 			planPath: this.hooks.planPath(),
 			planReview: this.hooks.planReview()?.canApprove === true,
 			question: this.hooks.question(),

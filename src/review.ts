@@ -23,8 +23,8 @@ async function diffBase(m: Mission, run: Run): Promise<string> {
  return base;
 }
 const countDiffFiles=(diff:string)=>(diff.match(/^diff --git /gm)??[]).length;
-/** Reviewer time budget: 5 minutes plus 15 seconds per changed file, capped at 30 minutes. A fixed 5 minutes aborted large PRs with nothing to show. */
-export const reviewBudgetMs=(changedFiles:number)=>Math.min(30*60_000,300_000+changedFiles*15_000);
+/** Retries of timed-out targets get more room, but no reviewer may exceed 30 minutes. */
+export const reviewBudgetMs=(changedFiles:number,timeoutAttempts=0)=>Math.min(30*60_000,(300_000+changedFiles*15_000)*2**Math.min(3,Math.max(0,timeoutAttempts)));
 export async function captureRevision(m: Mission, run: Run): Promise<RevisionCapture> {
  const cwd=m.workspace.cwd; const hash=createHash('sha256'); const treeHash=createHash('sha256'); const legacyHash=createHash('sha256'); const legacyTreeHash=createHash('sha256'); let files:string[];let diff='';
  const both=(chunk:string|Buffer)=>{hash.update(chunk);treeHash.update(chunk);legacyHash.update(chunk);legacyTreeHash.update(chunk);};
@@ -208,12 +208,35 @@ type Model = NonNullable<ExtensionContext['model']>;
 export type ReviewAgent = { id: string; label: string };
 export type ReviewOpener = (m: Mission, ctx: ExtensionContext, model: Model, contextFiles: Array<{ path: string; content: string }> | undefined, note: string, budgetMs?: number, agent?: ReviewAgent) => Promise<{ session: ReviewSession; file?: string }>;
 /** Where reviewer transcripts go and who hears about each reviewer. Without a dir the session stays in memory. */
-export interface ReviewWatch { sessionDir?: (m: Mission) => string; progress?: (event: { label: string; state: 'running' | 'closed' | 'error' }) => void; /** Called (awaited, serialized) after each review target settles so the caller can durably persist `m.reviewProgress`. */ checkpoint?: (m: Mission) => Promise<void> }
+export interface ReviewWatch { sessionDir?: (m: Mission) => string; progress?: (event: { label: string; state: 'running' | 'closed' | 'error' }) => void; checkpoint?: (m: Mission) => Promise<void>; schedule?: (callback: () => void, ms: number) => () => void }
+export interface LiveReview { label: string; model: string; startedAt: string; deadlineAt: string }
+const scheduleReview = (callback: () => void, ms: number) => { const timer=setTimeout(callback,ms); return ()=>clearTimeout(timer); };
 const reviewAgent = (label: string): ReviewAgent => ({ id: `review-${label}-${crypto.randomUUID().slice(0, 8)}`, label });
 export class Reviewer {
- private sessions = new Set<ReviewSession>();
+ private generation=0;
+ private readonly active=new Map<symbol,{cancel:()=>void;session?:ReviewSession;live:LiveReview}>();
+ private readonly disposing=new WeakMap<ReviewSession,Promise<void>>();
  constructor(private readonly opener?: ReviewOpener, private readonly watch: ReviewWatch = {}) {}
- async dispose(): Promise<void> {const all=[...this.sessions];this.sessions.clear();await Promise.all(all.map(session=>session.dispose().catch(()=>{})));}
+ running():LiveReview[] {
+  return [...this.active.values()].map(({live,session})=>{
+   const model=session?.state.model;
+   return {...live,model:model?`${model.provider}/${model.id}`:live.model};
+  });
+ }
+ private release(session:ReviewSession):Promise<void> {
+  const existing=this.disposing.get(session);if(existing)return existing;
+  const done=Promise.withResolvers<void>();
+  const cancel=(this.watch.schedule??scheduleReview)(()=>done.resolve(),5_000);
+  const promise=Promise.race([Promise.resolve().then(()=>session.dispose()).catch(()=>{}),done.promise]).finally(cancel);
+  this.disposing.set(session,promise);
+  return promise;
+ }
+ async dispose(): Promise<void> {
+  this.generation++;
+  const active=[...this.active.values()];
+  for(const item of active)item.cancel();
+  await Promise.all(active.flatMap(item=>item.session?[this.release(item.session)]:[]));
+ }
  /**
   * One reviewer per bead in parallel, plus one integration pass on the first round. A later round
   * reviews only beads whose files changed since the previous round (all-unchanged falls back to the
@@ -225,6 +248,7 @@ export class Reviewer {
   * throws and is never a passed review.
   */
  async runPerBead(m: Mission, ctx: ExtensionContext, run: Run, role: string, contextFiles: Array<{ path: string; content: string }> | undefined, targets: BeadReviewTarget[], maxConcurrent = 3): Promise<ReviewRound> {
+  const generation=this.generation;
   if(!ctx.model||!ctx.modelRegistry)throw new Error('Coordinator model/registry unavailable');
   const model = missionModel(m, 'review', role, ctx);
   const modelName=`${model.provider}/${model.id}`;
@@ -285,14 +309,18 @@ export class Reviewer {
    job.inputHash=createHash('sha256').update(reviewerInput([REVIEW_SYSTEM,job.note,effectiveContext,job.input])).digest('hex');
    state.inputs[job.label]=job.inputHash;
   }
+  m.reviewProgress=state;
+  await checkpoint();
   let capacityFailure: Error | undefined;
   const runJob=async(job:typeof planned[number])=>{
     let result:TargetResult|undefined;
     const cached=reusable&&reusable.inputs[job.label]===job.inputHash?reusable.targets[job.label]:undefined;
+    const timeoutAttempts=reusable&&reusable.inputs[job.label]===job.inputHash&&/deadline exceeded|timed out|timeout/i.test(reusable.failures[job.label]??'')?m.evidence.review?.attempts??1:0;
     try{
+     if(generation!==this.generation)throw new Error('Review cancelled');
      if (capacityFailure && !cached) throw new Error(`Not started while provider capacity is unavailable: ${capacityFailure.message}`);
      if(cached)result={summary:cached.summary,findings:cached.findings,...(cached.transcript?{file:cached.transcript}:{})};
-     else result=await this.#review(m,ctx,model,effectiveContext,job.note,job.input,captured.revision,job.budget,job.label);
+     else result=await this.#review(m,ctx,model,effectiveContext,job.note,job.input,captured.revision,job.budget,job.label,timeoutAttempts);
      // Out-of-owner citations are partitioned at assembly. Failing the target here discarded a finished review and looped the retry.
      state.targets[job.label]={summary:result.summary,findings:result.findings,model:cached ? cached.model ?? reusable!.model : modelName,...(result.file?{transcript:result.file}:{})};
      delete state.failures[job.label];
@@ -363,17 +391,46 @@ export class Reviewer {
   const models=[...new Set(Object.values(state.targets).map(target=>target.model??modelName))];
   return {round:m.round,revision:captured.revision,model:models.join(', ')||modelName,summary,findings,at:new Date().toISOString(),beads:hashes,...(Object.keys(transcripts).length?{transcripts}:{})};
  }
- async #review(m: Mission, ctx: ExtensionContext, model: Model, contextFiles: Array<{ path: string; content: string }> | undefined, note: string, payload: string, revision: string, changedFiles: number, label: string): Promise<Pick<ReviewRound,'summary'|'findings'>&{file?:string}> {
+ async #review(m: Mission, ctx: ExtensionContext, model: Model, contextFiles: Array<{ path: string; content: string }> | undefined, note: string, payload: string, revision: string, changedFiles: number, label: string, timeoutAttempts=0): Promise<Pick<ReviewRound,'summary'|'findings'>&{file?:string}> {
+  const budget=reviewBudgetMs(changedFiles,timeoutAttempts);
+  const started=Date.now();
+  const stopped=Promise.withResolvers<never>();
+  const key=Symbol(label);
+  let cancelled=false;
+  const item:{cancel:()=>void;session?:ReviewSession;live:LiveReview}={
+   cancel:()=>{cancelled=true;stopped.reject(new Error('Review cancelled'));},
+   live:{label,model:`${model.provider}/${model.id}`,startedAt:new Date(started).toISOString(),deadlineAt:new Date(started+budget).toISOString()},
+  };
+  const cancelTimer=(this.watch.schedule??scheduleReview)(()=>{
+   cancelled=true;
+   const last=item.session?.state.messages.findLast(message=>message.role==='assistant');
+   const detail=last?.role==='assistant'&&last.stopReason==='error'?last.errorMessage:undefined;
+   stopped.reject(new Error(`Reviewer deadline exceeded${detail?`: ${detail}`:''}`));
+  },budget);
+  this.active.set(key,item);
   this.watch.progress?.({label,state:'running'});
-  let state:'closed'|'error'='error';let session:ReviewSession|undefined;let file:string|undefined;
+  let state:'closed'|'error'='error';
   try{
-   const opened=await (this.opener??((...args)=>this.#open(...args)))(m,ctx,model,contextFiles,note,reviewBudgetMs(changedFiles),reviewAgent(label));session=opened.session;file=opened.file;this.sessions.add(session);
-   await session.prompt(payload,{expandPromptTemplates:false});
-   const {summary,findings}=await collectReview(session,revision);
+   const work=(async()=>{
+    const opened=await (this.opener??((...args)=>this.#open(...args)))(m,ctx,model,contextFiles,note,budget,reviewAgent(label));
+    if(cancelled){void this.release(opened.session);throw new Error('Review cancelled');}
+    item.session=opened.session;
+    await opened.session.prompt(payload,{expandPromptTemplates:false});
+    if(cancelled)throw new Error('Review cancelled');
+    const result=await collectReview(opened.session,revision);
+    if(cancelled)throw new Error('Review cancelled');
+    return {...result,...(opened.file?{file:opened.file}:{})};
+   })();
+   const result=await Promise.race([work,stopped.promise]);
    state='closed';
-   return {summary,findings,...(file?{file}:{})};
+   return result;
   }catch(error){throw new Error(`[${label}] ${error instanceof Error?error.message:String(error)}`);}
-  finally{if(session){this.sessions.delete(session);await session.dispose();}this.watch.progress?.({label,state});}
+  finally{
+   cancelTimer();
+   this.active.delete(key);
+   if(item.session)await this.release(item.session);
+   this.watch.progress?.({label,state});
+  }
  }
  async #open(m: Mission, ctx: ExtensionContext, model: Model, contextFiles: Array<{ path: string; content: string }> | undefined, note: string, budgetMs = reviewBudgetMs(0), agent: ReviewAgent = reviewAgent('review')) {
   const dir=this.watch.sessionDir?.(m);
@@ -402,18 +459,13 @@ export class Reviewer {
   const model = missionModel(m, 'review', role, ctx);
   const captured=await captureRevision(m,run);
   alignVerifiedRevision(m,captured);
-  const label='review';this.watch.progress?.({label,state:'running'});
-  let state:'closed'|'error'='error';let session:ReviewSession|undefined;let file:string|undefined;
-  try{
-   const opened=await this.#open(m,ctx,model,contextFiles,'',reviewBudgetMs(countDiffFiles(captured.diff)),reviewAgent(label));session=opened.session;file=opened.file;
-   this.sessions.add(session);
-   const bounded=boundDiff(captured.diff);
-   await session.prompt(JSON.stringify({reviewedRevision:captured.revision,source:m.source,workspace:m.workspace,scopes:m.scopes,verification:m.evidence.verify,files:captured.files,diff:bounded.diff,...(bounded.omitted.length?{omittedDiffs:bounded.omitted}:{}),priorDecisions:priorDecisions(m,captured.files)}),{expandPromptTemplates:false});
-   const result=await collectReview(session,captured.revision);
-   const after=await captureRevision(m,run);if(after.revision!==captured.revision)throw new Error('Revision changed during review; result invalidated');
-   state='closed';
-   delete m.reviewProgress;
-   return {...result,round:m.round,model:`${model.provider}/${model.id}`,at:new Date().toISOString(),...(file?{transcripts:{[label]:file}}:{})};
-  }finally{if(session){this.sessions.delete(session);await session.dispose();}this.watch.progress?.({label,state});}
+  const bounded=boundDiff(captured.diff);
+  const prior=m.evidence.review;
+  const attempts=prior?.revision===captured.revision&&/deadline exceeded|timed out|timeout/i.test(prior.detail)?prior.attempts??1:0;
+  const result=await this.#review(m,ctx,model,contextFiles,'',JSON.stringify({reviewedRevision:captured.revision,source:m.source,workspace:m.workspace,scopes:m.scopes,verification:m.evidence.verify,files:captured.files,diff:bounded.diff,...(bounded.omitted.length?{omittedDiffs:bounded.omitted}:{}),priorDecisions:priorDecisions(m,captured.files)}),captured.revision,countDiffFiles(captured.diff),'review',attempts);
+  const after=await captureRevision(m,run);if(after.revision!==captured.revision)throw new Error('Revision changed during review; result invalidated');
+  delete m.reviewProgress;
+  const {file,...verdict}=result;
+  return {...verdict,round:m.round,revision:captured.revision,model:`${model.provider}/${model.id}`,at:new Date().toISOString(),...(file?{transcripts:{review:file}}:{})};
  }
 }
