@@ -99,7 +99,7 @@ async function session(options: { plan?: boolean; child?: boolean; autostart?: s
 		appendEntry: (customType: string, data: unknown) => { branch.push({ type: 'custom', customType, data }) },
 		sendUserMessage: (message: string) => { sent.push(message); },
 		sendMessage: async () => {}, setSessionName: async () => {},
-		setModel: async () => true,
+		setModel: async (model: ExtensionContext['model']) => { Object.assign(context,{model}); return true; },
 		exec: async (name: string, args: string[]) => {
 			if (name === 'git') return { code: 128, stdout: '', stderr: 'not a git repository' };
 			if (name === 'lin') return { code: 0, stdout: JSON.stringify({ issue: { identifier: 'CHR-123', title: 'Startup', description: '', comments: { nodes: [] } } }), stderr: '' };
@@ -791,10 +791,20 @@ test('operator model recovery uses the live socket, preserves holds and refuses 
   expect((await retry()).ok).toBe(true);
   const saved=await loadMission(missionPath(run.root,mission));
   expect(saved.blocker).toBeUndefined();
-  expect(saved.modelOverrides).toEqual({coordinator:'p/replacement',worker:'p/replacement',review:'p/replacement'});
+  expect(saved.modelOverrides).toEqual({worker:'p/replacement',review:'p/replacement'});
   expect(saved.mode).toBe(mission.mode);
   expect(saved.phase).toBe(mission.phase);
   expect((await retry()).ok).toBe(false);
+ }finally{await run.event('session_shutdown',{});}
+});
+
+test('continue preserves the operator model instead of restoring a previous recovery choice', async () => {
+ const mission=baseMission('/tmp',{modelOverrides:{worker:'p/old',review:'p/old',...{coordinator:'p/old'}}});
+ const run=await session({child:true,mission,models:[{provider:'p',id:'old'},{provider:'p',id:'chosen'}]});
+ try{
+  Object.assign(run.context,{model:{provider:'p',id:'chosen'}});
+  await run.command('continue');
+  expect((await statusOf(run,mission)).model).toBe('p/chosen');
  }finally{await run.event('session_shutdown',{});}
 });
 

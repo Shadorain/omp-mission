@@ -548,10 +548,6 @@ async function finishMission(context:ExtensionContext){
    else if(params.operation==='continue'){
     if(mission?.evidence.verify?.outcome==='failed'&&!internal.operator)throw new Error('Verification is held; the operator must run /mission continue after resolving the blocker');
     if(!mission)throw new Error('No saved mission');
-    if(mission.modelOverrides?.coordinator){
-     const model=context.modelRegistry.getAvailable().find(model=>`${model.provider}/${model.id}`===mission!.modelOverrides!.coordinator);
-     if(!model||!await pi.setModel(model))throw new Error(`Selected recovery model is unavailable: ${mission.modelOverrides.coordinator}`);
-    }
     await acquire();const mode=params.mode??inspectionIntent.mode;if(mode)setMode(mission,mode);
     if(inspectionIntent.reviewRequested){mission.reviewRequested=true;if(mission.evidence.review?.outcome==='failed')delete mission.evidence.review;}
     if(mission.evidence.verify?.outcome==='failed')mission.evidence.verify={...mission.evidence.verify,outcome:'pending'};
@@ -570,7 +566,7 @@ async function finishMission(context:ExtensionContext){
     if(targets.workers.some(id=>workerAgents.isLive(id)))throw new Error('A failed worker is still running; wait for it to stop');
     if(!context.isIdle()||!await pi.setModel(model))throw new Error('Coordinator is busy or the selected model has no credentials');
     const selector=`${model.provider}/${model.id}`;
-    mission.modelOverrides={coordinator:selector,worker:selector,review:selector};
+    mission.modelOverrides={worker:selector,review:selector};
     if(targets.coordinator){delete mission.blocker;providerHold=undefined;}
     if(targets.review){
      if(mission.reviewProgress)mission.reviewProgress.retryModel=selector;

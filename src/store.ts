@@ -159,7 +159,7 @@ export function validateMission(value: unknown): Mission {
   if (row.modelOverrides !== undefined) {
     const models = object(row.modelOverrides, "modelOverrides");
     mission.modelOverrides = {};
-    for (const key of ['coordinator', 'worker', 'review'] as const) {
+    for (const key of ['worker', 'review'] as const) {
       if (models[key] !== undefined) mission.modelOverrides[key] = text(models[key], `modelOverrides.${key}`, 1000);
     }
   }

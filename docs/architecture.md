@@ -25,6 +25,11 @@ Phases run in order: `plan`, `isolate`, `graph`, `execute`, `verify`, `deliver`,
 
 Two graph kinds. `local`: work happens in the coordinator pane, no workers. `beads`: a bead epic with scoped leaves, executed by workers. A running mission keeps the graph it started with.
 
+Coordinator model state is owned and restored by OMP. Operator `retry-model` calls `setModel`
+once and persists worker/review overrides only; `continue` never reapplies a coordinator model.
+Legacy coordinator override fields are dropped while loading a mission, so they cannot undo
+a newer native model selection during automatic recovery.
+
 ## Evidence and review progress
 
 Binding repair work, a different epic, unfinished leaves, or changed scopes invalidates verification, delivery, review, completion evidence and partial review progress before execution. Saved rounds remain history; Pause approval is rebuilt for the new scope.
