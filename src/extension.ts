@@ -133,6 +133,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
     models:[...new Set(running.map(item=>item.model))],
    };
   },
+  sessionInfo:()=>({id:(()=>{const manager=ctx?.sessionManager;const id=typeof manager?.getSessionId==='function'?manager.getSessionId():null;return typeof id==='string'&&id?id:`pid-${process.pid}`;})(),owned:mission?!!ownership&&!ownershipError:true}),
   question,
   gateId:()=>mission?.gate?gateTokenId(mission.gate.token):undefined,
   decide:(context,verb,arg)=>decision(context,verb,arg),
@@ -145,7 +146,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
   planReview:()=>{const context=ctx&&eligible(ctx)?ctx:undefined;const review=context?.getPendingPlanReview?context.getPendingPlanReview():planReview;return context?.resolvePlanReview&&review?{reviewId:review.reviewId,canApprove:!review.options?.find(option=>option.id==='compact')?.disabled,resolve:(choice,input)=>context.resolvePlanReview(review.reviewId,choice,input)}:undefined;},
  });
  async function publishStatus(forceUsage=false){await holotable.publish(forceUsage);}
- async function openSocket(id:string){try{await holotable.open(id);}catch(error){ctx?.ui.notify(`Holotable control socket failed: ${error instanceof Error?error.message:String(error)}`,'warning');}}
+ async function openSocket(m:Mission){try{await holotable.open(m);}catch(error){ctx?.ui.notify(`Holotable control socket failed: ${error instanceof Error?error.message:String(error)}`,'warning');}}
  async function assertPrBase(m:Mission,url?:string){
   if(!m.workspace.base)throw new Error('Repository base unresolved; bind the workspace before delivery or review');
   const pr=await run('gh',['pr','view',...(url?[url]:[]),'--json','baseRefName'],m.workspace.cwd);
@@ -188,10 +189,22 @@ export default async function missionExtension(pi: ExtensionAPI) {
   if(!projection()||overlayAbort){context.ui.setWidget('mission',undefined);return;}
   context.ui.setWidget('mission',(tui,theme)=>createMissionWidget(()=>projection()!,()=>tui.terminal.rows,theme),{placement:'aboveEditor'});
  }
- async function acquire(){if(!mission||!path)throw new Error('No saved mission');if(ownership){await ownership.assertOwned();return;}ownershipError=undefined;ownership=await acquireOwnership(path,mission,error=>{ownershipError=`Controller lost: ${error.message}`;resumeHold=true;lastWake='';void reviewer.dispose();void render();});mission=ownership.mission;mission.controllerNonce=ownership.nonce;}
+ async function acquire(){if(!mission||!path)throw new Error('No saved mission');if(ownership){await ownership.assertOwned();return;}ownershipError=undefined;ownership=await acquireOwnership(path,mission,error=>{ownershipError=`Controller lost: ${error.message}`;resumeHold=true;lastWake='';void holotable.close();void reviewer.dispose();void render();});mission=ownership.mission;mission.controllerNonce=ownership.nonce;await openSocket(mission);await publishStatus();}
+ // Resumed panes try for the controller lock once at attach and then on a poll throttle; a
+ // live owner keeps this pane read-only, a stale lock clears ~30 s after the crash.
+ let lastOwnershipTry=0;
+ async function tryAcquire(context:ExtensionContext){
+  if(!mission||!path||ownership&&!ownershipError||Date.now()-lastOwnershipTry<15_000)return;
+  lastOwnershipTry=Date.now();
+  if(ownership)await release();
+  try{
+   await acquire();if(ctx!==context)return;
+   context.ui.notify('Mission control acquired: this pane is the controller now. /mission continue resumes work.','info');
+  }catch(error){ownershipError=error instanceof Error?error.message:String(error);}
+ }
  async function release(){pendingQuestions.clear();const current=ownership;ownership=undefined;await current?.release();await holotable.close();}
  async function detach(context?:ExtensionContext){generation++;providerHold=undefined;coordinatorShells.clear();lifetime.abort();lifetime=new AbortController();terminalInputDispose?.();terminalInputDispose=undefined;overlayAbort?.abort();overlayAbort=undefined;if(timer&&ctx)ctx.clearTimer(timer);timer=undefined;await reviewer.dispose();await workerAgents.abortAll();await release();await publishStatus(true);ctx?.ui.setWidget('mission',undefined);ctx=context;mission=undefined;pending=undefined;path=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;lastWake='';guided='';selected=undefined;history=undefined;lastPoll=0;outlineOffset=0;inspectionIntent={};subagents=[];reviewRows=[];planReview=undefined;openedPlanRevision=undefined;openingPlanReview=false;}
- async function attach(file:string,context:ExtensionContext,announce=true){providerHold=undefined;await release();mission=await loadMission(file);path=file;pending=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;ctx=context;await refresh(false);await render();await openSocket(mission.id);await publishStatus();
+ async function attach(file:string,context:ExtensionContext,announce=true){providerHold=undefined;await release();mission=await loadMission(file);path=file;pending=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;ctx=context;await refresh(false);await render();lastOwnershipTry=0;await tryAcquire(context);await publishStatus();
   const step=announce?currentStep(context):undefined;
   if(step)context.ui.notify(`${displaySourceId(mission.source)} · ${phaseLabel(displayPhase(mission,snapshot))}. ${step.command?`Next: ${step.command} — `:''}${step.text}. /mission opens the action menu.`,'info');
  }
@@ -220,7 +233,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
      const marker='\nMission pending recovery JSON:\n';const index=content.lastIndexOf(marker);if(index<0)continue;
      try{raw=JSON.parse(content.slice(index+marker.length));}catch{continue;}
     }else continue;
-    try{const recovered=validateMission(raw);if(recovered.phase==='plan'){if(entry.type==='message')pi.appendEntry('mission:pending',recovered);pending=recovered;await writeSourceFile(recovered);await render();await openSocket(recovered.id);}break;}
+    try{const recovered=validateMission(raw);if(recovered.phase==='plan'){if(entry.type==='message')pi.appendEntry('mission:pending',recovered);pending=recovered;await writeSourceFile(recovered);await render();await openSocket(recovered);}break;}
     catch(error){ownershipError=`Pending mission recovery failed: ${String(error)}`;context.ui.notify(ownershipError,'error');break;}
    }
   }
@@ -235,6 +248,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
    if(pending&&ctx)await openPendingPlanReview(ctx).catch(error=>ctx?.ui.notify(`Could not open plan review: ${String(error)}`,'warning'));
    const interval=mission&&(mission.phase==='execute'||mission.phase==='repair')?5000:30000;
    if(Date.now()-lastPoll>=interval)void refresh(true);
+   if((mission&&!ownership)||ownershipError)await tryAcquire(context);
   },1000);
  }
  async function openPendingPlanReview(context:ExtensionContext){
@@ -505,7 +519,7 @@ async function finishMission(context:ExtensionContext){
  await writeSourceFile(planned);
  pi.appendEntry('mission:pending',planned);
  pending = planned;
- await openSocket(planned.id);
+ await openSocket(planned);
  const prompt = `Mission ${displaySourceId(source)}: ${source.title}\nRead the full specification in ${sourceFilePath(planned)} before planning.`;
  await pi.setSessionName(`${displaySourceId(source)} ${source.title}`);
  await render();

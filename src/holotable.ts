@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { chmod, lstat, mkdir, open, readdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, open, readdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
@@ -81,6 +82,24 @@ export interface ContactStatus {
  usageEvidence?: UsageEvidence | null;
 	ctl: { socket: string; generation: number } | null;
 	updatedAt: string;
+	/** Identity of the publishing process; owned=false marks a read-only inspection pane. */
+	session?: { id: string; pid: number; processStart: string | null; terminal: string | null; owned: boolean };
+}
+
+// Linux /proc start-time beats PID reuse; null on other platforms or an exited process.
+let selfStart: string | null | undefined;
+export function processStartTicks(pid: number): string | null {
+	if (pid === process.pid && selfStart !== undefined) return selfStart;
+	try {
+		const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+		const ticks = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19];
+		const result = ticks && /^\d+$/.test(ticks) ? ticks : null;
+		if (pid === process.pid) selfStart = result;
+		return result;
+	} catch {
+		if (pid === process.pid) selfStart = null;
+		return null;
+	}
 }
 
 export interface UsageTotals {
@@ -278,6 +297,8 @@ export interface StatusInput {
 	planPath?: string;
 	planReview?: boolean;
 	question?: string;
+	/** Publish identity: the board tests process liveness directly, independent of socket or freshness. */
+	session?: { id: string; owned: boolean };
 }
 
 // Pure projection of mission state into the fleet status file. Async only for the worktree realpath.
@@ -349,11 +370,12 @@ export async function buildContactStatus(input: StatusInput): Promise<ContactSta
   review:input.review??null,
   model:input.model??null,
 		check: m.check ?? null,
+		session: input.session ? { ...input.session, pid: process.pid, processStart: processStartTicks(process.pid), terminal: process.env.ORCA_TERMINAL_HANDLE ?? null } : undefined,
+		ctl: input.ctl,
 		usage: input.usage,
   measurements,
   usageEvidence:input.usageEvidence??null,
-		ctl: input.ctl,
-		updatedAt: m.updatedAt,
+		updatedAt: new Date().toISOString(),
 	};
 }
 
@@ -407,6 +429,8 @@ export interface HolotableHooks {
 	// The open interactive plan review, when OMP exposes the review API (ctx.resolvePlanReview) and a review awaits an answer.
 	planReview(): { reviewId: string; canApprove: boolean; resolve(choice: PlanReviewChoice, input?: { feedback?: string }): boolean } | undefined;
 	onNotify(message: string): void;
+	/** Publish identity: id distinguishes panes of one mission; owned is false for read-only inspections. */
+	sessionInfo?(): { id: string; owned: boolean } | undefined;
 }
 
 interface Reply {
@@ -469,6 +493,7 @@ export class HolotableBridge {
 			owned: this.hooks.owned(),
 			selected: this.hooks.selected(),
 			operation: this.hooks.operation(),
+			session: this.hooks.sessionInfo?.(),
 			ctl: this.ctlFor(current.id),
    usage:measured.usage,
    usageEvidence:measured.evidence,
@@ -482,6 +507,16 @@ export class HolotableBridge {
 		const serialized = `${JSON.stringify(status, null, 2)}\n`;
 		const file = statusFilePath(this.agentDir, current);
 		if (file === this.lastPath && serialized === this.last) return;
+		// A read-only inspection pane never overwrites a live owner's fresh file; the board
+		// would flap between controlled and uncontrolled snapshots on every render.
+		if (status.session && status.session.owned === false) {
+			try {
+				const meta = await stat(file);
+				const existing = JSON.parse(await readFile(file, 'utf8'));
+				const prior = isRecord(existing) && isRecord(existing.session) ? existing.session : null;
+				if (prior && prior.owned === true && prior.id !== status.session.id && Date.now() - meta.mtimeMs < 45_000) return;
+			} catch { /* absent or unreadable: this pane is the only reporter */ }
+		}
 		try {
 			await mkdir(join(file, '..'), { recursive: true, mode: 0o700 });
 			const temporary = `${file}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
@@ -510,17 +545,29 @@ export class HolotableBridge {
 		await rm(file, { force: true });
 	}
 
-	// The socket exists only for board-launched children (OMP_HOLOTABLE_CHILD=1).
-	async open(missionId: string): Promise<void> {
-		if (process.env.OMP_HOLOTABLE_CHILD !== '1') return;
-		if (this.socketId === missionId && this.server) return;
+	// Board children always serve (OMP_HOLOTABLE_CHILD=1); the .ctl marker left by that first
+	// open lets a manually resumed pane serve again. Only the ownership holder serves: an
+	// inspection pane must not present control authority it cannot honor.
+	async open(mission: Pick<Mission, 'id' | 'workspace'>): Promise<void> {
+		if (this.socketId === mission.id && this.server) return;
+		const marker = join(statusFilePath(this.agentDir, mission), '..', `${mission.id}.ctl`);
+		const eligible = process.env.OMP_HOLOTABLE_CHILD === '1'
+			|| await lstat(marker).then(stat => stat.isFile()).catch(() => false);
+		const owned = mission.id === this.hooks.source().pending?.id || this.hooks.owned();
+		if (!eligible || !owned) return;
 		await this.close();
 		const dir = join(tmpdir(), `omp-mission-ctl-${process.getuid?.() ?? 0}`);
-		const path = join(dir, `${createHash('sha256').update(missionId).digest('hex').slice(0, 16)}.sock`);
+		// Per-process names: a second pane of the same mission never unlinks a live peer's socket.
+		const path = join(dir, `${createHash('sha256').update(mission.id).digest('hex').slice(0, 12)}-${process.pid}.sock`);
 		await mkdir(dir, { recursive: true, mode: 0o700 });
 		const stat = await lstat(dir);
 		if (!stat.isDirectory() || stat.uid !== process.getuid!()) throw new Error(`Refusing control socket dir ${dir}: not owned by uid ${process.getuid!()}`);
 		await chmod(dir, 0o700);
+		// Drop sibling sockets whose pid exited so the directory does not grow forever.
+		for (const entry of await readdir(dir).catch(() => [] as string[])) {
+			const pid = Number(/-(\d+)\.sock$/.exec(entry)?.[1]);
+			if (Number.isInteger(pid) && pid !== process.pid && !processStartTicks(pid)) await rm(join(dir, entry), { force: true }).catch(() => undefined);
+		}
 		await rm(path, { force: true });
 		this.generation = Date.now();
 		this.socketPath = path;
@@ -535,7 +582,9 @@ export class HolotableBridge {
 		});
 		await chmod(path, 0o600);
 		this.server = server;
-		this.socketId = missionId;
+		this.socketId = mission.id;
+		await mkdir(join(marker, '..'), { recursive: true, mode: 0o700 });
+		await writeFile(marker, `${process.pid}\n`, { mode: 0o600 }).catch(() => undefined);
 	}
 
 	async close(): Promise<void> {

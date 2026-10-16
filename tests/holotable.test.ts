@@ -58,13 +58,14 @@ function ctl(socket: string, request: unknown): Promise<Record<string, any>> {
 	conn.on('error', reject);
 	return promise;
 }
+let sessionSeq = 0;
 
 // Real extension, real store; pi.exec/UI faked as in autostart.test.ts.
-async function session(options: { plan?: boolean; child?: boolean; autostart?: string; mission?: Mission; models?: Array<{provider:string;id:string}>; entries?: Array<Record<string, unknown>>; beforeLoad?: (root: string) => Promise<void> | void } = {}) {
-	const root = await realpath(await mkdtemp(join(tmpdir(), 'holotable-')));
-	roots.push(root);
+async function session(options: { plan?: boolean; child?: boolean; autostart?: string; mission?: Mission; models?: Array<{provider:string;id:string}>; entries?: Array<Record<string, unknown>>; root?: string; beforeLoad?: (root: string) => Promise<void> | void } = {}) {
+	const root = options.root ?? await realpath(await mkdtemp(join(tmpdir(), 'holotable-')));
+	if (!options.root) roots.push(root);
 	const cwd = join(root, 'workspace');
-	await mkdir(cwd);
+	await mkdir(cwd, { recursive: true });
 	await writeFile(join(root, 'mission.json'), JSON.stringify({ version: 1, graph: 'beads', frontend: 'orca' }));
 	let path: string | undefined;
 	if (options.mission) {
@@ -72,6 +73,8 @@ async function session(options: { plan?: boolean; child?: boolean; autostart?: s
 		await saveMission(path, options.mission);
 	}
 	const events = new Map<string, Handler>();
+	// Same-pid test sessions need distinct ids or publish suppression cannot tell panes apart.
+	const sessionTag = `test-session-${++sessionSeq}`;
 	const sent: string[] = [];
 	const notices: string[] = [];
 	let command: ((args: string, context: ExtensionContext) => Promise<void>) | undefined;
@@ -85,7 +88,7 @@ async function session(options: { plan?: boolean; child?: boolean; autostart?: s
 	const context = {
 		agent: { kind: 'main' }, cwd, hasUI: false,
 		modelRegistry: { getAvailable: () => options.models ?? [] },
-  sessionManager:{getBranch:()=>branch,getEntries:()=>branch,getSessionName:()=>undefined,getSessionFile:()=>join(root,'coordinator.jsonl')},
+  sessionManager:{getBranch:()=>branch,getEntries:()=>branch,getSessionName:()=>undefined,getSessionFile:()=>join(root,'coordinator.jsonl'),getSessionId:()=>sessionTag},
 		localProtocolOptions: { getArtifactsDir: () => join(root, 'artifacts'), getSessionId: () => 'test-session' },
 		ui: { notify: (message: string) => { notices.push(message); }, setWidget: () => {} },
 		isIdle: () => true, hasPendingMessages: () => false,
@@ -124,7 +127,7 @@ async function session(options: { plan?: boolean; child?: boolean; autostart?: s
 }
 
 function socketName(missionId: string): string {
-	return `${createHash('sha256').update(missionId).digest('hex').slice(0, 16)}.sock`;
+	return `${createHash('sha256').update(missionId).digest('hex').slice(0, 12)}-${process.pid}.sock`;
 }
 
 test('pending questions replace plan approval until the matching tool finishes', async () => {
@@ -479,6 +482,34 @@ test('a board child exposes ping and operator ops on a 0600 socket in a 0700 dir
 	await expect(ctl(socket, { v: 1, op: 'ping' })).rejects.toThrow();
 	expect(await Bun.file(statusFile(run, mission)).exists()).toBe(false);
 	await run.event('session_shutdown', {});
+});
+
+test('a second pane of a saved mission stays read-only until the owner exits, then takes the socket', async () => {
+	const cwd = join(await realpath(await mkdtemp(join(tmpdir(), 'holotable-shared-'))), 'workspace');
+	roots.push(join(cwd, '..'));
+	await mkdir(cwd, { recursive: true });
+	const mission = baseMission(cwd);
+	const a = await session({ mission, child: true });
+	const live = await statusOf(a, mission);
+	expect(live.ctl).not.toBeNull();
+	expect(live.session?.owned).toBe(true);
+	const b = await session({ mission, root: a.root });
+	try {
+		// The lock is held by A: B publishes nothing over a fresh owner file.
+		const unchanged = await statusOf(a, mission);
+		expect(unchanged.session?.owned).toBe(true);
+		expect(unchanged.ctl?.socket).toBe(live.ctl!.socket);
+		await a.event('session_shutdown', {});
+		// The owner's final write retires authority; B's continue re-acquires and serves.
+		await b.command('continue');
+		const recovered = await statusOf(a, mission);
+		expect(recovered.session?.owned).toBe(true);
+		expect(recovered.session?.id).not.toBe(live.session?.id);
+		expect(recovered.ctl).not.toBeNull();
+		expect(await ctl(recovered.ctl!.socket, { v: 1, op: 'ping' })).toMatchObject({ ok: true });
+	} finally {
+		await b.event('session_shutdown', {});
+	}
 });
 
 test('socket ops enforce the resume hold and the pause gate, and shutdown closes the socket', async () => {
