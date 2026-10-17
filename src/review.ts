@@ -308,6 +308,9 @@ export class Reviewer {
   for(const job of planned){
    job.inputHash=createHash('sha256').update(reviewerInput([REVIEW_SYSTEM,job.note,effectiveContext,job.input])).digest('hex');
    state.inputs[job.label]=job.inputHash;
+   // Persist reusable results before a retry can block in an earlier uncached target.
+   const cached=reusable&&reusable.inputs[job.label]===job.inputHash?reusable.targets[job.label]:undefined;
+   if(cached)state.targets[job.label]={...cached,model:cached.model??reusable!.model};
   }
   m.reviewProgress=state;
   await checkpoint();

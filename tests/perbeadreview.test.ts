@@ -350,6 +350,38 @@ test('one failed target keeps finished outputs and a retry reruns only the faile
   expect(m.reviewProgress).toBeUndefined();
 });
 
+test('an interrupted retry preserves finished targets before uncached work settles', async () => {
+ const m=await missionAt();
+ const first:ReviewOpener=async(...args)=>{
+  const opened=await opener([],()=>({summary:`finished ${args[6]!.label}`,findings:[]}))(...args);
+  if(args[6]!.label==='bd-a')opened.session.prompt=async()=>{throw new Error('Reviewer deadline exceeded');};
+  return opened;
+ };
+ await expect(new Reviewer(first).runPerBead(m,ctx,real,'default',[],targets,1)).rejects.toThrow('deadline exceeded');
+ const kept=structuredClone(m.reviewProgress!.targets);
+ const file=join(root,'.git','review-state','k','m.json');
+ const started=Promise.withResolvers<void>(),release=Promise.withResolvers<void>();
+ const pending:ReviewOpener=async(...args)=>{
+  const opened=await opener([],()=>({summary:'unused',findings:[]}))(...args);
+  opened.session.prompt=async()=>{started.resolve();await release.promise;return false;};
+  opened.session.dispose=async()=>{release.resolve();};
+  return opened;
+ };
+ const reviewer=new Reviewer(pending,{checkpoint:async value=>{await saveMission(file,value);}});
+ const running=reviewer.runPerBead(m,ctx,real,'default',[],targets,1);
+ const settled=running.catch(()=>{});
+ await started.promise;
+ let restored:Mission;
+ try{restored=await loadMission(file);}
+ finally{await reviewer.dispose();await settled;}
+ expect(restored!.reviewProgress!.targets).toEqual(kept);
+ const sent:Array<{note:string;payload:Record<string,unknown>}>=[];
+ const result=await new Reviewer(opener(sent,()=>({summary:'recovered',findings:[]}))).runPerBead(restored!,ctx,real,'default',[],targets,1);
+ expect(sent.map(item=>beadOf(item.payload)??'integration')).toEqual(['bd-a']);
+ expect(result.summary).toContain('[bd-b] finished bd-b');
+ expect(result.summary).toContain('[integration] finished integration');
+});
+
 for(const changed of ['revision','model','task','context'] as const)test(`changed ${changed} invalidates completed cached targets`, async () => {
   const m = await missionAt();
   let context = [{path: '/review-rules.md', content: 'Original rules'}];
