@@ -146,7 +146,8 @@ export default async function missionExtension(pi: ExtensionAPI) {
   planReview:()=>{const context=ctx&&eligible(ctx)?ctx:undefined;const review=context?.getPendingPlanReview?context.getPendingPlanReview():planReview;return context?.resolvePlanReview&&review?{reviewId:review.reviewId,canApprove:!review.options?.find(option=>option.id==='compact')?.disabled,resolve:(choice,input)=>context.resolvePlanReview(review.reviewId,choice,input)}:undefined;},
  });
  async function publishStatus(forceUsage=false){await holotable.publish(forceUsage);}
- async function openSocket(m:Mission){try{await holotable.open(m);}catch(error){ctx?.ui.notify(`Holotable control socket failed: ${error instanceof Error?error.message:String(error)}`,'warning');}}
+ let socketWarned=false;
+ async function openSocket(m:Mission){try{await holotable.open(m);socketWarned=false;}catch(error){if(!socketWarned){socketWarned=true;ctx?.ui.notify(`Holotable control socket failed: ${error instanceof Error?error.message:String(error)}`,'warning');}}}
  async function assertPrBase(m:Mission,url?:string){
   if(!m.workspace.base)throw new Error('Repository base unresolved; bind the workspace before delivery or review');
   const pr=await run('gh',['pr','view',...(url?[url]:[]),'--json','baseRefName'],m.workspace.cwd);
@@ -194,7 +195,15 @@ export default async function missionExtension(pi: ExtensionAPI) {
  // live owner keeps this pane read-only, a stale lock clears ~30 s after the crash.
  let lastOwnershipTry=0;
  async function tryAcquire(context:ExtensionContext){
-  if(!mission||!path||ownership&&!ownershipError||Date.now()-lastOwnershipTry<15_000)return;
+  if(!mission||!path)return;
+  if(ownership&&!ownershipError){
+   // An owner that took the lock before its holotable eligibility existed (pane revived
+   // without OMP_HOLOTABLE_CHILD, marker backfilled later) retries the socket on each pass
+   // instead of holding the mission hostage without a control channel.
+   if(!holotable.ctlFor(mission.id)){await openSocket(mission);if(holotable.ctlFor(mission.id))await publishStatus();}
+   return;
+  }
+  if(Date.now()-lastOwnershipTry<15_000)return;
   lastOwnershipTry=Date.now();
   if(ownership)await release();
   try{
@@ -203,7 +212,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
   }catch(error){ownershipError=error instanceof Error?error.message:String(error);}
  }
  async function release(){pendingQuestions.clear();const current=ownership;ownership=undefined;await current?.release();await holotable.close();}
- async function detach(context?:ExtensionContext){generation++;providerHold=undefined;coordinatorShells.clear();lifetime.abort();lifetime=new AbortController();terminalInputDispose?.();terminalInputDispose=undefined;overlayAbort?.abort();overlayAbort=undefined;if(timer&&ctx)ctx.clearTimer(timer);timer=undefined;await reviewer.dispose();await workerAgents.abortAll();await release();await publishStatus(true);ctx?.ui.setWidget('mission',undefined);ctx=context;mission=undefined;pending=undefined;path=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;lastWake='';guided='';selected=undefined;history=undefined;lastPoll=0;outlineOffset=0;inspectionIntent={};subagents=[];reviewRows=[];planReview=undefined;openedPlanRevision=undefined;openingPlanReview=false;}
+ async function detach(context?:ExtensionContext){generation++;providerHold=undefined;coordinatorShells.clear();lifetime.abort();lifetime=new AbortController();terminalInputDispose?.();terminalInputDispose=undefined;overlayAbort?.abort();overlayAbort=undefined;if(timer&&ctx)ctx.clearTimer(timer);timer=undefined;await reviewer.dispose();await workerAgents.abortAll();await release();await publishStatus(true);ctx?.ui.setWidget('mission',undefined);ctx=context;mission=undefined;pending=undefined;path=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;lastWake='';guided='';selected=undefined;history=undefined;lastPoll=0;outlineOffset=0;inspectionIntent={};subagents=[];reviewRows=[];planReview=undefined;openedPlanRevision=undefined;openingPlanReview=false;socketWarned=false;}
  async function attach(file:string,context:ExtensionContext,announce=true){providerHold=undefined;await release();mission=await loadMission(file);path=file;pending=undefined;snapshot=undefined;resumeHold=true;ownershipError=undefined;ctx=context;await refresh(false);await render();lastOwnershipTry=0;await tryAcquire(context);await publishStatus();
   const step=announce?currentStep(context):undefined;
   if(step)context.ui.notify(`${displaySourceId(mission.source)} · ${phaseLabel(displayPhase(mission,snapshot))}. ${step.command?`Next: ${step.command} — `:''}${step.text}. /mission opens the action menu.`,'info');
@@ -248,7 +257,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
    if(pending&&ctx)await openPendingPlanReview(ctx).catch(error=>ctx?.ui.notify(`Could not open plan review: ${String(error)}`,'warning'));
    const interval=mission&&(mission.phase==='execute'||mission.phase==='repair')?5000:30000;
    if(Date.now()-lastPoll>=interval)void refresh(true);
-   if((mission&&!ownership)||ownershipError)await tryAcquire(context);
+   if(mission||ownershipError)await tryAcquire(context);
   },1000);
  }
  async function openPendingPlanReview(context:ExtensionContext){

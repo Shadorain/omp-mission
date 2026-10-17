@@ -512,6 +512,26 @@ test('a second pane of a saved mission stays read-only until the owner exits, th
 	}
 });
 
+test('a revived owner without the child env serves once the board backfills the marker', async () => {
+	const cwd = join(await realpath(await mkdtemp(join(tmpdir(), 'holotable-revived-'))), 'workspace');
+	roots.push(join(cwd, '..'));
+	await mkdir(cwd, { recursive: true });
+	const mission = baseMission(cwd);
+	// Revived pane: no OMP_HOLOTABLE_CHILD, no .ctl marker (mission predates it).
+	const run = await session({ mission });
+	const held = await statusOf(run, mission);
+	expect(held.session?.owned).toBe(true);
+	expect(held.ctl).toBeNull();
+	await expect(ctl(join(tmpdir(), `omp-mission-ctl-${process.getuid!()}`, socketName(mission.id)), { v: 1, op: 'ping' })).rejects.toThrow();
+	// Board sighted the tracked status file and backfilled the marker: the owner serves.
+	await writeFile(join(missionPath(run.root, mission), '..', 'status', `${mission.id}.ctl`), `${process.pid}\n`);
+	await run.poll();
+	const serving = await statusOf(run, mission);
+	expect(serving.ctl).not.toBeNull();
+	expect(await ctl(serving.ctl!.socket, { v: 1, op: 'ping' })).toMatchObject({ ok: true });
+	await run.event('session_shutdown', {});
+});
+
 test('socket ops enforce the resume hold and the pause gate, and shutdown closes the socket', async () => {
 	const mission = baseMission('/tmp', {
 		mode: 'pause', reviewRequested: true, phase: 'review',
