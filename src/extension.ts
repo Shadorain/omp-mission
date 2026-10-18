@@ -14,7 +14,7 @@ import { acquireOwnership, listMissions, loadMission, missionId, missionPath, sa
 import type { Ownership } from './store';
 import { readClaimActor, readGraph, readHistory } from './beads';
 import { createWorkerDriver } from './workers';
-import { approveGate, autoDispatchAllowed, consumeGate, deliverUrl, displayPhase, effectiveGraph, enforceGate, enforceMutation, isProviderBlocker, modelRetryTargets, nextAction, operatorCommands, operatorStep, QUOTA_BLOCKER, RATE_BLOCKER, requireBeadsGraph, revisionGate, reviewTriageAction, reviewFailureStep, setMode, terminalCapacity, triageFindings, waveGate } from './controller';
+import { approveGate, autoDispatchAllowed, consumeGate, consumeRepairBudget, deliverUrl, displayPhase, effectiveGraph, enforceGate, enforceMutation, isProviderBlocker, modelRetryTargets, nextAction, operatorCommands, operatorStep, QUOTA_BLOCKER, RATE_BLOCKER, REPAIR_CYCLES, repairBudgetReason, requireBeadsGraph, revisionGate, reviewTriageAction, reviewFailureStep, setMode, terminalCapacity, triageFindings, waveGate } from './controller';
 import { alignVerifiedRevision, captureRevision, Reviewer, roleModelString } from './review';
 import { beadTask, checkPrompt, coordinatorPrompt, guide, planSlug, workerPrompt } from './prompts';
 import { createMissionWidget, createMissionInspector, phaseLabel } from './ui';
@@ -392,7 +392,16 @@ async function finishMission(context:ExtensionContext){
  async function decision(context:ExtensionContext,verb:string,arg?:string){
   if(!mission)throw new Error('No active mission');if(nativePlan(context))throw new Error('Mission mutations are forbidden in native plan mode');
   if(verb==='mode'){const modes:Mode[]=['auto','pause','force'];const mode=z.enum(['auto','pause','force']).parse(arg??modes[(modes.indexOf(mission.mode)+1)%3]);setMode(mission,mode);if(resumeHold)inspectionIntent.mode=mode;}
-  else if(verb==='review'){if(reviewTriageAction(mission)?.kind==='hold'){if(resumeHold||!ownership||ownershipError)throw new Error('Take controller ownership with /mission continue before resolving the review escalation');await ownership.assertOwned();if(operation)throw new Error('Wait for the current operation before resolving the review escalation');if((await captureRevision(mission,run)).revision!==mission.reviews.at(-1)!.revision)throw new Error('Review revision changed; reverify/rereview');for(const finding of mission.reviews.at(-1)!.findings)if(!finding.rejection&&finding.triage?.disposition==='escalate')finding.triage={...finding.triage,disposition:'repair',detail:`Operator authorized another repair attempt after escalation. ${finding.triage.detail}`.slice(0,10_000)};}mission.reviewRequested=true;if(mission.evidence.review?.outcome==='failed')delete mission.evidence.review;if(resumeHold)inspectionIntent.reviewRequested=true;}
+  else if(verb==='review'){
+   if(reviewTriageAction(mission)?.kind==='hold'){
+    if(resumeHold||!ownership||ownershipError)throw new Error('Take controller ownership with /mission continue before resolving the review escalation');
+    await ownership.assertOwned();if(operation)throw new Error('Wait for the current operation before resolving the review escalation');
+    if((await captureRevision(mission,run)).revision!==mission.reviews.at(-1)!.revision)throw new Error('Review revision changed; reverify/rereview');
+    if(repairBudgetReason(mission))mission.repairBudget=1;
+    for(const finding of mission.reviews.at(-1)!.findings)if(!finding.rejection&&finding.triage?.disposition==='escalate')finding.triage={...finding.triage,disposition:'repair',detail:`Operator authorized another repair attempt after escalation. ${finding.triage.detail}`.slice(0,10_000)};
+   }
+   mission.reviewRequested=true;if(mission.evidence.review?.outcome==='failed')delete mission.evidence.review;if(resumeHold)inspectionIntent.reviewRequested=true;
+  }
   else if(verb==='approve'){if(resumeHold)throw new Error('Resumed session is read-only: run /mission continue first, then /mission approve');if(!mission.gate)throw new Error('No gate is waiting for approval. /mission shows what is next');approveGate(mission,mission.gate.token);}
   if(ownership)await persist(mission);await render();
   if(!resumeHold&&ownership&&!operation&&(verb==='review'||verb==='approve')){
@@ -575,6 +584,10 @@ async function finishMission(context:ExtensionContext){
     if(mission?.evidence.verify?.outcome==='failed'&&!internal.operator)throw new Error('Verification is held; the operator must run /mission continue after resolving the blocker');
     if(!mission)throw new Error('No saved mission');
     await acquire();const mode=params.mode??inspectionIntent.mode;if(mode)setMode(mission,mode);
+    if(mission.repairBudget===undefined){
+     const closingRepair=mission.evidence.repair?.outcome==='active'||mission.round>(mission.reviews.at(-1)?.round??mission.round);
+     mission.repairBudget=closingRepair?REPAIR_CYCLES-1:REPAIR_CYCLES;
+    }
     if(inspectionIntent.reviewRequested){mission.reviewRequested=true;if(mission.evidence.review?.outcome==='failed')delete mission.evidence.review;}
     if(mission.evidence.verify?.outcome==='failed')mission.evidence.verify={...mission.evidence.verify,outcome:'pending'};
     if(params.keep!==undefined)mission.keep=params.keep;resumeHold=false;if(isProviderBlocker(mission.blocker))delete mission.blocker;providerHold=undefined;await persist(mission);inspectionIntent={};pi.appendEntry('mission:pointer',{path,ignoredPaths:[...ignoredPaths]});
@@ -636,7 +649,16 @@ async function finishMission(context:ExtensionContext){
      const workspace=await inspectWorkspace(cwd,run,{explicitBase:base,delivery,githubRepo:mission.source.repo});if(workspace.key!==mission.workspace.key)throw new Error('Workspace repository identity differs');if(workspace.commonDir&&!workspace.base)throw new Error('Repository base unresolved');const bd=await run('bd',['--readonly','where','--json'],workspace.cwd,{BEADS_DIR:beadsDir});if(bd.code)throw new Error(bd.stderr||'Bead database unreachable');const where=JSON.parse(bd.stdout);if(await realpath(where.path)!==await realpath(beadsDir))throw new Error('BEADS_DIR does not match canonical database');workspace.beadsDir=await realpath(beadsDir);mission.workspace=workspace;mission.phase='graph';mission.evidence.isolate={outcome:'passed',detail:params.detail??(note||workspace.cwd),at:new Date().toISOString()};
     }else if(params.operation==='bind_graph'||params.operation==='bind_repairs'){
      requireBeadsGraph(mission);const epic=params.epicId??mission.epicId;if(!epic||!params.scopes||!mission.workspace.beadsDir)throw new Error('Bound workspace, epic and complete file scopes required');const graph=await readGraph(run,mission.workspace.cwd,epic,{BEADS_DIR:mission.workspace.beadsDir});if(graph.error)throw new Error(graph.error);for(const [id,files] of Object.entries(params.scopes)){if(!graph.leaves.some(b=>b.id===id))throw new Error(`Not a descendant implementation leaf: ${id}`);for(const file of files){if(isAbsolute(file)||file.split('/').includes('..')||file==='.'||!file.trim())throw new Error(`Invalid file scope: ${file}`);}}
-     if(params.operation==='bind_graph'&&graph.leaves.some(b=>!params.scopes![b.id]))throw new Error('Every implementation leaf requires scope');if(params.operation==='bind_repairs'){if(mission.phase!=='repair'||mission.evidence.repair?.outcome!=='active')throw new Error('Accept findings before binding repairs');if(!params.repairLinks)throw new Error('Finding links required');const findingIds=mission.reviews.at(-1)!.findings.filter(f=>!f.rejection).map(f=>f.id);for(const id of Object.keys(params.scopes)){const links=params.repairLinks[id];if(!links?.length||links.some(link=>!findingIds.includes(link)))throw new Error(`Invalid finding links: ${id}`);}if(findingIds.some(id=>!Object.values(params.repairLinks!).some(links=>links.includes(id))))throw new Error('Every actionable finding needs a repair bead');Object.assign(mission.repairLinks,params.repairLinks);mission.round++;delete mission.evidence.verify;delete mission.evidence.deliver;delete mission.gate;}
+     if(params.operation==='bind_graph'&&mission.phase==='repair'&&mission.evidence.repair?.outcome==='active')throw new Error('Bind accepted review repairs with bind_repairs and exact finding links');
+     if(params.operation==='bind_graph'&&graph.leaves.some(b=>!params.scopes![b.id]))throw new Error('Every implementation leaf requires scope');
+     if(params.operation==='bind_repairs'){
+      if(mission.phase!=='repair'||mission.evidence.repair?.outcome!=='active')throw new Error('Accept findings before binding repairs');
+      if(!params.repairLinks)throw new Error('Finding links required');
+      const findingIds=mission.reviews.at(-1)!.findings.filter(f=>!f.rejection).map(f=>f.id);
+      for(const id of Object.keys(params.scopes)){const links=params.repairLinks[id];if(!links?.length||links.some(link=>!findingIds.includes(link)))throw new Error(`Invalid finding links: ${id}`);}
+      if(findingIds.some(id=>!Object.values(params.repairLinks!).some(links=>links.includes(id))))throw new Error('Every actionable finding needs a repair bead');
+      consumeRepairBudget(mission);Object.assign(mission.repairLinks,params.repairLinks);mission.round++;delete mission.evidence.verify;delete mission.evidence.deliver;delete mission.gate;
+     }
      const changed=params.operation==='bind_repairs'||mission.epicId!==epic||graph.leaves.some(bead=>bead.category!=='closed')||Object.entries(params.scopes).some(([id,files])=>{const previous=mission!.scopes[id];return !previous||previous.length!==files.length||files.some(file=>!previous.includes(file));});
      if(changed){delete mission.evidence.verify;delete mission.evidence.deliver;delete mission.evidence.review;delete mission.evidence.complete;delete mission.reviewProgress;}
      mission.epicId=epic;Object.assign(mission.scopes,params.scopes);snapshot=graph;mission.phase=params.operation==='bind_repairs'?'repair':'execute';mission.evidence.graph={outcome:'passed',detail:`Epic ${epic}; scoped leaves ${Object.keys(mission.scopes).join(', ')}`,at:new Date().toISOString()};
@@ -714,6 +736,7 @@ async function finishMission(context:ExtensionContext){
      const local = effectiveGraph(mission) === 'local';
      if(mission.evidence.repair?.outcome!=='active')measurements(mission).acceptedRepairs++;
      if (local) {
+      consumeRepairBudget(mission);
       mission.round = Math.max(mission.round, review.round + 1);
       delete mission.evidence.verify;
       delete mission.evidence.deliver;

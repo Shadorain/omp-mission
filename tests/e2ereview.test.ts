@@ -146,3 +146,15 @@ test('resource_exhausted with a timed free-model rate limit waits for reset, not
  expect(reviewRetryAt(m)).toBeUndefined();
  expect(providerCapacity('resource_exhausted')).toBe('quota');
 });
+
+test('a follow-up review retries once, not through the full-audit backoff ladder',()=>{
+ const m=mkMission();m.epicId='E';m.reviewRequested=true;
+ m.evidence.verify={outcome:'passed',revision:'repair',detail:'Verified',at:'now'};m.evidence.deliver={...m.evidence.verify};
+ m.reviews=[{round:1,revision:'previous',model:'independent',summary:'Earlier audit',findings:[],at:'now'}];
+ m.evidence.review={outcome:'failed',revision:'repair',detail:'Reviewer deadline exceeded',attempts:1,at:new Date(Date.now()-3*60_000).toISOString()};
+ expect(nextAction(m,emptySnapshot,basePolicy).kind).toBe('review');
+ m.evidence.review.attempts=2;m.evidence.review.at=new Date(Date.now()-24*3600_000).toISOString();
+ expect(reviewRetryAt(m)).toBeUndefined();
+ expect(nextAction(m,emptySnapshot,basePolicy).kind).toBe('hold');
+ expect(nextAction(m,emptySnapshot,basePolicy).detail).toContain('explicitly retries');
+});

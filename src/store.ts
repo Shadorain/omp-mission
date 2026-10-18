@@ -113,7 +113,13 @@ export function validateMission(value: unknown): Mission {
     const item = object(raw, `reviews[${index}]`);
     const round = item.round;
     if (!isPositiveSafeInteger(round) || !Array.isArray(item.findings)) invalid(`reviews[${index}] is invalid`);
-    return { round, revision: text(item.revision, "review.revision", 1000), model: text(item.model, "review.model", 1000), summary: text(item.summary, "review.summary", 50_000), findings: item.findings.map(validateFinding), at: text(item.at, "review.at", 100), ...(item.invalidated === undefined ? {} : { invalidated: text(item.invalidated, "review.invalidated", 10_000) }), ...(item.beads === undefined ? {} : { beads: Object.fromEntries(Object.entries(object(item.beads, "review.beads")).map(([id, hash]) => [text(id, "review.beads id", 1000), text(hash, "review.beads hash", 200)])) }), ...(item.transcripts === undefined ? {} : { transcripts: Object.fromEntries(Object.entries(object(item.transcripts, "review.transcripts")).map(([label, file]) => [text(label, "review.transcripts label", 1000), text(file, "review.transcripts file", 4000)])) }) };
+    let baseline: Mission["reviews"][number]["baseline"];
+    if(item.baseline!==undefined){
+      const saved=object(item.baseline,"review.baseline");
+      if(saved.tree!==undefined&&(typeof saved.tree!=="string"||!/^[a-f0-9]{40,64}$/.test(saved.tree)))invalid("review.baseline.tree must be a Git object id");
+      baseline={base:content(saved.base,"review.baseline.base",4000),files:Object.fromEntries(Object.entries(object(saved.files,"review.baseline.files")).map(([file,hash])=>[text(file,"review.baseline path",4000),text(hash,"review.baseline hash",200)])),...(saved.tree===undefined?{}:{tree:saved.tree as string})};
+    }
+    return { round, revision: text(item.revision, "review.revision", 1000), model: text(item.model, "review.model", 1000), summary: text(item.summary, "review.summary", 50_000), findings: item.findings.map(validateFinding), at: text(item.at, "review.at", 100), ...(baseline?{baseline}:{}), ...(item.invalidated === undefined ? {} : { invalidated: text(item.invalidated, "review.invalidated", 10_000) }), ...(item.beads === undefined ? {} : { beads: Object.fromEntries(Object.entries(object(item.beads, "review.beads")).map(([id, hash]) => [text(id, "review.beads id", 1000), text(hash, "review.beads hash", 200)])) }), ...(item.transcripts === undefined ? {} : { transcripts: Object.fromEntries(Object.entries(object(item.transcripts, "review.transcripts")).map(([label, file]) => [text(label, "review.transcripts label", 1000), text(file, "review.transcripts file", 4000)])) }) };
   });
   let reviewProgress: Mission["reviewProgress"];
   if (row.reviewProgress !== undefined) {
@@ -151,6 +157,10 @@ export function validateMission(value: unknown): Mission {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(missionId)) invalid("id contains unsafe path characters");
   const mission: Mission = { version: 1, id: missionId, source: validSource(row.source), workspace: validWorkspace(row.workspace), scopes, phase: row.phase as Phase, evidence, mode: row.mode as Mode, keep: row.keep, reviewRequested: row.reviewRequested, workers, reviews, repairLinks, round, createdAt: text(row.createdAt, "createdAt", 100), updatedAt: text(row.updatedAt, "updatedAt", 100) };
   if (reviewProgress !== undefined) mission.reviewProgress = reviewProgress;
+  if(row.repairBudget!==undefined){
+    if(!isNonNegativeSafeInteger(row.repairBudget)||row.repairBudget>2)invalid("repairBudget must be an integer from 0 to 2");
+    mission.repairBudget=row.repairBudget;
+  }
   if (row.measurements !== undefined) {
     const raw = object(row.measurements, "measurements");
     if(raw.v!==1||typeof raw.since!=="string"||raw.since.length>64||!Number.isFinite(Date.parse(raw.since)))invalid("measurements version or since is invalid");

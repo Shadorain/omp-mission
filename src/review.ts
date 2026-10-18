@@ -1,15 +1,16 @@
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, realpath, lstat, readlink } from 'node:fs/promises';
-import { resolve, relative, isAbsolute } from 'node:path';
+import { mkdir, mkdtemp, rm, readFile, realpath, lstat, readlink } from 'node:fs/promises';
+import { resolve, relative, isAbsolute, join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { inScope } from './scope';
 import { AgentRegistry, createAgentSession, discoverContextFiles, SessionManager, Settings, settings, type AgentSession, type ExtensionContext } from '@oh-my-pi/pi-coding-agent';
 import { openUnlistedSession } from './session-file';
-import type { Finding, Mission, ReviewRound, Run } from './types';
+import type { Finding, Mission, ReviewBaseline, ReviewRound, Run } from './types';
 import { isRecord } from './guards';
 import { validateFinding, validateReviewSummary } from './store';
 import { providerCapacity } from './controller';
 /** `tree` fingerprints file contents and target base, not HEAD, so a same-byte commit on the same base leaves it unchanged. `legacy*` is that fingerprint before the base prefix, so evidence recorded then still matches. */
-export interface RevisionCapture { revision: string; tree: string; legacyRevision: string; legacyTree: string; diff: string; files: string[] }
+export interface RevisionCapture { revision: string; tree: string; legacyRevision: string; legacyTree: string; diff: string; files: string[]; hashes: Record<string,string> }
 /**
  * The commit the change is measured from: the merge-base of HEAD and the base branch, preferring origin/<base>.
  * A stale local base branch (or a base that has moved on) would drag unrelated changes into the review diff.
@@ -22,11 +23,10 @@ async function diffBase(m: Mission, run: Run): Promise<string> {
  }
  return base;
 }
-const countDiffFiles=(diff:string)=>(diff.match(/^diff --git /gm)??[]).length;
-/** Retries of timed-out targets get more room, but no reviewer may exceed 30 minutes. */
-export const reviewBudgetMs=(changedFiles:number,timeoutAttempts=0)=>Math.min(30*60_000,(300_000+changedFiles*15_000)*2**Math.min(3,Math.max(0,timeoutAttempts)));
+export const reviewBudgetMs=(changedFiles:number,timeoutAttempts=0,followup=false)=>followup?Math.min(5*60_000,90_000+changedFiles*10_000):Math.min(30*60_000,(300_000+changedFiles*15_000)*2**Math.min(3,Math.max(0,timeoutAttempts)));
 export async function captureRevision(m: Mission, run: Run): Promise<RevisionCapture> {
  const cwd=m.workspace.cwd; const hash=createHash('sha256'); const treeHash=createHash('sha256'); const legacyHash=createHash('sha256'); const legacyTreeHash=createHash('sha256'); let files:string[];let diff='';
+ const hashes:Record<string,string>=Object.create(null);
  const both=(chunk:string|Buffer)=>{hash.update(chunk);treeHash.update(chunk);legacyHash.update(chunk);legacyTreeHash.update(chunk);};
  hash.update('base\0');hash.update(m.workspace.base??'');hash.update('\0');treeHash.update('base\0');treeHash.update(m.workspace.base??'');treeHash.update('\0');
  if(m.workspace.commonDir){
@@ -37,6 +37,7 @@ export async function captureRevision(m: Mission, run: Run): Promise<RevisionCap
  }else files=[...new Set(Object.values(m.scopes).flat())].sort();
  const root=await realpath(cwd);
  for(const file of files){
+  const item=createHash('sha256');const add=(chunk:string|Buffer)=>{both(chunk);item.update(chunk);};
   const path=resolve(cwd,file);
   const target=await realpath(path).catch(()=>path);
   const rel=relative(root,target);
@@ -44,15 +45,16 @@ export async function captureRevision(m: Mission, run: Run): Promise<RevisionCap
   const key = Buffer.from(file).length + ":" + file;
   try{
    const st=await lstat(path);
-   if(st.isDirectory()){both(`${key}\0dir\0`);}
-   else if(st.isSymbolicLink()){const link=await readlink(path);both(`${key}\0symlink\0${Buffer.from(link).length}:${link}`);}
-   else{const content=await readFile(path);both(`${key}\0file\0${st.mode}\0${content.length}:`);both(content);}
+   if(st.isDirectory()){add(`${key}\0dir\0`);}
+   else if(st.isSymbolicLink()){const link=await readlink(path);add(`${key}\0symlink\0${Buffer.from(link).length}:${link}`);}
+   else{const content=await readFile(path);add(`${key}\0file\0${st.mode}\0${content.length}:`);add(content);}
   }catch(error){
    if(!isRecord(error)||error.code!=='ENOENT')throw error;
-   both(`${key}\0missing\0`);
+   add(`${key}\0missing\0`);
   }
+  hashes[file]=item.digest('hex');
  }
- return {revision:hash.digest('hex'),tree:treeHash.digest('hex'),legacyRevision:legacyHash.digest('hex'),legacyTree:legacyTreeHash.digest('hex'),diff,files};
+ return {revision:hash.digest('hex'),tree:treeHash.digest('hex'),legacyRevision:legacyHash.digest('hex'),legacyTree:legacyTreeHash.digest('hex'),diff,files,hashes};
 }
 /**
  * A passed verification still describes the checkout when only HEAD moved, or when the stored
@@ -172,6 +174,7 @@ function finalText(session: ReviewSession): string {
 export interface BeadReviewTarget { id: string; title: string; text: string; files: string[] }
 const INTEGRATION_NOTE = ' This is the integration pass: each bead was already reviewed on its own scoped diff, so look only for defects across beads (contracts between them, ordering, duplicated or conflicting changes, missing wiring) and for anything no single bead owned.';
 const BEAD_NOTE = ' You review one bead only: its task, its scoped diff, and the files listed in files. A finding on any other path is reassigned to its owner or dropped. Do not cite those paths.';
+const REPAIR_NOTE = ' This is a repair verification, not a new full audit. Verify the listed unresolved findings and the supplied repair delta against the mission acceptance criteria. Look for regressions introduced by these changes, including affected callers, but do not reopen untouched historical code, comments or unrelated test fixtures for general cleanup. Report substantive new regressions with concrete evidence; never call an unresolved defect clean.';
 /** Hash of the content of the files a bead owns, to tell a later round which beads actually changed. */
 export async function scopeHash(cwd: string, files: readonly string[]): Promise<string> {
  const hash=createHash('sha256');
@@ -181,6 +184,25 @@ export async function scopeHash(cwd: string, files: readonly string[]): Promise<
   catch(error){if(!isRecord(error)||error.code!=='ENOENT')throw error;hash.update('missing');}
  }
  return hash.digest('hex');
+}
+
+async function captureBaseline(m:Mission,captured:RevisionCapture,run:Run):Promise<ReviewBaseline>{
+ const baseline:ReviewBaseline={base:m.workspace.base??'',files:captured.hashes};
+ if(!m.workspace.commonDir)return baseline;
+ const root=await mkdtemp(join(tmpdir(),'mission-review-index-'));
+ try{
+  const env={GIT_INDEX_FILE:join(root,'index')};
+  const added=await run('git',['add','-A','--'],m.workspace.cwd,env);
+  if(added.code)throw new Error(added.stderr||'Cannot snapshot review files');
+  const written=await run('git',['write-tree'],m.workspace.cwd,env);
+  const tree=written.stdout.trim();
+  if(written.code||!/^[a-f0-9]{40,64}$/.test(tree))throw new Error(written.stderr||'Cannot snapshot review tree');
+  const key=createHash('sha256').update(m.id).digest('hex');
+  const pinned=await run('git',['update-ref',`refs/omp-mission/reviews/${key}/${tree}`,tree],m.workspace.cwd);
+  if(pinned.code)throw new Error(pinned.stderr||'Cannot retain reviewed snapshot');
+  baseline.tree=tree;
+  return baseline;
+ }finally{await rm(root,{recursive:true,force:true});}
 }
 
 // Store validation can reorder properties without changing the review inputs.
@@ -237,16 +259,7 @@ export class Reviewer {
   for(const item of active)item.cancel();
   await Promise.all(active.flatMap(item=>item.session?[this.release(item.session)]:[]));
  }
- /**
-  * One reviewer per bead in parallel, plus one integration pass on the first round. A later round
-  * reviews only beads whose files changed since the previous round (all-unchanged falls back to the
-  * integration pass over the whole revision). A file claimed by an original bead and a repair bead
-  * belongs to the latest linked repair bead only, so it is reviewed exactly once. Findings carry the
-  * bead they came from. When a target fails, every finished target is checkpointed onto
-  * `m.reviewProgress` (bound to revision, model and the exact serialized input) and the caller is
-  * asked to persist; a retry reuses only still-valid outputs and reruns the rest. An incomplete round
-  * throws and is never a passed review.
-  */
+ /** Per-file baselines survive ownership transfer; only the first pass audits the whole branch. */
  async runPerBead(m: Mission, ctx: ExtensionContext, run: Run, role: string, contextFiles: Array<{ path: string; content: string }> | undefined, targets: BeadReviewTarget[], maxConcurrent = 3): Promise<ReviewRound> {
   const generation=this.generation;
   if(!ctx.model||!ctx.modelRegistry)throw new Error('Coordinator model/registry unavailable');
@@ -256,6 +269,15 @@ export class Reviewer {
   alignVerifiedRevision(m,captured);
   const effectiveContext=contextFiles??await discoverContextFiles(m.workspace.cwd);
   const previous=m.reviews.at(-1);
+  const followup=!!previous&&!previous.invalidated&&(!previous.baseline||previous.baseline.base===(m.workspace.base??''));
+  const baseline=await captureBaseline(m,captured,run);
+  const from=followup&&previous.baseline?.tree?previous.baseline.tree:await diffBase(m,run);
+  if(followup&&previous.baseline?.tree){
+   const available=await run('git',['cat-file','-e',`${from}^{tree}`],m.workspace.cwd);
+   if(available.code)throw new Error('Reviewed baseline is unavailable; cannot safely verify the repair delta');
+  }
+  const unresolved=followup?previous.findings.filter(finding=>!finding.rejection):[];
+  const unresolvedPaths=new Set(unresolved.map(finding=>finding.path));
   // The latest bound repair for a target; the newest repair bead owns any contested file.
   const repairRank=new Map<string,number>();for(const [index,id] of Object.keys(m.repairLinks).entries())repairRank.set(id,index);
   const claim=(file:string):BeadReviewTarget|undefined=>{
@@ -268,29 +290,43 @@ export class Reviewer {
    return repair??original;
   };
   const ownedBy=new Map<BeadReviewTarget,string[]>(targets.map(target=>[target,[]]));
-  for(const file of captured.files){const owner=claim(file);if(owner)ownedBy.get(owner)!.push(file);}
+  const universe=new Set([...captured.files,...Object.keys(followup?previous.baseline?.files??{}:{}),...unresolvedPaths]);
+  for(const file of universe){const owner=claim(file);if(owner)ownedBy.get(owner)!.push(file);}
   const owned=(target:BeadReviewTarget)=>ownedBy.get(target)??[];
   const hashes:Record<string,string>={};
   for(const target of targets)hashes[target.id]=await scopeHash(m.workspace.cwd,owned(target));
-  const first=!previous?.beads;
-  const unresolved=new Set(previous?.findings.filter(finding=>!finding.rejection).map(finding=>claim(finding.path)?.id).filter((id):id is string=>!!id));
-  const changed=targets.filter(target=>first||previous!.beads![target.id]!==hashes[target.id]||unresolved.has(target.id));
-  const integrate=first||!changed.length||changed.some(target=>!owned(target).length);
-  const from=await diffBase(m,run);
+  let deltaFiles:string[]=[];
+  if(m.workspace.commonDir){
+   const delta=await run('git',['diff','--name-only','-z',from,baseline.tree!,'--'],m.workspace.cwd);
+   if(delta.code)throw new Error(delta.stderr||'Cannot enumerate review changes');
+   deltaFiles=delta.stdout.split('\0').filter(Boolean);
+  }
+  const unresolvedIds=new Set(unresolved.map(finding=>finding.id));
+  const affected=!followup?universe:previous.baseline
+   ?new Set([...universe].filter(file=>previous.baseline!.files[file]!==baseline.files[file]))
+   :new Set([...deltaFiles.filter(file=>!claim(file)),...targets.filter(target=>m.repairLinks[target.id]?.some(id=>unresolvedIds.has(id))).flatMap(owned),...unresolvedPaths]);
+  const selected=(target:BeadReviewTarget)=>owned(target).filter(file=>!followup||affected.has(file)||unresolvedPaths.has(file));
+  const changed=targets.filter(target=>selected(target).length);
+  const integrationFiles=followup?[...new Set([...affected,...unresolvedPaths])].filter(file=>!claim(file)):captured.files;
+  const reviewScope={kind:followup?'repair':'full',...(followup?{previousRevision:previous.revision,exactDelta:!!previous.baseline?.tree,unresolvedFindings:unresolved}:{})};
+  const diffFor=async(files:readonly string[])=>{
+   if(!m.workspace.commonDir||!files.length)return {diff:'',omitted:[]};
+   const diff=await run('git',['diff',from,baseline.tree!,'--',...files],m.workspace.cwd);
+   if(diff.code)throw new Error(diff.stderr||'Cannot read review delta');
+   return boundDiff(diff.stdout);
+  };
   type TargetResult=Pick<ReviewRound,'summary'|'findings'>&{file?:string};
   const beadInput=async(target:BeadReviewTarget,files:readonly string[]):Promise<string>=>{
-   const diff=m.workspace.commonDir?await run('git',['diff',from,'--',...files],m.workspace.cwd):undefined;
-   if(diff?.code)throw new Error(diff.stderr||`Cannot diff ${target.id}`);
-   const bounded=boundDiff(diff?.stdout??'');
-   return reviewerInput({reviewedRevision:captured.revision,bead:{id:target.id,title:target.title,task:target.text,...(m.repairLinks[target.id]?.length?{repairs:m.repairLinks[target.id]}:{})},requirements:{source:m.source},files:[...files],diff:bounded.diff,...(bounded.omitted.length?{omittedDiffs:bounded.omitted}:{}),priorDecisions:priorDecisions(m,files)});
+   const bounded=await diffFor(files);
+   return reviewerInput({reviewedRevision:captured.revision,reviewScope,bead:{id:target.id,title:target.title,...(!followup||repairRank.has(target.id)?{task:target.text}:{}),...(m.repairLinks[target.id]?.length?{repairs:m.repairLinks[target.id]}:{})},requirements:{source:m.source},files:[...files],diff:bounded.diff,...(bounded.omitted.length?{omittedDiffs:bounded.omitted}:{}),priorDecisions:priorDecisions(m,files)});
   };
-  const integrationInput=():string=>{
-   const bounded=boundDiff(captured.diff);
-   return reviewerInput({reviewedRevision:captured.revision,source:m.source,workspace:m.workspace,beads:targets.map(target=>({id:target.id,title:target.title,task:target.text,files:owned(target),...(m.repairLinks[target.id]?.length?{repairs:m.repairLinks[target.id]}:{})})),verification:m.evidence.verify,files:captured.files,diff:bounded.diff,...(bounded.omitted.length?{omittedDiffs:bounded.omitted}:{}),priorDecisions:priorDecisions(m,captured.files)});
+  const integrationInput=async():Promise<string>=>{
+   const bounded=await diffFor(integrationFiles);
+   return reviewerInput({reviewedRevision:captured.revision,reviewScope,source:m.source,workspace:m.workspace,beads:changed.map(target=>({id:target.id,title:target.title,files:selected(target),...(!followup||repairRank.has(target.id)?{task:target.text}:{}),...(m.repairLinks[target.id]?.length?{repairs:m.repairLinks[target.id]}:{})})),verification:m.evidence.verify,files:integrationFiles,diff:bounded.diff,...(bounded.omitted.length?{omittedDiffs:bounded.omitted}:{}),priorDecisions:priorDecisions(m,integrationFiles)});
   };
   const planned:Array<{label:string;beadId?:string;note:string;budget:number;input:string;inputHash:string}>=[];
-  for(const target of changed){const files=owned(target);if(files.length)planned.push({label:target.id,beadId:target.id,note:BEAD_NOTE,budget:files.length,input:await beadInput(target,files),inputHash:''});}
-  if(integrate)planned.push({label:'integration',note:INTEGRATION_NOTE,budget:countDiffFiles(captured.diff),input:integrationInput(),inputHash:''});
+  for(const target of changed){const files=selected(target);planned.push({label:target.id,beadId:target.id,note:BEAD_NOTE+(followup?REPAIR_NOTE:''),budget:files.length,input:await beadInput(target,files),inputHash:''});}
+  if(!followup||integrationFiles.length)planned.push({label:targets.length?'integration':'review',note:(targets.length?INTEGRATION_NOTE:'')+(followup?REPAIR_NOTE:''),budget:followup||!m.workspace.commonDir?integrationFiles.length:deltaFiles.length,input:await integrationInput(),inputHash:''});
   const persisted=m.reviewProgress;
   const reusable=persisted&&persisted.round===m.round&&persisted.revision===captured.revision&&(persisted.model===modelName||persisted.retryModel===modelName)?persisted:undefined;
   const state:NonNullable<Mission['reviewProgress']>={round:m.round,revision:captured.revision,model:modelName,inputs:{},targets:{},failures:{},at:new Date().toISOString()};
@@ -390,13 +426,14 @@ export class Reviewer {
     notes.push(`${outcome.label} moved ${finding.path} to ${owner}`);
    }
   }
-  const summary=validateReviewSummary([...outcomes.map(outcome=>`[${outcome.label}] ${outcome.result.summary}`),...notes].join('\n').slice(0,49_000));
+  const summary=validateReviewSummary((outcomes.length?[...outcomes.map(outcome=>`[${outcome.label}] ${outcome.result.summary}`),...notes].join('\n'):'No file changes since the independently reviewed baseline; no unresolved findings remain.').slice(0,49_000));
   const transcripts=Object.fromEntries(outcomes.flatMap(outcome=>outcome.result.file?[[outcome.label,outcome.result.file]]:[]));
   const models=[...new Set(Object.values(state.targets).map(target=>target.model??modelName))];
-  return {round:m.round,revision:captured.revision,model:models.join(', ')||modelName,summary,findings,at:new Date().toISOString(),beads:hashes,...(Object.keys(transcripts).length?{transcripts}:{})};
+  return {round:m.round,revision:captured.revision,model:models.join(', ')||modelName,summary,findings,at:new Date().toISOString(),baseline,beads:hashes,...(Object.keys(transcripts).length?{transcripts}:{})};
  }
  async #review(m: Mission, ctx: ExtensionContext, model: Model, contextFiles: Array<{ path: string; content: string }> | undefined, note: string, payload: string, revision: string, changedFiles: number, label: string, timeoutAttempts=0): Promise<Pick<ReviewRound,'summary'|'findings'>&{file?:string}> {
-  const budget=reviewBudgetMs(changedFiles,timeoutAttempts);
+  const prior=m.reviews.at(-1);const followup=!!prior&&!prior.invalidated&&(!prior.baseline||prior.baseline.base===(m.workspace.base??''));
+  const budget=reviewBudgetMs(changedFiles,timeoutAttempts,followup);
   const started=Date.now();
   const stopped=Promise.withResolvers<never>();
   const key=Symbol(label);
@@ -459,17 +496,6 @@ export class Reviewer {
   return {session:opened.session,file:dir?manager.getSessionFile():undefined};
  }
  async run(m: Mission, ctx: ExtensionContext, run: Run, role = 'default', contextFiles?: Array<{ path: string; content: string }>): Promise<ReviewRound> {
-  if(!ctx.model||!ctx.modelRegistry)throw new Error('Coordinator model/registry unavailable');
-  const model = missionModel(m, 'review', role, ctx);
-  const captured=await captureRevision(m,run);
-  alignVerifiedRevision(m,captured);
-  const bounded=boundDiff(captured.diff);
-  const prior=m.evidence.review;
-  const attempts=prior?.revision===captured.revision&&/deadline exceeded|timed out|timeout/i.test(prior.detail)?prior.attempts??1:0;
-  const result=await this.#review(m,ctx,model,contextFiles,'',JSON.stringify({reviewedRevision:captured.revision,source:m.source,workspace:m.workspace,scopes:m.scopes,verification:m.evidence.verify,files:captured.files,diff:bounded.diff,...(bounded.omitted.length?{omittedDiffs:bounded.omitted}:{}),priorDecisions:priorDecisions(m,captured.files)}),captured.revision,countDiffFiles(captured.diff),'review',attempts);
-  const after=await captureRevision(m,run);if(after.revision!==captured.revision)throw new Error('Revision changed during review; result invalidated');
-  delete m.reviewProgress;
-  const {file,...verdict}=result;
-  return {...verdict,round:m.round,revision:captured.revision,model:`${model.provider}/${model.id}`,at:new Date().toISOString(),...(file?{transcripts:{review:file}}:{})};
+  return this.runPerBead(m,ctx,run,role,contextFiles,[],1);
  }
 }

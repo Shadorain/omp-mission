@@ -1,5 +1,5 @@
 import {test,expect} from 'bun:test';
-import {nextAction,operatorStep,operatorCommands,modelRetryTargets,setMode,approveGate,enforceMutation,enforceGate,waveGate,terminalCapacity,QUOTA_BLOCKER,reviewTriageAction,triageFindings} from '../src/controller';
+import {nextAction,operatorStep,operatorCommands,modelRetryTargets,setMode,approveGate,enforceMutation,enforceGate,waveGate,terminalCapacity,QUOTA_BLOCKER,reviewTriageAction,triageFindings,consumeRepairBudget} from '../src/controller';
 import { validateMission } from '../src/store';
 import type {Mission,Snapshot,PolicyContext,ReviewRound} from '../src/types';
 export function fixture(): Mission {return {version:1,id:'freeform-test',source:{kind:'freeform',id:'test',title:'test',body:'test',comments:'',extra:''},workspace:{key:'key',cwd:'/tmp',delivery:'local'},epicId:'epic',scopes:{a:['a.ts'],b:['b.ts']},phase:'execute',evidence:{},mode:'auto',keep:false,reviewRequested:false,workers:[],reviews:[],repairLinks:{},round:1,createdAt:'now',updatedAt:'now'};}
@@ -301,4 +301,45 @@ test('an unsuccessful review window wakes coordinator triage instead of parking 
  m.evidence.deliver={outcome:'passed',revision:'rev-3',detail:'Delivered current output',at:'now'};
  expect(nextAction(m,closed,policy).kind).toBe('triage');
  expect(m.reviews.at(-1)!.findings[0]!.rejection).toBeUndefined();
+});
+
+test('exhausted automatic repair budget cannot restart on distinct new findings',()=>{
+ const m=fixture();m.phase='review';m.reviewRequested=true;m.repairBudget=0;
+ m.evidence.verify={outcome:'passed',revision:'last',detail:'Verified final repair',at:'now'};
+ m.evidence.deliver={outcome:'passed',revision:'last',detail:'Delivered',at:'now'};
+ m.reviews=[{round:50,revision:'last',model:'independent',summary:'New defect',at:'now',findings:[{id:'never-seen-before',severity:'high',path:'a.ts',line:1,title:'Distinct new defect',body:'Consumer fails',triage:{disposition:'repair',detail:'a.ts:1 reproduction confirmed'}}]}];
+ expect(nextAction(m,closed,policy).kind).toBe('hold');
+ expect(nextAction(m,closed,policy).detail).toContain('budget');
+ setMode(m,'force');
+ expect(nextAction(m,closed,policy).kind).toBe('hold');
+ expect(validateMission(m).repairBudget).toBe(0);
+});
+
+test('two repair cycles finish their final review but cannot spawn a third wave',()=>{
+ const m=fixture();m.reviewRequested=true;
+ for(let round=1;round<=3;round++){
+  const revision=`verified-${round}`;m.phase='review';
+  m.evidence.verify={outcome:'passed',revision,detail:'Verified',at:'now'};
+  m.evidence.deliver={outcome:'passed',revision,detail:'Delivered',at:'now'};
+  m.reviews.push({round,revision,model:'independent',summary:'Distinct defect',at:'now',findings:[{id:`new-${round}`,severity:'high',path:'a.ts',line:round,title:`Different defect ${round}`,body:'Consumer fails',triage:{disposition:'repair',detail:`a.ts:${round} reproduced`}}]});
+  if(round===3){expect(nextAction(m,closed,policy).kind).toBe('hold');expect(()=>consumeRepairBudget(m)).toThrow('budget exhausted');break;}
+  expect(nextAction(m,closed,policy).kind).toBe('repairs');
+  consumeRepairBudget(m);delete m.evidence.verify;delete m.evidence.deliver;m.phase='repair';
+  expect(nextAction(m,closed,policy).kind).toBe('verify');
+  m.evidence.verify={outcome:'passed',revision:`repair-${round}`,detail:'Verified repairs',at:'now'};
+  m.evidence.deliver={outcome:'passed',revision:`repair-${round}`,detail:'Delivered repairs',at:'now'};
+  expect(nextAction(m,closed,policy).kind).toBe('review');
+ }
+ expect(m.repairBudget).toBe(0);
+ expect(m.reviews.at(-1)!.findings[0]!.rejection).toBeUndefined();
+ expect(operatorStep(m,nextAction(m,closed,policy),policy).command).toBe('/mission review');
+});
+
+test('zero repair budget still permits evidence triage and clean completion',()=>{
+ const m=fixture();m.phase='review';m.reviewRequested=true;m.repairBudget=0;
+ m.evidence.verify={outcome:'passed',revision:'r',detail:'Verified',at:'now'};m.evidence.deliver={...m.evidence.verify};
+ m.reviews=[{round:1,revision:'r',model:'independent',summary:'Claim',at:'now',findings:[{id:'false',severity:'low',path:'a.ts',line:1,title:'Case-sensitive match',body:'Eligible matches Ineligible'}]}];
+ expect(nextAction(m,closed,policy).kind).toBe('triage');
+ triageFindings(m,[{findingId:'false',disposition:'reject',detail:'a.ts:1 case-sensitive substring comparison is false'}]);
+ expect(nextAction(m,closed,policy).kind).toBe('complete');
 });

@@ -43,18 +43,32 @@ export function reviewFailureStep(detail:string,completed=0,total=0):Step{
 /** Review failures a later run clears by itself: throttles, provider overload, dropped connections, a reviewer deadline. Quota needs a person. */
 const transientReview = /deadline exceeded|timed out|timeout|overloaded|rate_limit_error|\b(?:502|503|504|529)\b|internal server error|econnreset|socket hang up|fetch failed|network error/i;
 export const REVIEW_RETRIES = 3;
+export const reviewRetryLimit=(m:Pick<Mission,'reviews'>)=>m.reviews.length?1:REVIEW_RETRIES;
+export const REPAIR_CYCLES = 2;
+export function repairBudgetReason(m:Mission):string|undefined {
+ const review=m.reviews.at(-1);
+ if(m.phase==='complete'||m.repairBudget!==0||!review||review.invalidated||m.evidence.verify?.outcome!=='passed'||m.evidence.verify.revision!==review.revision)return undefined;
+ const open=review.findings.filter(finding=>!finding.rejection);
+ if(!open.length||open.some(finding=>!finding.triage))return undefined;
+ return `Automatic repair budget exhausted. Unresolved findings: ${open.map(finding=>finding.id).join(', ')}. No further automatic repair wave; inspect the recorded evidence. Operator /mission review authorizes exactly one additional repair cycle`;
+}
+export function consumeRepairBudget(m:Mission):void {
+ const remaining=m.repairBudget??REPAIR_CYCLES;
+ if(remaining<=0)throw new Error('Automatic repair budget exhausted; operator /mission review must authorize another cycle');
+ m.repairBudget=remaining-1;
+}
 const REVIEW_BACKOFF_MS = [2 * 60_000, 10 * 60_000, 30 * 60_000];
 /**
  * When a failed review reruns without the operator, or undefined when it waits for `/mission review`.
  * Honors the provider's retry-after, and spreads missions that failed together by up to
  * a minute; a multi-hour provider reset must not gain another hour of jitter.
  */
-export function reviewRetryAt(m: Pick<Mission, 'id' | 'evidence'>): number | undefined {
+export function reviewRetryAt(m: Pick<Mission, 'id' | 'evidence' | 'reviews'>): number | undefined {
  const review = m.evidence.review;
  if (review?.outcome !== 'failed' || providerCapacity(review.detail) === 'quota') return undefined;
  if (providerCapacity(review.detail) !== 'rate' && !transientReview.test(review.detail)) return undefined;
  const attempts = review.attempts ?? 1;
- if (attempts > REVIEW_RETRIES) return undefined;
+ if (attempts > reviewRetryLimit(m)) return undefined;
  const failedAt = Date.parse(review.at);
  const hints = [...review.detail.matchAll(/retry-after-ms=(\d+)/g)].map(match => Number(match[1])).filter(Number.isFinite);
  for (const match of review.detail.matchAll(/\breset(?:s|ting)?\s+in\s+(\d+)\s+(seconds?|minutes?|hours?)\b/gi))
@@ -98,7 +112,8 @@ export function reviewTriageAction(m: Mission): Action | undefined {
  const escalated=open.filter(finding=>finding.triage?.disposition==='escalate');
  if(escalated.length)return {kind:'hold',detail:`Review escalation: ${escalated.map(finding=>`${finding.id}: ${finding.triage!.detail}`).join('; ')}. Operator inspection required; /mission review explicitly authorizes another repair attempt`};
  const pending=open.filter(finding=>!finding.triage);
- return pending.length?{kind:'triage',ids:pending.map(finding=>finding.id),detail:`Validate ${pending.length} review finding${pending.length===1?'':'s'} against the requirements, current code and prior repair evidence; record evidence-based repair, reject or escalate decisions before creating repair work`}:undefined;
+ if(pending.length)return {kind:'triage',ids:pending.map(finding=>finding.id),detail:`Validate ${pending.length} review finding${pending.length===1?'':'s'} against the requirements, current code and prior repair evidence; record evidence-based repair, reject or escalate decisions before creating repair work`};
+ const budget=repairBudgetReason(m);return budget?{kind:'hold',detail:budget}:undefined;
 }
 export function triageFindings(m: Mission, decisions: readonly FindingDecision[]): void {
  const review=m.reviews.at(-1);
@@ -228,7 +243,7 @@ export function nextAction(m: Mission, snapshot: Snapshot | undefined, policy: P
  if (reviewEvidence?.outcome === 'failed' && reviewEvidence.revision === revision) {
   const retryAt = reviewRetryAt(m);
   if (retryAt === undefined) return {kind: 'hold', detail: `Review failed; /mission review explicitly retries: ${reviewEvidence.detail}`};
-  if (Date.now() < retryAt) return {kind: 'hold', detail: `Review retries automatically at ${new Date(retryAt).toISOString().slice(11, 16)} UTC (attempt ${(reviewEvidence.attempts ?? 1) + 1} of ${REVIEW_RETRIES + 1}) after: ${reviewEvidence.detail.slice(0, 200)}`};
+  if (Date.now() < retryAt) return {kind: 'hold', detail: `Review retries automatically at ${new Date(retryAt).toISOString().slice(11, 16)} UTC (attempt ${(reviewEvidence.attempts ?? 1) + 1} of ${reviewRetryLimit(m) + 1}) after: ${reviewEvidence.detail.slice(0, 200)}`};
  }
  const review = m.reviews.at(-1);
  if (review && !review.invalidated && review.revision === revision) {

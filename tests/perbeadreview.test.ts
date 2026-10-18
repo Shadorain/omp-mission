@@ -7,8 +7,8 @@ import { captureRevision, Reviewer, type BeadReviewTarget, type ReviewOpener } f
 import type { Mission, Run } from '../src/types';
 import { loadMission, saveMission, validateMission } from '../src/store';
 
-const real: Run = async (command, args, cwd) => {
-  const child = Bun.spawn([command, ...args], { cwd, stdout: 'pipe', stderr: 'pipe' });
+const real: Run = async (command, args, cwd, env) => {
+  const child = Bun.spawn([command, ...args], { cwd, env: {...process.env,...env}, stdout: 'pipe', stderr: 'pipe' });
   const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
   return { stdout, stderr, code };
 };
@@ -153,6 +153,66 @@ test('unchanged scopes with unresolved findings are reviewed alongside changed s
  const review=await new Reviewer(opener(sent,payload=>({summary:'Review',findings:beadOf(payload)==='bd-a'?[finding('still-open')]:[]}))).runPerBead(m,ctx,real,'default',undefined,targets);
  expect(sent.map(item=>beadOf(item.payload)).sort()).toEqual(['bd-a','bd-b']);
  expect(review.findings).toEqual([expect.objectContaining({id:'bd-a:still-open'})]);
+});
+
+test('repair ownership transfer reviews only the repair delta, not the cumulative branch',async()=>{
+ await writeFile(join(root,'a','one.txt'),'reviewed first wave\n');
+ const m=await missionAt();
+ m.reviews.push(await new Reviewer(opener([],payload=>({summary:'First audit',findings:beadOf(payload)==='bd-a'?[finding('open')]:[]}))).runPerBead(m,ctx,real,'default',undefined,targets));
+ await writeFile(join(root,'a','one.txt'),'fixed second wave\n');
+ m.scopes['bd-fix']=['a/**'];m.repairLinks['bd-fix']=['bd-a:open'];m.round++;
+ m.evidence.verify={outcome:'passed',detail:'Verified repair',revision:(await captureRevision(m,real)).revision,at:'now'};
+ const sent:Array<{note:string;payload:Record<string,unknown>}>=[];
+ await new Reviewer(opener(sent,()=>({summary:'Repair verified',findings:[]}))).runPerBead(m,ctx,real,'default',undefined,[...targets,{id:'bd-fix',title:'Repair',text:'Fix the open defect',files:['a/**']}]);
+ expect(sent.map(item=>beadOf(item.payload))).toEqual(['bd-fix']);
+ expect(sent[0]!.payload.diff).toContain('-reviewed first wave');
+ expect(sent[0]!.payload.diff).toContain('+fixed second wave');
+ expect(sent[0]!.payload.diff).not.toContain('\n-1\n');
+});
+
+test('review snapshots preserve the real index and include untracked additions and deletions',async()=>{
+ await writeFile(join(root,'a','one.txt'),'staged');
+ await real('git',['add','a/one.txt'],root);
+ await writeFile(join(root,'a','one.txt'),'reviewed working tree');
+ await writeFile(join(root,'a','new.txt'),'new untracked content');
+ const index=(await real('git',['ls-files','--stage'],root)).stdout;
+ const status=(await real('git',['status','--porcelain'],root)).stdout;
+ const m=await missionAt();
+ m.reviews.push(await new Reviewer(opener([],()=>({summary:'Initial audit',findings:[]}))).runPerBead(m,ctx,real,'default',undefined,targets));
+ expect((await real('git',['ls-files','--stage'],root)).stdout).toBe(index);
+ expect((await real('git',['status','--porcelain'],root)).stdout).toBe(status);
+ await rm(join(root,'a','new.txt'));
+ await rm(join(root,'a','one.txt'));
+ await writeFile(join(root,'b','new.txt'),'new repair file');
+ m.round++;m.evidence.verify={outcome:'passed',detail:'Verified changes',revision:(await captureRevision(m,real)).revision,at:'now'};
+ const sent:Array<{note:string;payload:Record<string,unknown>}>=[];
+ const round=await new Reviewer(opener(sent,()=>({summary:'Delta verified',findings:[]}))).runPerBead(m,ctx,real,'default',undefined,targets);
+ const a=sent.find(item=>beadOf(item.payload)==='bd-a')!;
+ expect((a.payload.files as string[]).toSorted()).toEqual(['a/new.txt','a/one.txt']);
+ expect(a.payload.diff).toContain('-new untracked content');
+ expect(a.payload.diff).toContain('-reviewed working tree');
+ expect(sent.find(item=>beadOf(item.payload)==='bd-b')!.payload.diff).toContain('+new repair file');
+ expect((await real('git',['ls-files','--stage'],root)).stdout).toBe(index);
+ expect(validateMission({...m,reviews:[...m.reviews,round]}).reviews.at(-1)!.baseline).toEqual(round.baseline);
+});
+
+test('unchanged ownership transfer cannot create another full audit',async()=>{
+ const m=await missionAt();
+ m.reviews.push(await new Reviewer(opener([],()=>({summary:'Clean audit',findings:[]}))).runPerBead(m,ctx,real,'default',undefined,targets));
+ m.repairLinks['bd-fix']=['old-decision'];
+ const sent:Array<{note:string;payload:Record<string,unknown>}>=[];
+ const round=await new Reviewer(opener(sent,()=>{throw new Error('No changes to review')})).runPerBead(m,ctx,real,'default',undefined,[...targets,{id:'bd-fix',title:'Reassigned',text:'Ownership only',files:['a/**']}]);
+ expect(sent).toEqual([]);
+ expect(round.findings).toEqual([]);
+});
+
+test('a missing persisted baseline fails closed instead of silently rescanning or passing',async()=>{
+ const m=await missionAt();
+ const round=await new Reviewer(opener([],()=>({summary:'Initial audit',findings:[]}))).runPerBead(m,ctx,real,'default',undefined,targets);
+ round.baseline!.tree='0'.repeat(40);m.reviews.push(round);
+ const sent:Array<{note:string;payload:Record<string,unknown>}>=[];
+ await expect(new Reviewer(opener(sent,()=>({summary:'Must not pass',findings:[]}))).runPerBead(m,ctx,real,'default',undefined,targets)).rejects.toThrow('baseline is unavailable');
+ expect(sent).toEqual([]);
 });
 
 test('when no bead owns the change, the integration pass covers the whole revision', async () => {
@@ -563,4 +623,40 @@ test('timeout retries expand only failed targets and retain completed reviews',a
  expect(round.summary).toContain('[bd-a] retained');
  expect(round.summary).toContain('[bd-b] recovered');
  expect(round.summary).toContain('[integration] retained');
+});
+
+test('repair verification timeouts never expand into full-audit deadlines on retry',async()=>{
+ await writeFile(join(root,'a','one.txt'),'first wave');
+ const m=await missionAt();
+ m.reviews.push(await new Reviewer(opener([],payload=>({summary:'Initial audit',findings:beadOf(payload)==='bd-a'?[finding('open')]:[]}))).runPerBead(m,ctx,real,'default',[],targets));
+ await writeFile(join(root,'a','one.txt'),'repair wave');m.round++;
+ m.evidence.verify={outcome:'passed',detail:'Verified repair',at:'now',revision:(await captureRevision(m,real)).revision};
+ const budgets:number[]=[];
+ const failed:ReviewOpener=async(...args)=>{budgets.push(args[5]!);const opened=await opener([],()=>({summary:'Unused',findings:[]}))(...args);opened.session.prompt=async()=>{throw new Error('Reviewer deadline exceeded')};return opened;};
+ await expect(new Reviewer(failed).runPerBead(m,ctx,real,'default',[],targets)).rejects.toThrow('deadline exceeded');
+ m.evidence.review={outcome:'active',detail:'Retrying',revision:m.evidence.verify.revision,at:'now',attempts:3};
+ await new Reviewer(async(...args)=>{budgets.push(args[5]!);return opener([],()=>({summary:'Repair checked',findings:[]}))(...args)}).runPerBead(m,ctx,real,'default',[],targets);
+ expect(budgets).toHaveLength(2);expect(budgets[1]).toBe(budgets[0]);expect(budgets.every(ms=>ms<=5*60_000)).toBe(true);
+});
+
+test('legacy ownership transfer does not reopen the former owners untouched remaining files',async()=>{
+ await writeFile(join(root,'a','other.txt'),'settled historical code');
+ const m=await missionAt();
+ const first=await new Reviewer(opener([],payload=>({summary:'Initial review',findings:beadOf(payload)==='bd-a'?[finding('open')]:[]}))).runPerBead(m,ctx,real,'default',[],targets);
+ delete first.baseline;m.reviews.push(first);
+ await writeFile(join(root,'a','one.txt'),'repaired');
+ m.repairLinks['bd-fix']=['bd-a:open'];m.round++;
+ m.evidence.verify={outcome:'passed',detail:'Verified repair',revision:(await captureRevision(m,real)).revision,at:'now'};
+ const sent:Array<{note:string;payload:Record<string,unknown>}>=[];
+ await new Reviewer(opener(sent,()=>({summary:'Repair verified',findings:[]}))).runPerBead(m,ctx,real,'default',[],[...targets,{id:'bd-fix',title:'Repair',text:'Fix open finding',files:['a/one.txt']}]);
+ expect(sent.map(item=>beadOf(item.payload))).toEqual(['bd-fix']);
+ expect(sent[0]!.payload.files).toEqual(['a/one.txt']);
+});
+
+test('initial integration deadline counts changed files, not untouched repository files',async()=>{
+ await writeFile(join(root,'a','one.txt'),'only changed file');
+ const m=await missionAt(),budgets:Record<string,number>={};
+ const reviewer=new Reviewer(async(...args)=>{budgets[args[6]!.label]=args[5]!;return opener([],()=>({summary:'Checked',findings:[]}))(...args);});
+ await reviewer.runPerBead(m,ctx,real,'default',[],targets);
+ expect(budgets.integration).toBe(budgets['bd-a']);
 });

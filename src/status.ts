@@ -1,4 +1,5 @@
 import type { Action, Mission, Snapshot } from './types';
+import { REPAIR_CYCLES } from './controller';
 
 // What the coordinator model sees. The saved mission keeps everything (source text,
 // worker assignments, timestamps, lock nonce); none of it helps a decision, and every
@@ -28,6 +29,7 @@ export function briefView({ mission, pending, snapshot, resumeHold, ownershipErr
 		phase: mission.phase,
 		mode: mission.mode,
 		round: mission.round,
+		repairBudget: mission.repairBudget ?? REPAIR_CYCLES,
 		base: mission.workspace.base,
 		...(mission.gate ? { gate: `${mission.gate.detail}${mission.gate.approved ? ' (approved)' : ''}` } : {}),
 		...(mission.blocker ? { blocker: mission.blocker } : {}),

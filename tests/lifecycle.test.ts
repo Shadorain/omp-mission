@@ -15,7 +15,7 @@ type Execute = (id: string, params: Params, signal: undefined, update: undefined
 type EventHandler = (event: unknown, context: ExtensionContext) => Promise<unknown>;
 const noRun: Run = async () => { throw new Error('Unexpected command'); };
 
-async function fixture(graph: Graph, leaves = true, host: { untriaged?: boolean; autoDispatch?: boolean; idle?: boolean; pending?: boolean; resumed?: boolean; unreviewed?: boolean; clean?: boolean; complete?: boolean; plan?: boolean; otherCheckout?: boolean; linearCheckout?: boolean; archived?: boolean; prBase?: string; delivered?: boolean; reviewRequested?: boolean; legacyFingerprint?: boolean; mergeConflict?: boolean } = {}) {
+async function fixture(graph: Graph, leaves = true, host: { repairBudget?: number; untriaged?: boolean; autoDispatch?: boolean; idle?: boolean; pending?: boolean; resumed?: boolean; unreviewed?: boolean; clean?: boolean; complete?: boolean; plan?: boolean; otherCheckout?: boolean; linearCheckout?: boolean; archived?: boolean; prBase?: string; delivered?: boolean; reviewRequested?: boolean; legacyFingerprint?: boolean; mergeConflict?: boolean } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'mission-lifecycle-'));
   const cwd = join(root, 'workspace');
   await mkdir(cwd);
@@ -28,6 +28,7 @@ async function fixture(graph: Graph, leaves = true, host: { untriaged?: boolean;
     evidence: {}, workers: [], reviews: [], repairLinks: {},
     ...(graph === 'beads' ? { epicId: 'epic' } : {}),
   };
+  if(host.repairBudget!==undefined)mission.repairBudget=host.repairBudget;
   const revision = (await captureRevision(mission, noRun)).revision;
   if (host.mergeConflict) { mission.workspace.commonDir = '.git'; mission.workspace.base = 'main'; }
   if (graph === 'local') {
@@ -570,3 +571,30 @@ test('turn_start leaves a blocker that only mentions quota', async () => {
   } finally { await mission.dispose(); }
 });
 
+
+test('repair budget survives restore and Continue; only operator Review grants one cycle',async()=>{
+ const mission=await fixture('local',true,{repairBudget:0});
+ try{
+  await expect(mission.execute({operation:'accept_repairs'})).rejects.toThrow('budget exhausted');
+  await mission.command('mode force');await mission.command('continue');await mission.restore();await mission.command('continue');
+  expect((await mission.state()).repairBudget).toBe(0);
+  await expect(mission.execute({operation:'accept_repairs'})).rejects.toThrow('budget exhausted');
+  await mission.command('review');
+  expect((await mission.state()).repairBudget).toBe(1);
+  await mission.execute({operation:'accept_repairs'});
+  const accepted=await mission.state();
+  expect(accepted.phase).toBe('repair');expect(accepted.repairBudget).toBe(0);
+  expect(accepted.reviews[0]!.findings[0]!.rejection).toBeUndefined();
+  await expect(mission.execute({operation:'accept_repairs'})).rejects.toThrow('budget exhausted');
+ }finally{await mission.dispose();}
+});
+
+test('legacy repair awaiting its closing review counts toward the resumed budget',async()=>{
+ const mission=await fixture('local',true);
+ try{
+  const saved=await mission.state();delete saved.repairBudget;saved.round=saved.reviews.at(-1)!.round+1;
+  saved.evidence.repair={outcome:'passed',revision:saved.reviews.at(-1)!.revision,detail:'Repair wave verified; closing review pending',at:'now'};
+  await saveMission(mission.path,saved);await mission.restore();await mission.command('continue');
+  expect((await mission.state()).repairBudget).toBe(1);
+ }finally{await mission.dispose();}
+});
