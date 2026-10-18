@@ -23,7 +23,7 @@ async function diffBase(m: Mission, run: Run): Promise<string> {
  }
  return base;
 }
-export const reviewBudgetMs=(changedFiles:number,timeoutAttempts=0,followup=false)=>followup?Math.min(5*60_000,90_000+changedFiles*10_000):Math.min(30*60_000,(300_000+changedFiles*15_000)*2**Math.min(3,Math.max(0,timeoutAttempts)));
+export const reviewBudgetMs=(changedFiles:number,timeoutAttempts=0,followup=false)=>followup?10*60_000:Math.min(30*60_000,(300_000+changedFiles*15_000)*2**Math.min(3,Math.max(0,timeoutAttempts)));
 export async function captureRevision(m: Mission, run: Run): Promise<RevisionCapture> {
  const cwd=m.workspace.cwd; const hash=createHash('sha256'); const treeHash=createHash('sha256'); const legacyHash=createHash('sha256'); const legacyTreeHash=createHash('sha256'); let files:string[];let diff='';
  const hashes:Record<string,string>=Object.create(null);

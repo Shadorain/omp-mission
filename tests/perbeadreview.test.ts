@@ -636,7 +636,7 @@ test('repair verification timeouts never expand into full-audit deadlines on ret
  await expect(new Reviewer(failed).runPerBead(m,ctx,real,'default',[],targets)).rejects.toThrow('deadline exceeded');
  m.evidence.review={outcome:'active',detail:'Retrying',revision:m.evidence.verify.revision,at:'now',attempts:3};
  await new Reviewer(async(...args)=>{budgets.push(args[5]!);return opener([],()=>({summary:'Repair checked',findings:[]}))(...args)}).runPerBead(m,ctx,real,'default',[],targets);
- expect(budgets).toHaveLength(2);expect(budgets[1]).toBe(budgets[0]);expect(budgets.every(ms=>ms<=5*60_000)).toBe(true);
+ expect(budgets).toHaveLength(2);expect(budgets[1]).toBe(budgets[0]);expect(budgets[0]).toBe(10*60_000);
 });
 
 test('legacy ownership transfer does not reopen the former owners untouched remaining files',async()=>{
