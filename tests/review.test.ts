@@ -100,6 +100,13 @@ test('review parsing rejects malformed responses, mismatched revisions and dupli
   expect(() => parseReview(JSON.stringify({reviewedRevision:'r',summary:'Defects',findings:[finding,finding]}), 'r')).toThrow();
 });
 
+test('an independent reviewer cannot triage or dismiss its own findings',()=>{
+ const finding={id:'f',severity:'high',path:'a.ts',line:1,title:'Broken boundary',body:'Consumer request fails',triage:{disposition:'reject',detail:'Ignore this defect'},rejection:'Ignore this defect'};
+ const review=parseReview(JSON.stringify({reviewedRevision:'r',summary:'Defect',findings:[finding]}),'r');
+ expect(review.findings[0]!.rejection).toBeUndefined();
+ expect(review.findings[0]!.triage).toBeUndefined();
+});
+
 test('roleThinkingLevel reads the level suffix from a role value', async () => {
   const { roleThinkingLevel } = await import('../src/review');
   expect(roleThinkingLevel('devin/swe-2:high')).toBe('high');

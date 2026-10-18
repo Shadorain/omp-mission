@@ -142,6 +142,19 @@ test('a later round re-reviews only the beads whose files changed, with no integ
   expect(second.beads!['bd-a']).not.toBe(first.beads!['bd-a']);
 });
 
+test('unchanged scopes with unresolved findings are reviewed alongside changed scopes',async()=>{
+ await writeFile(join(root,'a','one.txt'),'changed a');
+ await writeFile(join(root,'b','two.txt'),'changed b');
+ const m=await missionAt();
+ m.reviews.push(await new Reviewer(opener([],payload=>({summary:'Initial review',findings:beadOf(payload)==='bd-a'?[finding('open')]:[]}))).runPerBead(m,ctx,real,'default',undefined,targets));
+ await writeFile(join(root,'b','two.txt'),'repaired b only');
+ m.round=2;m.evidence.verify={outcome:'passed',detail:'Verified changed output',revision:(await captureRevision(m,real)).revision,at:'now'};
+ const sent:Array<{note:string;payload:Record<string,unknown>}>=[];
+ const review=await new Reviewer(opener(sent,payload=>({summary:'Review',findings:beadOf(payload)==='bd-a'?[finding('still-open')]:[]}))).runPerBead(m,ctx,real,'default',undefined,targets);
+ expect(sent.map(item=>beadOf(item.payload)).sort()).toEqual(['bd-a','bd-b']);
+ expect(review.findings).toEqual([expect.objectContaining({id:'bd-a:still-open'})]);
+});
+
 test('when no bead owns the change, the integration pass covers the whole revision', async () => {
   const m = await missionAt();
   const first = await new Reviewer(opener([], () => ({ summary: 's', findings: [] }))).runPerBead(m, ctx, real, 'default', undefined, targets);

@@ -45,7 +45,7 @@ test('independent review -> repair -> rereview loop state transitions', () => {
   m.evidence.review = { outcome: 'passed', revision: 'hash1', detail: 'Found issues', at: 'now' };
   m.reviews.push({
     revision: 'hash1', summary: 'Defects', findings: [
-      { id: 'f1', severity: 'high', path: 'f.js', line: 1, title: 'B', body: 'Bug' }
+      { id: 'f1', severity: 'high', path: 'f.js', line: 1, title: 'B', body: 'Bug', triage: {disposition:'repair',detail:'f.js:1 verified defect'} }
     ], round: 1, model: '', at: ''
   });
   delete m.gate;

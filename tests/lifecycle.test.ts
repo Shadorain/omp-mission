@@ -7,15 +7,15 @@ import missionExtension from '../src/extension';
 import { isRecord } from '../src/guards';
 import { captureRevision } from '../src/review';
 import { loadMission, missionPath, saveMission, workspaceKey } from '../src/store';
-import type { Graph, Mission, Run } from '../src/types';
+import type { FindingDecision, Graph, Mission, Run } from '../src/types';
 
-type Operation = 'start' | 'clear' | 'continue' | 'bind_graph' | 'accept_repairs' | 'record_verification' | 'record_delivery' | 'run_review' | 'reject_finding';
-type Params = { operation: Operation; passed?: boolean; detail?: string; findingId?: string; url?: string; epicId?: string; scopes?: Record<string,string[]> };
+type Operation = 'start' | 'clear' | 'continue' | 'bind_graph' | 'triage_findings' | 'accept_repairs' | 'record_verification' | 'record_delivery' | 'run_review' | 'reject_finding';
+type Params = { operation: Operation; decisions?: FindingDecision[]; passed?: boolean; detail?: string; findingId?: string; url?: string; epicId?: string; scopes?: Record<string,string[]> };
 type Execute = (id: string, params: Params, signal: undefined, update: undefined, context: ExtensionContext) => Promise<unknown>;
 type EventHandler = (event: unknown, context: ExtensionContext) => Promise<unknown>;
 const noRun: Run = async () => { throw new Error('Unexpected command'); };
 
-async function fixture(graph: Graph, leaves = true, host: { churn?: boolean; autoDispatch?: boolean; idle?: boolean; pending?: boolean; resumed?: boolean; unreviewed?: boolean; clean?: boolean; complete?: boolean; plan?: boolean; otherCheckout?: boolean; linearCheckout?: boolean; archived?: boolean; prBase?: string; delivered?: boolean; reviewRequested?: boolean; legacyFingerprint?: boolean; mergeConflict?: boolean } = {}) {
+async function fixture(graph: Graph, leaves = true, host: { untriaged?: boolean; autoDispatch?: boolean; idle?: boolean; pending?: boolean; resumed?: boolean; unreviewed?: boolean; clean?: boolean; complete?: boolean; plan?: boolean; otherCheckout?: boolean; linearCheckout?: boolean; archived?: boolean; prBase?: string; delivered?: boolean; reviewRequested?: boolean; legacyFingerprint?: boolean; mergeConflict?: boolean } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'mission-lifecycle-'));
   const cwd = join(root, 'workspace');
   await mkdir(cwd);
@@ -36,7 +36,7 @@ async function fixture(graph: Graph, leaves = true, host: { churn?: boolean; aut
     mission.evidence.deliver = { outcome: 'passed', revision, detail: 'before', at: 'now' };
     mission.reviews = host.unreviewed ? [] : [{ round: 1, revision, summary: host.clean ? 'Clean' : 'Defect', model: 'test', at: 'now', findings: host.clean ? [] : [{ id: 'f', severity: 'high', path: 'task.txt', line: 1, title: 'Defect', body: 'Fix task.txt' }] }];
   }
-  if(host.churn)mission.reviews=[1,2,3].map(round=>({...mission.reviews[0]!,round,findings:mission.reviews[0]!.findings.map(finding=>({...finding,id:`f${round}`,title:`Defect ${round}`}))}));
+  if(!host.untriaged)for(const review of mission.reviews)for(const finding of review.findings)finding.triage={disposition:'repair',detail:'task.txt:1 confirmed against the task acceptance'};
   if (host.legacyFingerprint && mission.evidence.verify) {
    const captured = await captureRevision(mission, noRun);
    mission.evidence.verify = { ...mission.evidence.verify, revision: captured.legacyRevision, tree: captured.legacyTree };
@@ -167,21 +167,49 @@ test('a failed automatic wave returns to the caller instead of recursively retry
  }finally{await mission.dispose();}
 });
 
-test('churn cannot be released by model operations or continue and an operator checkpoint survives restore',async()=>{
- const mission=await fixture('local',true,{churn:true});
+test('coordinator triage progresses without operator acknowledgement and survives restore',async()=>{
+ const mission=await fixture('local',true,{untriaged:true,idle:true});
  try{
-  await expect(mission.execute({operation:'accept_repairs'})).rejects.toThrow('Review paused');
-  await expect(mission.execute({operation:'record_verification',passed:true,detail:'Blind retry'})).rejects.toThrow('Review paused');
+  expect(mission.sent.at(-1)).toContain('Next: triage');
+  await expect(mission.execute({operation:'accept_repairs'})).rejects.toThrow('Validate');
+  await expect(mission.execute({operation:'run_review'})).rejects.toThrow('Validate');
   await mission.execute({operation:'continue'});
-  expect((await mission.status()).next.detail).toContain('Review paused');
-  await mission.command('review');
-  expect((await mission.state()).reviewAcknowledged).toBe(3);
+  expect((await mission.status()).next.kind).toBe('triage');
+  await mission.execute({operation:'triage_findings',decisions:[{findingId:'f',disposition:'repair',detail:'task.txt:1 the acceptance requires changed output; current output fails'}]});
+  expect((await mission.state()).reviews[0]!.findings[0]!.triage?.disposition).toBe('repair');
   await mission.execute({operation:'accept_repairs'});
   expect((await mission.state()).phase).toBe('repair');
   await mission.restore();
   await mission.execute({operation:'continue'});
-  expect((await mission.state()).reviewAcknowledged).toBe(3);
-  expect((await mission.status()).next.detail).not.toContain('Review paused');
+  expect((await mission.state()).reviews[0]!.findings[0]!.triage?.disposition).toBe('repair');
+  expect((await mission.status()).next.kind).toBe('verify');
+ }finally{await mission.dispose();}
+});
+
+test('triage cannot decide stale findings and cannot bypass a Pause repair gate',async()=>{
+ const mission=await fixture('local',true,{untriaged:true});
+ try{
+  await writeFile(join(mission.cwd,'task.txt'),'changed after review');
+  await expect(mission.execute({operation:'triage_findings',decisions:[{findingId:'f',disposition:'reject',detail:'task.txt:1 already fixed'}]})).rejects.toThrow('revision changed');
+  expect((await mission.state()).reviews[0]!.findings[0]!.rejection).toBeUndefined();
+  await writeFile(join(mission.cwd,'task.txt'),'before');
+  await mission.command('mode pause');
+  await mission.execute({operation:'triage_findings',decisions:[{findingId:'f',disposition:'repair',detail:'task.txt:1 reproduces the failure'}]});
+  expect((await mission.state()).gate?.approved).toBe(false);
+  await expect(mission.execute({operation:'accept_repairs'})).rejects.toThrow('Approval required');
+  await mission.command('approve');
+  expect((await mission.state()).phase).toBe('repair');
+ }finally{await mission.dispose();}
+});
+
+test('evidence-based rejection of every finding preserves independent review and completes unchanged output',async()=>{
+ const mission=await fixture('local',true,{untriaged:true});
+ try{
+  await mission.execute({operation:'triage_findings',decisions:[{findingId:'f',disposition:'reject',detail:'task.txt:1 matches the explicit acceptance; the proposed change contradicts it'}]});
+  const saved=await mission.state();
+  expect(saved.phase).toBe('complete');
+  expect(saved.reviews[0]!.findings[0]!.rejection).toContain('explicit acceptance');
+  expect(saved.workers).toEqual([]);
  }finally{await mission.dispose();}
 });
 

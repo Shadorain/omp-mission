@@ -14,7 +14,7 @@ import { acquireOwnership, listMissions, loadMission, missionId, missionPath, sa
 import type { Ownership } from './store';
 import { readClaimActor, readGraph, readHistory } from './beads';
 import { createWorkerDriver } from './workers';
-import { approveGate, autoDispatchAllowed, consumeGate, deliverUrl, displayPhase, effectiveGraph, enforceGate, enforceMutation, isProviderBlocker, modelRetryTargets, nextAction, operatorCommands, operatorStep, QUOTA_BLOCKER, RATE_BLOCKER, requireBeadsGraph, revisionGate, reviewChurnReason, reviewFailureStep, setMode, terminalCapacity, waveGate } from './controller';
+import { approveGate, autoDispatchAllowed, consumeGate, deliverUrl, displayPhase, effectiveGraph, enforceGate, enforceMutation, isProviderBlocker, modelRetryTargets, nextAction, operatorCommands, operatorStep, QUOTA_BLOCKER, RATE_BLOCKER, requireBeadsGraph, revisionGate, reviewTriageAction, reviewFailureStep, setMode, terminalCapacity, triageFindings, waveGate } from './controller';
 import { alignVerifiedRevision, captureRevision, Reviewer, roleModelString } from './review';
 import { beadTask, checkPrompt, coordinatorPrompt, guide, planSlug, workerPrompt } from './prompts';
 import { createMissionWidget, createMissionInspector, phaseLabel } from './ui';
@@ -99,7 +99,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
  // In-process workers report back here: a clean result already closed the bead; a rejected one waits for the operator.
  async function settleSubagent(beadId:string,outcome:{ok:true;summary:string}|{ok:false;error:string}){const m=mission;if(!m)return;const w=m.workers.findLast(x=>x.beadId===beadId&&x.state!=='closed');if(!w)return;if(outcome.ok){w.state='closed';w.error=undefined;}else w.error=outcome.error;try{if(ownership&&!resumeHold)await persist(m);}catch{/* ownership lost: the next resume reconciles from bd */}if(!outcome.ok&&ctx)ctx.ui.notify(`Worker ${beadId}: ${outcome.error}`,'warning');await refresh(true);}
  const workerAgents=new SubagentRunner({run,agentDir,config:()=>config,context:()=>ctx,onSettled:(beadId,outcome)=>{void settleSubagent(beadId,outcome);}});
- const driver=createWorkerDriver(run,{subagent:workerAgents,canMutate:()=>!!ctx&&!!ownership&&!resumeHold&&!ownershipError&&!nativePlan(ctx)&&!!mission&&!reviewChurnReason(mission),persist:async value=>{if(value!==mission)throw new Error('Session changed during worker operation');if(ownership&&!resumeHold)await persist(value);},prompt:(mission,worker,task)=>config.frontend==='subagent'?subagentPrompt(mission,worker,task):workerPrompt(mission,worker,config.frontend,task),agentDir,model:()=>roleModelString(config.workerRole),frontend:()=>config.frontend,customCommand:()=>config.customCommand});
+ const driver=createWorkerDriver(run,{subagent:workerAgents,canMutate:()=>!!ctx&&!!ownership&&!resumeHold&&!ownershipError&&!nativePlan(ctx)&&!!mission&&!reviewTriageAction(mission),persist:async value=>{if(value!==mission)throw new Error('Session changed during worker operation');if(ownership&&!resumeHold)await persist(value);},prompt:(mission,worker,task)=>config.frontend==='subagent'?subagentPrompt(mission,worker,task):workerPrompt(mission,worker,config.frontend,task),agentDir,model:()=>roleModelString(config.workerRole),frontend:()=>config.frontend,customCommand:()=>config.customCommand});
  function policy(context:ExtensionContext){return {resumeHold,owned:!!ownership&&!ownershipError,nativePlan:nativePlan(context),fresh:!!snapshot&&!snapshot.error&&Date.now()-snapshot.fetchedAt<35000,maxWorkers:config.maxWorkers};}
  // A hint is attached once per distinct text. The action detail is always sent, so recovery does not depend on it.
  let guided='';
@@ -291,7 +291,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
      if(epoch!==generation||mission!==current)return;
     }
     await driver.reconcile(current,new Map(next.beads.map(bead=>[bead.id,bead])));
-    if(ctx&&ownership&&!resumeHold&&!ownershipError&&!nativePlan(ctx)&&!reviewChurnReason(current)){for(const worker of current.workers.filter(w=>w.state==='missing')){const bead=next.beads.find(b=>b.id===worker.beadId);if(bead)try{await driver.recover(current,worker.beadId,bead);}catch{/* claimed or not ready: stays held for the operator */}}}
+    if(ctx&&ownership&&!resumeHold&&!ownershipError&&!nativePlan(ctx)&&!reviewTriageAction(current)){for(const worker of current.workers.filter(w=>w.state==='missing')){const bead=next.beads.find(b=>b.id===worker.beadId);if(bead)try{await driver.recover(current,worker.beadId,bead);}catch{/* claimed or not ready: stays held for the operator */}}}
     if(epoch!==generation||mission!==current)return;
     const audit=selected&&!selected.startsWith('subagent:')&&next.beads.some(bead=>bead.id===selected)?selected:undefined;
     if(audit){try{history=await readHistory(run,current.workspace.cwd,audit,{BEADS_DIR:current.workspace.beadsDir??''});}catch{history=undefined;}}
@@ -392,7 +392,7 @@ async function finishMission(context:ExtensionContext){
  async function decision(context:ExtensionContext,verb:string,arg?:string){
   if(!mission)throw new Error('No active mission');if(nativePlan(context))throw new Error('Mission mutations are forbidden in native plan mode');
   if(verb==='mode'){const modes:Mode[]=['auto','pause','force'];const mode=z.enum(['auto','pause','force']).parse(arg??modes[(modes.indexOf(mission.mode)+1)%3]);setMode(mission,mode);if(resumeHold)inspectionIntent.mode=mode;}
-  else if(verb==='review'){if(reviewChurnReason(mission)){if(resumeHold||!ownership||ownershipError)throw new Error('Take controller ownership with /mission continue before acknowledging the review pause');await ownership.assertOwned();if(operation)throw new Error('Wait for the current operation before acknowledging the review pause');mission.reviewAcknowledged=mission.reviews.length;}mission.reviewRequested=true;if(mission.evidence.review?.outcome==='failed')delete mission.evidence.review;if(resumeHold)inspectionIntent.reviewRequested=true;}
+  else if(verb==='review'){if(reviewTriageAction(mission)?.kind==='hold'){if(resumeHold||!ownership||ownershipError)throw new Error('Take controller ownership with /mission continue before resolving the review escalation');await ownership.assertOwned();if(operation)throw new Error('Wait for the current operation before resolving the review escalation');if((await captureRevision(mission,run)).revision!==mission.reviews.at(-1)!.revision)throw new Error('Review revision changed; reverify/rereview');for(const finding of mission.reviews.at(-1)!.findings)if(!finding.rejection&&finding.triage?.disposition==='escalate')finding.triage={...finding.triage,disposition:'repair',detail:`Operator authorized another repair attempt after escalation. ${finding.triage.detail}`.slice(0,10_000)};}mission.reviewRequested=true;if(mission.evidence.review?.outcome==='failed')delete mission.evidence.review;if(resumeHold)inspectionIntent.reviewRequested=true;}
   else if(verb==='approve'){if(resumeHold)throw new Error('Resumed session is read-only: run /mission continue first, then /mission approve');if(!mission.gate)throw new Error('No gate is waiting for approval. /mission shows what is next');approveGate(mission,mission.gate.token);}
   if(ownership)await persist(mission);await render();
   if(!resumeHold&&ownership&&!operation&&(verb==='review'||verb==='approve')){
@@ -544,14 +544,15 @@ async function finishMission(context:ExtensionContext){
  const scopesSchema=z.record(z.string(),z.array(z.string()).min(1));
  pi.registerTool({name:'mission_status',defaultInactive:true,loadMode:'essential',label:'Mission status',description:'Inspect authoritative cached mission graph, hold, gates and next coordinator action.',approval:'read',parameters:z.object({}),execute:async(_id,_params,_signal,_update,context)=>{if(!eligible(context))throw new Error('Mission coordinator only');if(!operation)await refresh(false);return {content:[{type:'text',text:JSON.stringify(status(context))}],details:{}};}});
  const controlSchema=z.object({
-  operation:z.enum(['start','clear','continue','retry-model','bind_workspace','bind_graph','dispatch','check','record_check','record_verification','record_delivery','run_review','accept_repairs','bind_repairs','resend','release','reap','reject_finding']),
+  operation:z.enum(['start','clear','continue','retry-model','bind_workspace','bind_graph','dispatch','check','record_check','record_verification','record_delivery','run_review','triage_findings','accept_repairs','bind_repairs','resend','release','reap','reject_finding']),
   cwd:z.string().optional(),base:z.string().optional(),beadsDir:z.string().optional(),delivery:z.enum(['pr','local']).optional(),
   epicId:z.string().optional(),scopes:scopesSchema.optional(),repairLinks:z.record(z.string(),z.array(z.string())).optional(),
   beadId:z.string().optional(),detail:z.string().optional(),files:z.array(z.string()).max(50).optional().describe('resend only: extra workspace-relative paths the stopped subagent worker may edit'),passed:z.boolean().optional(),url:z.string().optional(),
   mode:z.enum(['auto','pause','force']).optional(),keep:z.boolean().optional(),findingId:z.string().optional(),
   checkState:z.enum(['clean','merged','closed','conflict','threads','checks','fixing','unknown']).optional(),
   conflicts:z.array(z.string()).max(200).optional(),threads:z.object({open:z.number().int().min(0),total:z.number().int().min(0)}).optional(),
-  model:z.string().min(1).max(1000).optional()
+  model:z.string().min(1).max(1000).optional(),
+  decisions:z.array(z.object({findingId:z.string().min(1).max(1000),disposition:z.enum(['repair','reject','escalate']),detail:z.string().trim().min(1).max(9000),previousFindingId:z.string().min(1).max(1000).optional()})).min(1).max(1000).optional()
  });
  async function control(rawParams:unknown,context:ExtensionContext,_signal?:AbortSignal,internal:{reuseOnly?:boolean;operator?:boolean}={}){
   const params=controlSchema.parse(rawParams);
@@ -626,7 +627,7 @@ async function finishMission(context:ExtensionContext){
    }
    else{
     if(!mission)throw new Error('No active mission');enforceMutation(mission,policy(context));await ownership!.assertOwned();
-    const churn=reviewChurnReason(mission);if(churn&&!['reject_finding','release','reap'].includes(params.operation))throw new Error(churn);
+    const triage=reviewTriageAction(mission);if(triage&&!['triage_findings','reject_finding','release','reap'].includes(params.operation))throw new Error(triage.detail);
     if(params.operation==='bind_workspace'){
      let {cwd,beadsDir,delivery,base}=params;let note='';
      if(!cwd){const isolated=await isolateCheckout(run,{source:mission.source,start:mission.workspace.cwd,base,delivery,create:!internal.reuseOnly});cwd=isolated.cwd;base??=isolated.base;delivery??=isolated.delivery;note=`${isolated.created?'created':'reusing'} ${cwd}`;}
@@ -698,9 +699,16 @@ async function finishMission(context:ExtensionContext){
      if (!result.findings.length) {
       await tryComplete(mission,{detail:'Verification, delivery and independent review complete',revision:result.revision,at:result.at});
      }
+    }else if(params.operation==='triage_findings'){
+     const review=mission.reviews.at(-1);
+     if(!review||(await captureRevision(mission,run)).revision!==review.revision)throw new Error('Review revision changed; reverify/rereview before triage');
+     triageFindings(mission,params.decisions??[]);
+     await refresh(false);
+     if(nextAction(mission,snapshot,policy(context)).kind==='complete')await tryComplete(mission,{detail:'All independent findings rejected with recorded evidence',revision:review.revision,at:new Date().toISOString()});
     }else if(params.operation==='accept_repairs'){
      const review = mission.reviews.at(-1);
      if (!review || review.invalidated || !review.findings.some(finding => !finding.rejection)) throw new Error('No actionable findings');
+     if(review.findings.some(finding=>!finding.rejection&&finding.triage?.disposition!=='repair'))throw new Error('Validate and triage every finding before accepting repairs');
      if ((await captureRevision(mission, run)).revision !== review.revision) throw new Error('Review revision changed; reverify/rereview');
      enforceGate(mission, revisionGate(mission, 'repairs', review.revision));
      const local = effectiveGraph(mission) === 'local';
@@ -724,6 +732,7 @@ async function finishMission(context:ExtensionContext){
      if (!review || !finding || !params.detail?.trim()) throw new Error('Finding and visible non-actionable explanation required');
      if ((await captureRevision(mission, run)).revision !== review.revision) throw new Error('Finding belongs to a changed revision');
      finding.rejection = params.detail;
+     finding.triage={disposition:'reject',detail:params.detail};
      const evidence: Evidence = {outcome:'passed',detail:'All independent findings explicitly rejected with recorded reasons',revision:review.revision,at:new Date().toISOString()};
      if (!review.findings.some(finding => !finding.rejection) && mission.evidence.repair?.outcome === 'active') {
       mission.evidence.repair = {...evidence, outcome:'skipped'};

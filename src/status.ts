@@ -47,6 +47,7 @@ export function statusView(input: Input) {
 	const brief = briefView(input);
 	if (!mission) return { ...brief, pending: pending ? { id: pending.id, source: pending.source.id, title: pending.source.title } : undefined };
 	const review = mission.reviews.at(-1);
+ const paths=new Set(review?.findings.map(finding=>finding.path));
 	return {
 		...brief,
 		mission: mission.id,
@@ -57,6 +58,7 @@ export function statusView(input: Input) {
 		evidence: Object.fromEntries(Object.entries(mission.evidence).map(([phase, item]) => [phase, item && `${item.outcome}: ${clip(item.detail, 160)}`])),
 		review: review && { round: review.round, summary: clip(review.summary, 300), invalidated: review.invalidated, findings: review.findings },
 		reviewRounds: mission.reviews.length,
+  priorFindings: mission.reviews.slice(-3,-1).filter(round=>!round.invalidated).flatMap(round=>round.findings.filter(finding=>paths.has(finding.path)).map(finding=>({id:finding.id,round:round.round,path:finding.path,title:finding.title,triage:finding.triage,rejection:finding.rejection,repairedBy:Object.keys(mission.repairLinks).filter(id=>mission.repairLinks[id]!.includes(finding.id))}))),
 		beads: snapshot?.beads.map(bead => `${bead.id} ${bead.category} ${clip(bead.title, 60)}`),
 		ready: snapshot?.ready,
 		closed: snapshot?.closed,

@@ -47,7 +47,14 @@ export function validateFinding(value: unknown): Finding {
   if (severity !== "critical" && severity !== "high" && severity !== "medium" && severity !== "low") invalid("finding.severity is unsupported");
   const line = row.line;
   if (!isPositiveSafeInteger(line)) invalid("finding.line must be a positive integer");
-  return { id: text(row.id, "finding.id", 1000), severity, path: text(row.path, "finding.path", 4000), line, title: text(row.title, "finding.title", 10_000), body: text(row.body, "finding.body", 50_000), ...(row.rejection === undefined ? {} : { rejection: text(row.rejection, "finding.rejection", 10_000) }), ...(row.beadId === undefined ? {} : { beadId: text(row.beadId, "finding.beadId", 1000) }) };
+  const finding: Finding = { id: text(row.id, "finding.id", 1000), severity, path: text(row.path, "finding.path", 4000), line, title: text(row.title, "finding.title", 10_000), body: text(row.body, "finding.body", 50_000), ...(row.rejection === undefined ? {} : { rejection: text(row.rejection, "finding.rejection", 10_000) }), ...(row.beadId === undefined ? {} : { beadId: text(row.beadId, "finding.beadId", 1000) }) };
+  if (row.triage !== undefined) {
+    const triage = object(row.triage, "finding.triage");
+    if (triage.disposition !== "repair" && triage.disposition !== "reject" && triage.disposition !== "escalate") invalid("finding.triage.disposition is unsupported");
+    if (triage.disposition === "reject" && !finding.rejection) invalid("rejected triage requires finding.rejection");
+    finding.triage = { disposition: triage.disposition, detail: text(triage.detail, "finding.triage.detail", 10_000), ...(triage.previousFindingId === undefined ? {} : { previousFindingId: text(triage.previousFindingId, "finding.triage.previousFindingId", 1000) }) };
+  }
+  return finding;
 }
 
 function validSource(value: unknown): Source {
@@ -143,10 +150,6 @@ export function validateMission(value: unknown): Mission {
   const missionId = text(row.id, "id", 1000);
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(missionId)) invalid("id contains unsafe path characters");
   const mission: Mission = { version: 1, id: missionId, source: validSource(row.source), workspace: validWorkspace(row.workspace), scopes, phase: row.phase as Phase, evidence, mode: row.mode as Mode, keep: row.keep, reviewRequested: row.reviewRequested, workers, reviews, repairLinks, round, createdAt: text(row.createdAt, "createdAt", 100), updatedAt: text(row.updatedAt, "updatedAt", 100) };
-  if (row.reviewAcknowledged !== undefined) {
-    if (!isNonNegativeSafeInteger(row.reviewAcknowledged) || row.reviewAcknowledged > reviews.length) invalid("reviewAcknowledged must be a completed-review count");
-    mission.reviewAcknowledged = row.reviewAcknowledged;
-  }
   if (reviewProgress !== undefined) mission.reviewProgress = reviewProgress;
   if (row.measurements !== undefined) {
     const raw = object(row.measurements, "measurements");

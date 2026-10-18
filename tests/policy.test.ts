@@ -1,5 +1,5 @@
 import {test,expect} from 'bun:test';
-import {nextAction,operatorStep,operatorCommands,modelRetryTargets,setMode,approveGate,enforceMutation,enforceGate,waveGate,terminalCapacity,QUOTA_BLOCKER,reviewChurnReason} from '../src/controller';
+import {nextAction,operatorStep,operatorCommands,modelRetryTargets,setMode,approveGate,enforceMutation,enforceGate,waveGate,terminalCapacity,QUOTA_BLOCKER,reviewTriageAction,triageFindings} from '../src/controller';
 import { validateMission } from '../src/store';
 import type {Mission,Snapshot,PolicyContext,ReviewRound} from '../src/types';
 export function fixture(): Mission {return {version:1,id:'freeform-test',source:{kind:'freeform',id:'test',title:'test',body:'test',comments:'',extra:''},workspace:{key:'key',cwd:'/tmp',delivery:'local'},epicId:'epic',scopes:{a:['a.ts'],b:['b.ts']},phase:'execute',evidence:{},mode:'auto',keep:false,reviewRequested:false,workers:[],reviews:[],repairLinks:{},round:1,createdAt:'now',updatedAt:'now'};}
@@ -15,7 +15,18 @@ test('stale reads never dispatch and plan blocks all mutations',()=>{const m=fix
 test('delivery without requested review is not complete',()=>{const m=fixture();m.evidence.verify={outcome:'passed',revision:'rev',detail:'actual',at:'now'};m.evidence.deliver={outcome:'passed',detail:'local',at:'now'};expect(nextAction(m,closed,policy).kind).toBe('hold');m.reviewRequested=true;expect(nextAction(m,closed,policy).kind).toBe('review');m.reviews=[{round:1,revision:'rev',model:'model',summary:'clean',findings:[],at:'now'}];expect(nextAction(m,closed,policy).kind).toBe('complete');});
 test('failed review holds until explicitly retried or a new revision is verified',()=>{const m=fixture();m.reviewRequested=true;m.evidence.verify={outcome:'passed',revision:'rev',detail:'Node assertions passed',at:'now'};m.evidence.deliver={outcome:'passed',revision:'rev',detail:'local',at:'now'};m.evidence.review={outcome:'failed',revision:'rev',detail:'Malformed reviewer JSON',at:'now'};expect(nextAction(m,closed,policy).kind).toBe('hold');delete m.evidence.review;expect(nextAction(m,closed,policy).kind).toBe('review');});
 test('empty graph cannot advance to verification or delivery',()=>{const m=fixture();expect(nextAction(m,{...ready,beads:[],leaves:[],ready:[]},policy).kind).toBe('hold');});
-test('Pause independently gates review entry and repair acceptance',()=>{const m=fixture();m.mode='pause';m.reviewRequested=true;m.evidence.verify={outcome:'passed',revision:'rev',detail:'Node assertions passed',at:'now'};m.evidence.deliver={outcome:'passed',revision:'rev',detail:'local',at:'now'};m.gate=nextAction(m,closed,policy).gate;expect(m.gate?.kind).toBe('review');approveGate(m,m.gate!.token);expect(nextAction(m,closed,policy).kind).toBe('review');m.reviews=[{round:1,revision:'rev',model:'independent',summary:'Defect',findings:[{id:'R1',severity:'high',path:'a.ts',line:1,title:'Boundary defect',body:'Boundary defect'}],at:'now'}];m.gate=nextAction(m,closed,policy).gate;expect(m.gate?.kind).toBe('repairs');approveGate(m,m.gate!.token);expect(nextAction(m,closed,policy).kind).toBe('repairs');});
+test('Pause independently gates review entry and triaged repair acceptance',()=>{
+ const m=fixture();m.mode='pause';m.reviewRequested=true;
+ m.evidence.verify={outcome:'passed',revision:'rev',detail:'Node assertions passed',at:'now'};
+ m.evidence.deliver={outcome:'passed',revision:'rev',detail:'local',at:'now'};
+ m.gate=nextAction(m,closed,policy).gate;expect(m.gate?.kind).toBe('review');
+ approveGate(m,m.gate!.token);expect(nextAction(m,closed,policy).kind).toBe('review');
+ m.reviews=[{round:1,revision:'rev',model:'independent',summary:'Defect',findings:[{id:'R1',severity:'high',path:'a.ts',line:1,title:'Boundary defect',body:'Boundary defect'}],at:'now'}];
+ expect(nextAction(m,closed,policy).kind).toBe('triage');
+ triageFindings(m,[{findingId:'R1',disposition:'repair',detail:'a.ts:1 violates the checked boundary'}]);
+ m.gate=nextAction(m,closed,policy).gate;expect(m.gate?.kind).toBe('repairs');
+ approveGate(m,m.gate!.token);expect(nextAction(m,closed,policy).kind).toBe('repairs');
+});
 
 test('failed verification holds all automatic work until explicitly continued',()=>{
  const m=fixture();m.graph='local';m.phase='verify';m.evidence.verify={outcome:'failed',revision:'rev',detail:'Remote build host unavailable',at:'now'};
@@ -219,46 +230,57 @@ function reviewRound(round:number,title=`Defect ${round}`):ReviewRound{
  return {round,revision:`rev-${round}`,model:'independent',summary:'Concrete defect',at:'now',findings:[{id:`r${round}`,path:'a.ts',line:round,title,body:'A consumer operation fails',severity:'high'}]};
 }
 
-test('review repair work stops after two unsuccessful cycles without losing findings',()=>{
- const m=fixture();m.reviewRequested=true;
- m.reviews=[reviewRound(1)];
- expect(nextAction(m,ready,policy).kind).toBe('dispatch');
- m.reviews.push(reviewRound(2));
- expect(nextAction(m,ready,policy).kind).toBe('dispatch');
- m.reviews.push(reviewRound(3));
- expect(nextAction(m,ready,policy)).toMatchObject({kind:'hold',detail:expect.stringContaining('Two repair cycles')});
- expect(operatorStep(m,nextAction(m,ready,policy),policy).command).toBe('/mission review');
- expect(operatorCommands(m,false,ready,policy)).not.toContain('dispatch');
- expect(m.reviews.flatMap(review=>review.findings).map(finding=>finding.rejection)).toEqual([undefined,undefined,undefined]);
- setMode(m,'force');
- expect(nextAction(m,ready,policy).kind).toBe('hold');
+test('triage validates every pending finding atomically and preserves confirmed defects',()=>{
+ const m=fixture();m.reviews=[reviewRound(1)];m.reviews[0]!.findings.push({...m.reviews[0]!.findings[0]!,id:'other',title:'Cosmetic suggestion',severity:'low'});
+ const before=structuredClone(m.reviews);
+ expect(()=>triageFindings(m,[{findingId:'r1',disposition:'repair',detail:'a.ts:1 reproduces a failed payment'}])).toThrow('exactly once');
+ expect(()=>triageFindings(m,[{findingId:'r1',disposition:'repair',detail:'a.ts:1 payment fails'},{findingId:'missing',disposition:'reject',detail:'Not in the spec'}])).toThrow('Invalid finding');
+ expect(m.reviews).toEqual(before);
+ triageFindings(m,[{findingId:'r1',disposition:'repair',detail:'a.ts:1 reproduces a failed payment'},{findingId:'other',disposition:'reject',detail:'a.ts:2 whitespace only; no observable behavior changes'}]);
+ const saved=validateMission(m);
+ expect(saved.reviews[0]!.findings[0]!.triage?.disposition).toBe('repair');
+ expect(saved.reviews[0]!.findings[0]!.rejection).toBeUndefined();
+ expect(saved.reviews[0]!.findings[1]).toMatchObject({triage:{disposition:'reject'},rejection:'a.ts:2 whitespace only; no observable behavior changes'});
 });
 
-test('repeated review findings stop the next repair even when labels and line numbers change',()=>{
- const m=fixture();m.reviews=[reviewRound(1,'Lost payment'),reviewRound(2,'  LOST   payment ')];
- expect(reviewChurnReason(m)).toContain('Repeated finding');
- m.reviews[0]!.findings[0]!.rejection='Not applicable: fixture is unreachable';
- expect(reviewChurnReason(m)).toBeUndefined();
- delete m.reviews[0]!.findings[0]!.rejection;
- m.reviews[0]!.invalidated='Source changed';
- expect(reviewChurnReason(m)).toBeUndefined();
+test('only a confirmed defect surviving two linked changed-revision repairs escalates',()=>{
+ const m=fixture();
+ for(let round=1;round<=3;round++){
+  m.reviews.push(reviewRound(round,'Lost payment'));
+  m.evidence.verify={outcome:'passed',revision:`rev-${round}`,detail:'Verified',at:'now'};
+  expect(reviewTriageAction(m)?.kind).toBe('triage');
+  triageFindings(m,[{findingId:`r${round}`,disposition:'repair',detail:'a.ts:1 distinct payment still fails'}]);
+  if(round<3){expect(reviewTriageAction(m)).toBeUndefined();m.repairLinks[`repair-${round}`]=[`r${round}`];}
+ }
+ expect(reviewTriageAction(m)?.kind).toBe('hold');
+ expect(m.reviews.at(-1)!.findings[0]!.triage).toMatchObject({disposition:'escalate',detail:expect.stringContaining('2 linked repair attempts')});
+ expect(m.reviews.at(-1)!.findings[0]!.rejection).toBeUndefined();
 });
 
-test('clean and rejected reviews can finish while acknowledged churn gets a bounded new window',()=>{
- const m=fixture();m.reviews=[reviewRound(1),reviewRound(2),reviewRound(3)];
- m.reviewAcknowledged=m.reviews.length;
- const restored=validateMission(m);
- expect(restored.reviewAcknowledged).toBe(3);
- expect(reviewChurnReason(restored)).toBeUndefined();
- restored.reviews.push(reviewRound(4));
- expect(reviewChurnReason(restored)).toBeUndefined();
- restored.reviews.push(reviewRound(5));
- expect(reviewChurnReason(restored)).toContain('Two repair cycles');
- restored.reviews.at(-1)!.findings[0]!.rejection='Specification explicitly requires this behavior';
- expect(reviewChurnReason(restored)).toBeUndefined();
- restored.reviews.at(-1)!.findings=[];
- expect(reviewChurnReason(restored)).toBeUndefined();
- expect(()=>validateMission({...restored,reviewAcknowledged:6})).toThrow('reviewAcknowledged');
+test('new findings and unattempted historical suggestions do not trigger a round-count pause',()=>{
+ const m=fixture();m.reviews=Array.from({length:20},(_,i)=>reviewRound(i+1,'Lost payment'));
+ m.evidence.verify={outcome:'passed',revision:'rev-20',detail:'Verified',at:'now'};
+ triageFindings(m,[{findingId:'r20',disposition:'repair',detail:'a.ts:1 confirmed failure; earlier suggestions were never validated or repaired'}]);
+ expect(reviewTriageAction(m)).toBeUndefined();
+ m.reviews.at(-1)!.findings=[];
+ expect(reviewTriageAction(m)).toBeUndefined();
+});
+
+test('renamed recurring defects use explicit lineage and invalidated or unchanged reviews are not failed repairs',()=>{
+ const m=fixture();m.reviews=[reviewRound(1,'Lost payment')];
+ triageFindings(m,[{findingId:'r1',disposition:'repair',detail:'a.ts:1 payment lost'}]);m.repairLinks.first=['r1'];
+ m.reviews.push(reviewRound(2,'Renamed payment defect'));
+ triageFindings(m,[{findingId:'r2',disposition:'repair',detail:'a.ts:2 same root cause',previousFindingId:'r1'}]);m.repairLinks.second=['r2'];
+ m.reviews.push(reviewRound(3,'Second rename'));m.evidence.verify={outcome:'passed',revision:'rev-3',detail:'Verified',at:'now'};
+ triageFindings(m,[{findingId:'r3',disposition:'repair',detail:'a.ts:3 same root cause survives',previousFindingId:'r2'}]);
+ expect(reviewTriageAction(m)?.kind).toBe('hold');
+ const unchanged=fixture();unchanged.reviews=[reviewRound(1,'Lost payment'),reviewRound(2,'Lost payment'),reviewRound(3,'Lost payment')];
+ for(const review of unchanged.reviews.slice(0,2)){review.revision='rev-3';review.findings[0]!.triage={disposition:'repair',detail:'a.ts:1 confirmed'};unchanged.repairLinks[`repair-${review.round}`]=[review.findings[0]!.id];}
+ triageFindings(unchanged,[{findingId:'r3',disposition:'repair',detail:'a.ts:1 no changed revision was ever reviewed'}]);
+ expect(unchanged.reviews.at(-1)!.findings[0]!.triage?.disposition).toBe('repair');
+ const invalidated=structuredClone(m);invalidated.reviews[0]!.invalidated='Source changed';delete invalidated.reviews.at(-1)!.findings[0]!.triage;
+ triageFindings(invalidated,[{findingId:'r3',disposition:'repair',detail:'a.ts:3 only one valid failed repair remains',previousFindingId:'r2'}]);
+ expect(invalidated.reviews.at(-1)!.findings[0]!.triage?.disposition).toBe('repair');
 });
 
 test('waves serialize overlapping scopes and do not overlap an existing worker',()=>{
@@ -270,4 +292,13 @@ test('waves serialize overlapping scopes and do not overlap an existing worker',
  expect(nextAction(m,ready,policy).ids).toEqual(['b']);
  m.workers[0]!.state='closed';m.scopes.b=['shared/file.ts'];
  expect(nextAction(m,ready,policy).ids).toEqual(['a']);
+});
+
+test('an unsuccessful review window wakes coordinator triage instead of parking indefinitely',()=>{
+ const m=fixture();m.reviewRequested=true;
+ m.reviews=[reviewRound(1),reviewRound(2),reviewRound(3)];
+ m.evidence.verify={outcome:'passed',revision:'rev-3',detail:'Verified current output',at:'now'};
+ m.evidence.deliver={outcome:'passed',revision:'rev-3',detail:'Delivered current output',at:'now'};
+ expect(nextAction(m,closed,policy).kind).toBe('triage');
+ expect(m.reviews.at(-1)!.findings[0]!.rejection).toBeUndefined();
 });

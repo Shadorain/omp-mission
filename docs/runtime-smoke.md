@@ -8,7 +8,7 @@ Use a throwaway agent dir so real missions and `mission.json` are untouched:
 
 1. Make a temp root with a `workspace/` directory.
 2. Write a `mission.json` and a mission file under `<root>/missions/<workspace-key>/` using `saveMission` and `missionPath`.
-3. Create a session with `SessionManager.create(cwd, <root>/sessions)` and append a `mission:pointer` custom entry holding the mission path. Resume it, so the extension attaches.
+3. Create a session with `SessionManager.create(cwd, <root>/sessions)` and append a `mission:pointer` custom entry holding the mission path. Await `ensureOnDisk()` and `close()` before resuming it, so the file exists and the seed process releases its write lease.
 4. Run OMP with `PI_CODING_AGENT_DIR=<root>`, `--no-extensions -e <repo>/index.ts`, and no tools or LSP.
 
 ## Drive and read (Orca)
@@ -34,6 +34,7 @@ Use an isolated deterministic provider to emit actual native tool calls; do not 
 - While verification is held, attempt model `record_verification passed=true` and `continue`; both must fail. An operator `/mission continue` resets verification to pending.
 - Restore incomplete quota and deadline reviews. Read the actual widget and inspector: quota requires funding first; deadlines offer retry; completed and failed rows survive without a finalized round.
 - Seed `round: 1` with multiple scoped beads. Let one target finish and make integration return invalid JSON twice. Confirm a saved completed target plus failure, without a finalized round. Restart OMP, release its resume hold, and retry with a valid reply carrying the requested `reviewedRevision`, `summary`, and `findings`. Compare provider calls and transcript paths: the completed reviewer must not run again; successful finalization clears partial progress. Classify fixture targets from their input (`bead` versus `beads`), not only the legacy flat `Context.systemPrompt`.
+- Restore a late-round review with untriaged findings. Have the deterministic provider call native `accept_repairs` before triage (refused), then `triage_findings` with one confirmed defect and one evidence-backed rejection, then `accept_repairs` again in Pause (approval required). Check persisted decisions and the unapproved repair gate. Approve through the operator socket and confirm repair starts with verification invalidated. Do not approve the gate through the model or edit the saved mission to advance it.
 
 ## Worker transport
 

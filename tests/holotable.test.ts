@@ -12,6 +12,7 @@ import { buildContactStatus, gateTokenId, autostartMessage, envBase, envCheckout
 import { planSlug } from '../src/prompts';
 import type { Mission } from '../src/types';
 import { QUOTA_BLOCKER } from '../src/controller';
+import { captureRevision } from '../src/review';
 
 type Handler = (event: unknown, context: ExtensionContext) => Promise<any>;
 const roots: string[] = [];
@@ -130,14 +131,17 @@ function socketName(missionId: string): string {
 	return `${createHash('sha256').update(missionId).digest('hex').slice(0, 12)}-${process.pid}.sock`;
 }
 
-test('review convergence holds survive automatic continue and only operator review acknowledges them',async()=>{
- const mission=baseMission('/tmp',{phase:'repair',reviewRequested:true,reviews:[1,2,3].map(round=>({round,revision:`rev-${round}`,model:'independent',at:'now',summary:'Defect',findings:[{id:`f${round}`,severity:'high' as const,path:'task.ts',line:round,title:`Defect ${round}`,body:'A consumer workflow fails'}]}))});
+test('only an evidence-backed escalation parks review and Continue cannot release it',async()=>{
+ const mission=baseMission('/tmp',{phase:'review',reviewRequested:true});
+ const {revision}=await captureRevision(mission,async()=>{throw new Error('Unexpected command');});
+ mission.evidence.verify={outcome:'passed',revision,detail:'Verified output',at:'now'};
+ mission.evidence.deliver={...mission.evidence.verify,detail:'Delivered output'};
+ mission.reviews=[{round:1,revision,model:'independent',at:'now',summary:'Defect',findings:[{id:'f',severity:'high',path:'task.ts',line:1,title:'Unresolved defect',body:'A consumer workflow fails',triage:{disposition:'escalate',detail:'task.ts:1 confirmed defect survives prior repair attempts'}}]}];
  const run=await session({mission,child:true});
  try{
   const status=await statusOf(run,mission);
   expect(status.hold).toBe('resume');
-  expect(status.problem?.source).toBe('convergence');
-  expect(status.actions).not.toContain('dispatch');
+  expect(status.problem?.source).toBe('triage');
   const socket=status.ctl!.socket;
   expect((await ctl(socket,{v:1,op:'continue',operator:true})).ok).toBe(true);
   const continued=await statusOf(run,mission);
@@ -147,9 +151,27 @@ test('review convergence holds survive automatic continue and only operator revi
   expect((await ctl(socket,{v:1,op:'review'})).ok).toBe(false);
   expect((await ctl(socket,{v:1,op:'review',operator:true})).ok).toBe(true);
   const saved=(await listMissions(run.root))[0]!.mission;
-  expect(saved.reviewAcknowledged).toBe(3);
-  expect(saved.reviews).toEqual(mission.reviews);
+  expect(saved.reviews[0]!.findings[0]!.triage).toMatchObject({disposition:'repair',detail:expect.stringContaining('Operator authorized')});
+  expect(saved.reviews[0]!.findings[0]!.rejection).toBeUndefined();
   expect((await statusOf(run,mission)).hold).toBe('none');
+ }finally{await run.event('session_shutdown',{});}
+});
+
+test('untriaged findings wake the coordinator and do not appear as a blocked review',async()=>{
+ const mission=baseMission('/tmp',{phase:'review',reviewRequested:true});
+ const {revision}=await captureRevision(mission,async()=>{throw new Error('Unexpected command');});
+ mission.evidence.verify={outcome:'passed',revision,detail:'Verified output',at:'now'};
+ mission.evidence.deliver={...mission.evidence.verify,detail:'Delivered output'};
+ mission.reviews=[{round:1,revision,model:'independent',at:'now',summary:'Defect',findings:[{id:'f',severity:'high',path:'task.ts',line:1,title:'Payment defect',body:'A consumer workflow fails'}]}];
+ const run=await session({mission,child:true});
+ try{
+  const initial=await statusOf(run,mission);
+  expect((await ctl(initial.ctl!.socket,{v:1,op:'continue',operator:true})).ok).toBe(true);
+  const status=await statusOf(run,mission);
+  expect(status.hold).toBe('none');
+  expect(status.problem).toBeNull();
+  expect(status.actions).not.toContain('review');
+  expect(run.sent.at(-1)).toContain('Next: triage');
  }finally{await run.event('session_shutdown',{});}
 });
 

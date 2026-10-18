@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { Action, Gate, Graph, Mission, Mode, Phase, PolicyContext, Snapshot, Step } from './types';
+import type { Action, FindingDecision, FindingTriage, Gate, Graph, Mission, Mode, Phase, PolicyContext, Snapshot, Step } from './types';
 import { scopesOverlap } from './scope';
 export function token(value: unknown): string { return createHash('sha256').update(JSON.stringify(value)).digest('hex'); }
 const quotaHold = /quota.{0,80}exhausted|insufficient.{0,40}(?:credits|balance|funds)|usage[_ -]?limit|usage_limit_reached|run out of credits|out of credits|out of (?:extra )?usage|spending[- ]?limit|personal-team-blocked|requires more credits|more credits, or fewer max_tokens/i;
@@ -91,17 +91,43 @@ export function verificationParked(m: Mission): boolean {
  return m.evidence.verify?.outcome==='failed' && (m.mode==='pause' || effectiveGraph(m)==='local');
 }
 export function approveGate(m: Mission, expected: string): void { if(!m.gate || m.gate.token!==expected)throw new Error('Approval scope changed; inspect the current gate'); m.gate.approved=true; }
-export function reviewChurnReason(m: Mission): string | undefined {
- if(m.phase==='complete'||m.reviews.at(-1)?.invalidated||(m.reviewAcknowledged??0)>=m.reviews.length)return undefined;
- const rounds=m.reviews.slice(Math.max(0,(m.reviewAcknowledged??0)-1)).filter(review=>!review.invalidated);
- const latest=rounds.at(-1);
- if(!latest||!latest.findings.some(finding=>!finding.rejection))return undefined;
- const previous=rounds.at(-2);
- const key=(finding:typeof latest.findings[number])=>JSON.stringify([finding.path,finding.title.trim().toLowerCase().replace(/\s+/g,' ')]);
- const prior=new Set(previous?.findings.filter(finding=>!finding.rejection).map(key));
- const repeated=latest.findings.find(finding=>!finding.rejection&&prior.has(key(finding)));
- const reason=repeated?`Repeated finding: ${repeated.title} (${repeated.path})`:rounds.length>=3?'Two repair cycles have not produced a clean review':undefined;
- return reason?`Review paused: ${reason}. Inspect findings and repair evidence, then explicitly /mission review to authorize another bounded cycle`:undefined;
+export function reviewTriageAction(m: Mission): Action | undefined {
+ const review=m.reviews.at(-1);
+ if(m.phase==='complete'||!review||review.invalidated||m.evidence.verify?.outcome!=='passed'||m.evidence.verify.revision!==review.revision)return undefined;
+ const open=review.findings.filter(finding=>!finding.rejection);
+ const escalated=open.filter(finding=>finding.triage?.disposition==='escalate');
+ if(escalated.length)return {kind:'hold',detail:`Review escalation: ${escalated.map(finding=>`${finding.id}: ${finding.triage!.detail}`).join('; ')}. Operator inspection required; /mission review explicitly authorizes another repair attempt`};
+ const pending=open.filter(finding=>!finding.triage);
+ return pending.length?{kind:'triage',ids:pending.map(finding=>finding.id),detail:`Validate ${pending.length} review finding${pending.length===1?'':'s'} against the requirements, current code and prior repair evidence; record evidence-based repair, reject or escalate decisions before creating repair work`}:undefined;
+}
+export function triageFindings(m: Mission, decisions: readonly FindingDecision[]): void {
+ const review=m.reviews.at(-1);
+ if(m.phase==='complete'||!review||review.invalidated)throw new Error('No current independent findings to triage');
+ if(review.findings.some(finding=>!finding.rejection&&finding.triage?.disposition==='escalate'))throw new Error('An escalated finding requires an operator decision');
+ const pending=review.findings.filter(finding=>!finding.rejection&&!finding.triage);
+ if(!pending.length||decisions.length!==pending.length||new Set(decisions.map(decision=>decision.findingId)).size!==pending.length)throw new Error('Triage must decide every pending finding exactly once');
+ const history=m.reviews.slice(0,-1).filter(round=>!round.invalidated);
+ const prepared=decisions.map(decision=>{
+  const finding=pending.find(finding=>finding.id===decision.findingId);
+  if(!finding||!decision.detail.trim()||decision.detail.length>9000||!['repair','reject','escalate'].includes(decision.disposition))throw new Error(`Invalid finding decision: ${decision.findingId}`);
+  if(decision.previousFindingId&&!history.some(round=>round.findings.some(prior=>prior.id===decision.previousFindingId&&!prior.rejection&&prior.triage?.disposition==='repair')))throw new Error(`Previous confirmed finding missing: ${decision.previousFindingId}`);
+  let predecessor=decision.previousFindingId;
+  let nextRevision=review.revision;
+  let path=finding.path;
+  let title=finding.title.trim().toLowerCase().replace(/\s+/g,' ');
+  let attempts=0;
+  for(let index=history.length-1;index>=0;index--){
+   const round=history[index]!;
+   const prior=round.findings.find(prior=>!prior.rejection&&(predecessor?prior.id===predecessor:prior.path===path&&prior.title.trim().toLowerCase().replace(/\s+/g,' ')===title));
+   if(!prior)continue;
+   if(prior.triage?.disposition!=='repair'||round.revision===nextRevision||!Object.values(m.repairLinks).some(links=>links.includes(prior.id)))break;
+   attempts++;predecessor=prior.triage.previousFindingId;nextRevision=round.revision;path=prior.path;title=prior.title.trim().toLowerCase().replace(/\s+/g,' ');
+  }
+  const escalate=decision.disposition==='repair'&&attempts>=2;
+  const triage:FindingTriage={disposition:escalate?'escalate':decision.disposition,detail:escalate?`Confirmed defect survived ${attempts} linked repair attempts. ${decision.detail}`:decision.detail,...(decision.previousFindingId?{previousFindingId:decision.previousFindingId}:{})};
+  return {finding,triage};
+ });
+ for(const {finding,triage} of prepared){finding.triage=triage;if(triage.disposition==='reject')finding.rejection=triage.detail;}
 }
 export function enforceMutation(m: Mission, p: PolicyContext): void {
  if(p.nativePlan)throw new Error('Mission mutations are forbidden in native plan mode');
@@ -137,7 +163,7 @@ export function nextAction(m: Mission, snapshot: Snapshot | undefined, policy: P
  if (policy.resumeHold) return {kind: 'hold', detail: 'Resumed inspection; continue explicitly'};
  if (!policy.owned) return {kind: 'hold', detail: 'Controller ownership required'};
  if (m.blocker) return {kind: 'hold', detail: m.blocker};
- const churn=reviewChurnReason(m);if(churn)return {kind:'hold',detail:churn};
+ const triage=reviewTriageAction(m);if(triage&&(effectiveGraph(m)==='local'||(policy.fresh&&snapshot&&!snapshot.error)))return triage;
  if(verificationParked(m))return {kind:'hold',detail:`Verification failed; stop. /mission continue releases the hold. Then bind an unbound repair leaf, or create one, and dispatch it. Do not record verification until that leaf closes: ${m.evidence.verify!.detail}`};
 
  const local = effectiveGraph(m) === 'local';
@@ -217,7 +243,7 @@ export function nextAction(m: Mission, snapshot: Snapshot | undefined, policy: P
 }
 export function modelRetryTargets(m: Mission, snapshot: Snapshot | undefined, p: PolicyContext) {
  if (m.phase === 'complete' || p.nativePlan || p.resumeHold || !p.owned || m.evidence.verify?.outcome === 'failed' || m.gate && !m.gate.approved) return undefined;
- if(reviewChurnReason(m))return undefined;
+ if(reviewTriageAction(m))return undefined;
  if (effectiveGraph(m) === 'beads' && (!p.fresh || !snapshot || snapshot.error)) return undefined;
  const coordinator = isProviderBlocker(m.blocker);
  if (m.blocker && !coordinator) return undefined;
@@ -249,7 +275,7 @@ export function operatorCommands(m: Mission | undefined, pending: boolean, snaps
  if (worker?.handle && worker.state !== 'closed' && ['orca', 'herdr'].includes(worker.frontend ?? 'orca')) commands.push(`focus ${worker.beadId}`);
  if (!m || m.phase === 'complete' || p.nativePlan || operation) return commands;
  if (p.resumeHold || !p.owned || m.evidence.verify?.outcome==='failed' || isProviderBlocker(m.blocker)) commands.push('continue');
- if(reviewChurnReason(m)){if(p.owned&&!p.resumeHold&&!m.blocker)commands.push('review');return commands;}
+ const triage=reviewTriageAction(m);if(triage){if(triage.kind==='hold'&&p.owned&&!p.resumeHold&&!m.blocker)commands.push('review');return commands;}
  commands.push('mode');
  // A scheduled automatic retry is the extension's step, so the operator is not asked for it.
  if (m.evidence.deliver?.outcome === 'passed' && m.evidence.verify?.outcome !== 'failed' && !m.blocker &&
@@ -283,7 +309,7 @@ export function operatorStep(m: Mission, action: Action, p: PolicyContext, owner
  if (p.nativePlan) return {text: m.phase === 'plan' ? 'Approve the plan to start the mission' : 'Plan mode is read-only; leave plan mode to continue'};
  if (ownershipError) return {command: '/mission continue', text: `Lost control of the mission (${ownershipError}); take it back`};
  if (p.resumeHold) return {command: '/mission continue', text: 'Take control of this resumed mission'};
- const churn=reviewChurnReason(m);if(churn)return {command:'/mission review',text:churn};
+ const triage=reviewTriageAction(m);if(triage?.kind==='hold')return {command:'/mission review',text:triage.detail};
  if (action.gate) return {command: '/mission approve', text: action.gate.detail};
  if (m.blocker) return {command: isProviderBlocker(m.blocker) ? '/mission continue' : '/mission', text: m.blocker};
  if(verificationParked(m))return {command:'/mission continue',text:`Verification blocked: ${m.evidence.verify!.detail}. Continue releases the hold so the fix can be bound and dispatched; it does not mark the blocker fixed`};

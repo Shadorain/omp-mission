@@ -88,7 +88,7 @@ export function parseReview(text: string, revision: string): Pick<ReviewRound,'r
   const finding = validateFinding(value);
   if (ids.has(finding.id)) throw new Error('Duplicate review finding');
   ids.add(finding.id);
-  const {rejection: _rejection, ...actionable} = finding;
+  const {rejection: _rejection, triage: _triage, ...actionable} = finding;
   findings.push(actionable);
  }
  return {revision,summary,findings};
@@ -200,7 +200,7 @@ function priorDecisions(m: Mission, files: readonly string[]) {
   const repairs=Object.keys(m.repairLinks).filter(id=>m.repairLinks[id]!.includes(finding.id));
   const status=finding.rejection!==undefined?'rejected':repairs.length?'accepted-repair-decision':'open';
   return {id:finding.id,round:review.round,path:finding.path,line:finding.line,title:finding.title,body:finding.body,status,
-   ...(repairs.length?{repairedBy:repairs}:{}) ,...(finding.rejection===undefined?{}:{rejection:finding.rejection})};
+   ...(repairs.length?{repairedBy:repairs}:{}),...(finding.triage?{triage:finding.triage}:{}),...(finding.rejection===undefined?{}:{rejection:finding.rejection})};
  }));
 }
 export type ReviewSession = Pick<AgentSession, 'prompt' | 'dispose' | 'state'>;
@@ -273,7 +273,8 @@ export class Reviewer {
   const hashes:Record<string,string>={};
   for(const target of targets)hashes[target.id]=await scopeHash(m.workspace.cwd,owned(target));
   const first=!previous?.beads;
-  const changed=targets.filter(target=>first||previous!.beads![target.id]!==hashes[target.id]);
+  const unresolved=new Set(previous?.findings.filter(finding=>!finding.rejection).map(finding=>claim(finding.path)?.id).filter((id):id is string=>!!id));
+  const changed=targets.filter(target=>first||previous!.beads![target.id]!==hashes[target.id]||unresolved.has(target.id));
   const integrate=first||!changed.length||changed.some(target=>!owned(target).length);
   const from=await diffBase(m,run);
   type TargetResult=Pick<ReviewRound,'summary'|'findings'>&{file?:string};
