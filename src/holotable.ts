@@ -5,7 +5,7 @@ import { createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import type { ExtensionContext, PlanReviewChoice } from '@oh-my-pi/pi-coding-agent';
-import { deliverUrl, displayPhase, effectiveGraph, modelRetryTargets, operatorCommands, providerCapacity, quotaBlocked, reviewRetryAt } from './controller';
+import { deliverUrl, displayPhase, effectiveGraph, modelRetryTargets, operatorCommands, providerCapacity, quotaBlocked, reviewChurnReason, reviewRetryAt } from './controller';
 import { isRecord } from './guards';
 import { displaySourceId } from './sources';
 import { missionDirectory } from './store';
@@ -32,10 +32,11 @@ function missionProblem(m: Mission, graphError?: string): MissionProblem | null 
  if (m.phase === 'complete') return null;
  const review = m.evidence.review;
  const worker = m.workers.find(w => w.state !== 'closed' && w.error);
- const source = graphError ? 'graph' : m.blocker ? 'coordinator'
+ const churn=reviewChurnReason(m);
+ const source = graphError ? 'graph' : m.blocker ? 'coordinator' : churn ? 'convergence'
   : review?.outcome === 'failed' ? 'review' : worker ? 'worker'
   : m.evidence.verify?.outcome === 'failed' ? 'verification' : undefined;
- const detail = graphError ?? m.blocker ?? (source === 'review' ? review!.detail : worker?.error ?? (source === 'verification' ? m.evidence.verify!.detail : undefined));
+ const detail = graphError ?? m.blocker ?? churn ?? (source === 'review' ? review!.detail : worker?.error ?? (source === 'verification' ? m.evidence.verify!.detail : undefined));
  if (!source || !detail) return null;
  const capacity = providerCapacity(detail);
  const retry = source === 'review' ? reviewRetryAt(m) : undefined;
@@ -309,10 +310,12 @@ export async function buildContactStatus(input: StatusInput): Promise<ContactSta
 	// An unreadable bead graph stops the controller (nextAction holds on snapshot.error) even though no blocker is saved.
 	const graphDown = phase !== 'complete' && !!m.epicId && effectiveGraph(m) === 'beads' && !!input.snapshot?.error;
 	const question = phase !== 'complete' ? input.question : undefined;
+ const churn=reviewChurnReason(m);
 	const hold = question ? 'question'
 		: quotaBlocked(m) ? 'quota'
 		: input.pending ? (m.blocker ? 'blocked' : 'plan-approval')
 		: input.resumeHold && phase !== 'complete' ? 'resume'
+  : churn ? 'blocked'
 		: m.gate ? 'gate'
 		: m.blocker || graphDown ? 'blocked'
 		: 'none';
@@ -329,6 +332,7 @@ export async function buildContactStatus(input: StatusInput): Promise<ContactSta
 	const branch = m.workspace.branch ?? null;
 	const next = question ? `Answer in mission: ${question}`.replace(/\s+/g, ' ').slice(0, 240)
 		: m.blocker ? m.blocker.replace(/\s+/g, ' ').slice(0, 240)
+  : churn && !input.resumeHold ? churn.slice(0,240)
 		: input.step ? `${input.step.command ? `${input.step.command} — ` : ''}${input.step.text}`.replace(/\s*\n\s*/g, ' ').slice(0, 240) : null;
  const measured=m.measurements;
  const latest=m.reviews.at(-1);

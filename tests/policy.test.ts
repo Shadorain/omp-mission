@@ -1,6 +1,7 @@
 import {test,expect} from 'bun:test';
-import {nextAction,operatorStep,operatorCommands,modelRetryTargets,setMode,approveGate,enforceMutation,enforceGate,waveGate,terminalCapacity,QUOTA_BLOCKER} from '../src/controller';
-import type {Mission,Snapshot,PolicyContext} from '../src/types';
+import {nextAction,operatorStep,operatorCommands,modelRetryTargets,setMode,approveGate,enforceMutation,enforceGate,waveGate,terminalCapacity,QUOTA_BLOCKER,reviewChurnReason} from '../src/controller';
+import { validateMission } from '../src/store';
+import type {Mission,Snapshot,PolicyContext,ReviewRound} from '../src/types';
 export function fixture(): Mission {return {version:1,id:'freeform-test',source:{kind:'freeform',id:'test',title:'test',body:'test',comments:'',extra:''},workspace:{key:'key',cwd:'/tmp',delivery:'local'},epicId:'epic',scopes:{a:['a.ts'],b:['b.ts']},phase:'execute',evidence:{},mode:'auto',keep:false,reviewRequested:false,workers:[],reviews:[],repairLinks:{},round:1,createdAt:'now',updatedAt:'now'};}
 const ready:Snapshot={beads:[{id:'a',title:'a',status:'open',children:[],ready:true,category:'ready'},{id:'b',title:'b',status:'open',children:[],ready:true,category:'ready'}],leaves:[],ready:['a','b'],closed:0,active:0,blocked:0,fetchedAt:Date.now()};ready.leaves=ready.beads;
 const policy:PolicyContext={resumeHold:false,owned:true,nativePlan:false,fresh:true,maxWorkers:2};
@@ -212,4 +213,61 @@ test('model recovery respects holds and targets only failed owned subagents',()=
  delete m.evidence.verify;
  m.blocker='Unrelated ownership conflict';
  expect(modelRetryTargets(m,active,policy)).toBeUndefined();
+});
+
+function reviewRound(round:number,title=`Defect ${round}`):ReviewRound{
+ return {round,revision:`rev-${round}`,model:'independent',summary:'Concrete defect',at:'now',findings:[{id:`r${round}`,path:'a.ts',line:round,title,body:'A consumer operation fails',severity:'high'}]};
+}
+
+test('review repair work stops after two unsuccessful cycles without losing findings',()=>{
+ const m=fixture();m.reviewRequested=true;
+ m.reviews=[reviewRound(1)];
+ expect(nextAction(m,ready,policy).kind).toBe('dispatch');
+ m.reviews.push(reviewRound(2));
+ expect(nextAction(m,ready,policy).kind).toBe('dispatch');
+ m.reviews.push(reviewRound(3));
+ expect(nextAction(m,ready,policy)).toMatchObject({kind:'hold',detail:expect.stringContaining('Two repair cycles')});
+ expect(operatorStep(m,nextAction(m,ready,policy),policy).command).toBe('/mission review');
+ expect(operatorCommands(m,false,ready,policy)).not.toContain('dispatch');
+ expect(m.reviews.flatMap(review=>review.findings).map(finding=>finding.rejection)).toEqual([undefined,undefined,undefined]);
+ setMode(m,'force');
+ expect(nextAction(m,ready,policy).kind).toBe('hold');
+});
+
+test('repeated review findings stop the next repair even when labels and line numbers change',()=>{
+ const m=fixture();m.reviews=[reviewRound(1,'Lost payment'),reviewRound(2,'  LOST   payment ')];
+ expect(reviewChurnReason(m)).toContain('Repeated finding');
+ m.reviews[0]!.findings[0]!.rejection='Not applicable: fixture is unreachable';
+ expect(reviewChurnReason(m)).toBeUndefined();
+ delete m.reviews[0]!.findings[0]!.rejection;
+ m.reviews[0]!.invalidated='Source changed';
+ expect(reviewChurnReason(m)).toBeUndefined();
+});
+
+test('clean and rejected reviews can finish while acknowledged churn gets a bounded new window',()=>{
+ const m=fixture();m.reviews=[reviewRound(1),reviewRound(2),reviewRound(3)];
+ m.reviewAcknowledged=m.reviews.length;
+ const restored=validateMission(m);
+ expect(restored.reviewAcknowledged).toBe(3);
+ expect(reviewChurnReason(restored)).toBeUndefined();
+ restored.reviews.push(reviewRound(4));
+ expect(reviewChurnReason(restored)).toBeUndefined();
+ restored.reviews.push(reviewRound(5));
+ expect(reviewChurnReason(restored)).toContain('Two repair cycles');
+ restored.reviews.at(-1)!.findings[0]!.rejection='Specification explicitly requires this behavior';
+ expect(reviewChurnReason(restored)).toBeUndefined();
+ restored.reviews.at(-1)!.findings=[];
+ expect(reviewChurnReason(restored)).toBeUndefined();
+ expect(()=>validateMission({...restored,reviewAcknowledged:6})).toThrow('reviewAcknowledged');
+});
+
+test('waves serialize overlapping scopes and do not overlap an existing worker',()=>{
+ const m=fixture();m.scopes={a:['shared'],b:['shared/file.ts']};
+ expect(nextAction(m,ready,policy).ids).toEqual(['a']);
+ m.workers=[{beadId:'a',attempt:'1',cwd:'/tmp',files:['shared'],state:'running',assignment:'repair'}];
+ expect(nextAction(m,ready,policy).kind).toBe('hold');
+ m.scopes.b=['separate.ts'];
+ expect(nextAction(m,ready,policy).ids).toEqual(['b']);
+ m.workers[0]!.state='closed';m.scopes.b=['shared/file.ts'];
+ expect(nextAction(m,ready,policy).ids).toEqual(['a']);
 });

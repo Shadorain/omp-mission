@@ -152,12 +152,16 @@ A requested review starts in the extension without a coordinator model turn when
 
 A malformed reviewer reply is sent back once in the same session with the reason. A reply that remains invalid fails the round with `[bead-id] <reason>`. Reviewers are instructed to use the full mission requirements and recorded repair/rejection decisions, and exclude cosmetic-only findings. Repair history does not silently settle distinct defects at the same location.
 
+Review/repair work stops for operator inspection after two unsuccessful repair cycles, or sooner when consecutive reviews repeat a finding at the same path with the same normalized title. Findings, repair links and completed reviewer results are retained; nothing is silently rejected or approved. The board shows **blocked** with the convergence reason. Inspect the findings and repair evidence, then explicitly run `/mission review` (or click Review) to authorize another bounded cycle. `/mission continue`, Force mode, automatic recovery, and restarting OMP do not acknowledge this pause. Resume ownership first if needed. A clean latest review can still complete normally.
+
 Each completed per-bead or integration result is checkpointed immediately. A timeout or another target's failure leaves the round incomplete, not clean. Retry reuses finished results only when the round, revision, model, prompt, inputs, and context still match. Valid finished results remain in the first retry checkpoint, even while earlier unfinished targets occupy every reviewer slot, so progress does not reset and an interrupted retry cannot discard them. Progress survives restart and appears in the inspector. Older failed rounds without saved progress cannot recover their discarded results automatically.
 
 
 Reviewers appear in Agent Hub while running and as `review <bead-id>` rows in the mission outline. Saved round transcripts and incomplete-round progress reconstruct completed and failed rows after restart; live rows replace their saved counterpart. Completed transcript paths remain in the inspector's evidence view under `~/.omp/agent/missions/<workspace>/reviews/<mission-id>/`; open one with `omp --resume <path>`. Older reviews without saved transcript or progress records cannot reconstruct individual rows.
 
 Worker and reviewer sessions are saved but never recorded as the terminal's last session, so `omp -c` in the coordinator's terminal always resumes the coordinator and not a bead worker. A control result or `mission_status` that arrives while the extension is about to run a step itself (an auto dispatch or a review) says so and tells the coordinator to wait, instead of telling it to make a call that would fail with "Workers running" or "Mission operation already running".
+
+Automatic waves serialize overlapping file scopes, including scopes held by live workers. A failed automatic dispatch is handed to the coordinator once instead of recursively retrying inside the preceding tool call. Control results and board actions are republished when the operation releases its busy flag.
 
 `/mission approve` also runs the step it approves: at a wave gate it dispatches the wave, and at a repairs gate it accepts the repairs. Judgement stays with the coordinator: graph scopes, verification, delivery, repair work and rejecting findings.
 

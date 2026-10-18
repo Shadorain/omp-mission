@@ -42,6 +42,10 @@ Per-bead lanes stop starting uncached targets after the first provider-capacity 
 
 Capacity classification gives explicit credit exhaustion precedence, then rate-limit wording, then an otherwise unexplained `resource_exhausted`. A free-model throttle is therefore recoverable even when its transport code says resource exhaustion. Review backoff takes the latest retry-after, reset duration, or dated UTC reset derived from the failure timestamp.
 
+Review convergence is a durable operator checkpoint: `reviewAcknowledged` stores the completed-review count acknowledged by an explicit operator `review`. The initial review plus two unsuccessful repair cycles, or a consecutive `(path, normalized title)` recurrence, makes `reviewChurnReason` hold scheduling before graph, worker or review work. Invalidated rounds do not count; rejected findings do not recur; a clean latest verdict does not hold. Acknowledgement includes the prior verdict as the next cycle's baseline, so each new window permits at most two repair cycles. The control boundary refuses new work while held, but inspection, reasoned finding rejection and worker release/reap remain available. Resume/Continue and model recovery do not acknowledge the checkpoint. Holotable publishes `hold: blocked`, `problem.source: convergence` and the reason ahead of stale Pause gates.
+
+Wave selection shares the worker driver's scope-overlap rules and excludes files reserved by live workers and earlier selections in the same wave. Automatic dispatch and review record their attempt signature before entering `control()`: its `finally` wakes scheduling, so recording only in the outer failure handler recursively retried a rejected dispatch and prevented the original bind tool from returning. Releasing the operation flag republishes status before waking scheduling, including when the next action holds.
+
 
 ## Safety model
 

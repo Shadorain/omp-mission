@@ -130,6 +130,29 @@ function socketName(missionId: string): string {
 	return `${createHash('sha256').update(missionId).digest('hex').slice(0, 12)}-${process.pid}.sock`;
 }
 
+test('review convergence holds survive automatic continue and only operator review acknowledges them',async()=>{
+ const mission=baseMission('/tmp',{phase:'repair',reviewRequested:true,reviews:[1,2,3].map(round=>({round,revision:`rev-${round}`,model:'independent',at:'now',summary:'Defect',findings:[{id:`f${round}`,severity:'high' as const,path:'task.ts',line:round,title:`Defect ${round}`,body:'A consumer workflow fails'}]}))});
+ const run=await session({mission,child:true});
+ try{
+  const status=await statusOf(run,mission);
+  expect(status.hold).toBe('resume');
+  expect(status.problem?.source).toBe('convergence');
+  expect(status.actions).not.toContain('dispatch');
+  const socket=status.ctl!.socket;
+  expect((await ctl(socket,{v:1,op:'continue',operator:true})).ok).toBe(true);
+  const continued=await statusOf(run,mission);
+  expect(continued.hold).toBe('blocked');
+  expect(continued.actions).toContain('review');
+  expect(run.sent).toEqual([]);
+  expect((await ctl(socket,{v:1,op:'review'})).ok).toBe(false);
+  expect((await ctl(socket,{v:1,op:'review',operator:true})).ok).toBe(true);
+  const saved=(await listMissions(run.root))[0]!.mission;
+  expect(saved.reviewAcknowledged).toBe(3);
+  expect(saved.reviews).toEqual(mission.reviews);
+  expect((await statusOf(run,mission)).hold).toBe('none');
+ }finally{await run.event('session_shutdown',{});}
+});
+
 test('pending questions replace plan approval until the matching tool finishes', async () => {
  const run = await session({ plan: true, child: true, autostart: 'CHR-123' });
  try {

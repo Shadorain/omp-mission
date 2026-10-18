@@ -143,6 +143,10 @@ export function validateMission(value: unknown): Mission {
   const missionId = text(row.id, "id", 1000);
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(missionId)) invalid("id contains unsafe path characters");
   const mission: Mission = { version: 1, id: missionId, source: validSource(row.source), workspace: validWorkspace(row.workspace), scopes, phase: row.phase as Phase, evidence, mode: row.mode as Mode, keep: row.keep, reviewRequested: row.reviewRequested, workers, reviews, repairLinks, round, createdAt: text(row.createdAt, "createdAt", 100), updatedAt: text(row.updatedAt, "updatedAt", 100) };
+  if (row.reviewAcknowledged !== undefined) {
+    if (!isNonNegativeSafeInteger(row.reviewAcknowledged) || row.reviewAcknowledged > reviews.length) invalid("reviewAcknowledged must be a completed-review count");
+    mission.reviewAcknowledged = row.reviewAcknowledged;
+  }
   if (reviewProgress !== undefined) mission.reviewProgress = reviewProgress;
   if (row.measurements !== undefined) {
     const raw = object(row.measurements, "measurements");

@@ -1,5 +1,6 @@
 import type { Bead, Frontend, Mission, Run, Terminal, Worker } from './types.ts';
 import { spawnBackground, spawnCustom, spawnHerdr, writePromptFile, writeSourceFile } from './hosts.ts';
+import { normalizeScope, scopesOverlap } from './scope';
 
 export interface WorkerAssignment { beadId: string; cwd: string; files: string[]; assignment?: string; task?: string }
 /** In-process subagent runner, as the driver sees it. */
@@ -38,18 +39,6 @@ export function assertNonOverlapping(assignments: WorkerAssignment[]): void {
   }
 }
 
-function scopesOverlap(left: string, right: string): boolean {
-  const a = normalizeScope(left);
-  const b = normalizeScope(right);
-  return a === '' || b === '' || a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
-}
-function normalizeScope(path: string): string {
-  if (path.trim().length === 0) throw new Error('worker file scope cannot be empty');
-  if (path.startsWith('/') || /^[A-Za-z]:/.test(path)) throw new Error(`worker scope must be workspace-relative: ${path}`);
-  const parts = path.replaceAll('\\', '/').split('/').filter(part => part && part !== '.');
-  if (parts.includes('..')) throw new Error(`invalid worker file scope: ${path}`);
-  return parts.join('/');
-}
 function quote(value: string): string { return `'${value.replaceAll("'", "'\\''")}'`; }
 function orcaError(value: unknown): string | undefined {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;

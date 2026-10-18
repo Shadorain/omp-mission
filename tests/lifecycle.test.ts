@@ -15,7 +15,7 @@ type Execute = (id: string, params: Params, signal: undefined, update: undefined
 type EventHandler = (event: unknown, context: ExtensionContext) => Promise<unknown>;
 const noRun: Run = async () => { throw new Error('Unexpected command'); };
 
-async function fixture(graph: Graph, leaves = true, host: { idle?: boolean; pending?: boolean; resumed?: boolean; unreviewed?: boolean; clean?: boolean; complete?: boolean; plan?: boolean; otherCheckout?: boolean; linearCheckout?: boolean; archived?: boolean; prBase?: string; delivered?: boolean; reviewRequested?: boolean; legacyFingerprint?: boolean; mergeConflict?: boolean } = {}) {
+async function fixture(graph: Graph, leaves = true, host: { churn?: boolean; autoDispatch?: boolean; idle?: boolean; pending?: boolean; resumed?: boolean; unreviewed?: boolean; clean?: boolean; complete?: boolean; plan?: boolean; otherCheckout?: boolean; linearCheckout?: boolean; archived?: boolean; prBase?: string; delivered?: boolean; reviewRequested?: boolean; legacyFingerprint?: boolean; mergeConflict?: boolean } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'mission-lifecycle-'));
   const cwd = join(root, 'workspace');
   await mkdir(cwd);
@@ -36,6 +36,7 @@ async function fixture(graph: Graph, leaves = true, host: { idle?: boolean; pend
     mission.evidence.deliver = { outcome: 'passed', revision, detail: 'before', at: 'now' };
     mission.reviews = host.unreviewed ? [] : [{ round: 1, revision, summary: host.clean ? 'Clean' : 'Defect', model: 'test', at: 'now', findings: host.clean ? [] : [{ id: 'f', severity: 'high', path: 'task.txt', line: 1, title: 'Defect', body: 'Fix task.txt' }] }];
   }
+  if(host.churn)mission.reviews=[1,2,3].map(round=>({...mission.reviews[0]!,round,findings:mission.reviews[0]!.findings.map(finding=>({...finding,id:`f${round}`,title:`Defect ${round}`}))}));
   if (host.legacyFingerprint && mission.evidence.verify) {
    const captured = await captureRevision(mission, noRun);
    mission.evidence.verify = { ...mission.evidence.verify, revision: captured.legacyRevision, tree: captured.legacyTree };
@@ -71,6 +72,9 @@ async function fixture(graph: Graph, leaves = true, host: { idle?: boolean; pend
   };
   const events = new Map<string, EventHandler>();
   let active: string[] = [];
+  let ready = false;
+  let readyReads = 0;
+  const repeatedWave = Promise.withResolvers<void>();
   const branch: unknown[] = [...(host.otherCheckout ? [] : [{ type: 'custom', customType: 'mission:pointer', data: { path } }]), ...(host.plan ? [{ type: 'mode_change', mode: 'plan' }] : [])];
   // This fixture supplies only host services used by these operations. Storage,
   // revision capture, graph parsing, and mission transitions are real.
@@ -110,8 +114,8 @@ async function fixture(graph: Graph, leaves = true, host: { idle?: boolean; pend
       else if (command !== 'bd') throw new Error(`Unexpected command: ${command}`);
       let rows: unknown[];
       if (args.includes('show')) rows = [{ id: 'epic', issue_type: 'epic', status: 'open' }];
-      else if (args.includes('ready')) rows = [];
-      else if (args.includes('list')) rows = leaves && args[args.indexOf('--parent') + 1] === 'epic' ? [{ id: 'leaf', title: 'Leaf', status: 'done' }] : [];
+      else if (args.includes('ready')) { if(ready&&++readyReads===3)repeatedWave.resolve();rows = ready ? [{id:'leaf'},{id:'sibling'}] : []; }
+      else if (args.includes('list')) rows = leaves && args[args.indexOf('--parent') + 1] === 'epic' ? (ready ? [{id:'leaf',title:'Leaf',status:'open'},{id:'sibling',title:'Sibling',status:'open'}] : [{ id: 'leaf', title: 'Leaf', status: 'done' }]) : [];
       else throw new Error(`Unexpected bd command: ${args.join(' ')}`);
       return { code: 0, stdout: JSON.stringify(rows), stderr: '' };
     },
@@ -119,6 +123,7 @@ async function fixture(graph: Graph, leaves = true, host: { idle?: boolean; pend
   const old = process.env.PI_CODING_AGENT_DIR;
   try {
     process.env.PI_CODING_AGENT_DIR = root;
+    if(host.autoDispatch)await writeFile(join(root,'mission.json'),JSON.stringify({version:1,autoDispatch:true}));
     await missionExtension(api);
   } finally {
     if (old === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -139,6 +144,8 @@ async function fixture(graph: Graph, leaves = true, host: { idle?: boolean; pend
     noticeCount: (prefix: string, count: number) => { const { promise, resolve } = Promise.withResolvers<string>(); noticeWaiters.push({ prefix, count, resolve }); settleNoticeWaiters(); return promise; },
     errorCount: (count:number) => {const {promise,resolve}=Promise.withResolvers<string>();noticeWaiters.push({level:'error',count,resolve});settleNoticeWaiters();return promise;},
     execute, cwd, root, path, state: () => loadMission(path),
+    ready: () => { ready = true; },
+    repeatedWave: repeatedWave.promise,
     event: (name:string,event:unknown) => events.get(name)!(event,context),
     restore: () => start({}, context),
     status: async () => {
@@ -148,6 +155,35 @@ async function fixture(graph: Graph, leaves = true, host: { idle?: boolean; pend
     dispose: async () => { try { await shutdown({}, context); } finally { await rm(root, { recursive: true, force: true }); } },
   };
 }
+
+test('a failed automatic wave returns to the caller instead of recursively retrying',async()=>{
+ const mission=await fixture('beads',true,{autoDispatch:true,reviewRequested:false});
+ try{
+  mission.ready();
+  const result=mission.execute({operation:'bind_graph',epicId:'epic',scopes:{leaf:['task.txt'],sibling:['task.txt']}});
+  const outcome=await Promise.race([result.then(()=>'returned'),mission.repeatedWave.then(()=>'recursive retry')]);
+  expect(outcome).toBe('returned');
+  expect(mission.notices.filter(message=>message.startsWith('Auto-dispatch held'))).toHaveLength(1);
+ }finally{await mission.dispose();}
+});
+
+test('churn cannot be released by model operations or continue and an operator checkpoint survives restore',async()=>{
+ const mission=await fixture('local',true,{churn:true});
+ try{
+  await expect(mission.execute({operation:'accept_repairs'})).rejects.toThrow('Review paused');
+  await expect(mission.execute({operation:'record_verification',passed:true,detail:'Blind retry'})).rejects.toThrow('Review paused');
+  await mission.execute({operation:'continue'});
+  expect((await mission.status()).next.detail).toContain('Review paused');
+  await mission.command('review');
+  expect((await mission.state()).reviewAcknowledged).toBe(3);
+  await mission.execute({operation:'accept_repairs'});
+  expect((await mission.state()).phase).toBe('repair');
+  await mission.restore();
+  await mission.execute({operation:'continue'});
+  expect((await mission.state()).reviewAcknowledged).toBe(3);
+  expect((await mission.status()).next.detail).not.toContain('Review paused');
+ }finally{await mission.dispose();}
+});
 
 test('binding changed graph scopes requires fresh verification and delivery',async()=>{
  const mission=await fixture('beads',true,{reviewRequested:false});

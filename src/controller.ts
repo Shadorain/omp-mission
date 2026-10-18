@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { Action, Gate, Graph, Mission, Mode, Phase, PolicyContext, Snapshot, Step } from './types';
+import { scopesOverlap } from './scope';
 export function token(value: unknown): string { return createHash('sha256').update(JSON.stringify(value)).digest('hex'); }
 const quotaHold = /quota.{0,80}exhausted|insufficient.{0,40}(?:credits|balance|funds)|usage[_ -]?limit|usage_limit_reached|run out of credits|out of credits|out of (?:extra )?usage|spending[- ]?limit|personal-team-blocked|requires more credits|more credits, or fewer max_tokens/i;
 /** Transient throttle wording. OMP already retries these; the mission must not start another loop. */
@@ -90,6 +91,18 @@ export function verificationParked(m: Mission): boolean {
  return m.evidence.verify?.outcome==='failed' && (m.mode==='pause' || effectiveGraph(m)==='local');
 }
 export function approveGate(m: Mission, expected: string): void { if(!m.gate || m.gate.token!==expected)throw new Error('Approval scope changed; inspect the current gate'); m.gate.approved=true; }
+export function reviewChurnReason(m: Mission): string | undefined {
+ if(m.phase==='complete'||m.reviews.at(-1)?.invalidated||(m.reviewAcknowledged??0)>=m.reviews.length)return undefined;
+ const rounds=m.reviews.slice(Math.max(0,(m.reviewAcknowledged??0)-1)).filter(review=>!review.invalidated);
+ const latest=rounds.at(-1);
+ if(!latest||!latest.findings.some(finding=>!finding.rejection))return undefined;
+ const previous=rounds.at(-2);
+ const key=(finding:typeof latest.findings[number])=>JSON.stringify([finding.path,finding.title.trim().toLowerCase().replace(/\s+/g,' ')]);
+ const prior=new Set(previous?.findings.filter(finding=>!finding.rejection).map(key));
+ const repeated=latest.findings.find(finding=>!finding.rejection&&prior.has(key(finding)));
+ const reason=repeated?`Repeated finding: ${repeated.title} (${repeated.path})`:rounds.length>=3?'Two repair cycles have not produced a clean review':undefined;
+ return reason?`Review paused: ${reason}. Inspect findings and repair evidence, then explicitly /mission review to authorize another bounded cycle`:undefined;
+}
 export function enforceMutation(m: Mission, p: PolicyContext): void {
  if(p.nativePlan)throw new Error('Mission mutations are forbidden in native plan mode');
  if(p.resumeHold)throw new Error('Resumed inspection: use /mission continue');
@@ -124,6 +137,7 @@ export function nextAction(m: Mission, snapshot: Snapshot | undefined, policy: P
  if (policy.resumeHold) return {kind: 'hold', detail: 'Resumed inspection; continue explicitly'};
  if (!policy.owned) return {kind: 'hold', detail: 'Controller ownership required'};
  if (m.blocker) return {kind: 'hold', detail: m.blocker};
+ const churn=reviewChurnReason(m);if(churn)return {kind:'hold',detail:churn};
  if(verificationParked(m))return {kind:'hold',detail:`Verification failed; stop. /mission continue releases the hold. Then bind an unbound repair leaf, or create one, and dispatch it. Do not record verification until that leaf closes: ${m.evidence.verify!.detail}`};
 
  const local = effectiveGraph(m) === 'local';
@@ -150,7 +164,14 @@ export function nextAction(m: Mission, snapshot: Snapshot | undefined, policy: P
   if (outstanding.length) {
    const reserved = new Set(workers.map(worker => worker.beadId));
    const capacity = Math.max(0, policy.maxWorkers - workers.length);
-   const ids = snapshot.ready.filter(id => m.scopes[id] && !reserved.has(id)).sort().slice(0, capacity);
+   const scopes=workers.flatMap(worker=>worker.files);
+   const ids:string[]=[];
+   for(const id of snapshot.ready.filter(id=>m.scopes[id]&&!reserved.has(id)).sort()){
+    if(ids.length>=capacity)break;
+    const files=m.scopes[id]!;
+    if(files.some(file=>scopes.some(scope=>scopesOverlap(file,scope))))continue;
+    ids.push(id);scopes.push(...files);
+   }
    // A stopped subagent worker waits for the operator but does not hold back other ready beads; it surfaces once nothing else can start.
    if (stopped.length && (m.mode === 'pause' || !ids.length)) return {kind: 'resend', detail: `Worker stopped: ${stopped.map(worker => `${worker.beadId} (${worker.error!.slice(0, 240)})`).join('; ')}`, ids: stopped.map(worker => worker.beadId).sort()};
    if (m.mode === 'pause' && workers.length) return {kind: 'hold', detail: 'Current wave still running'};
@@ -196,6 +217,7 @@ export function nextAction(m: Mission, snapshot: Snapshot | undefined, policy: P
 }
 export function modelRetryTargets(m: Mission, snapshot: Snapshot | undefined, p: PolicyContext) {
  if (m.phase === 'complete' || p.nativePlan || p.resumeHold || !p.owned || m.evidence.verify?.outcome === 'failed' || m.gate && !m.gate.approved) return undefined;
+ if(reviewChurnReason(m))return undefined;
  if (effectiveGraph(m) === 'beads' && (!p.fresh || !snapshot || snapshot.error)) return undefined;
  const coordinator = isProviderBlocker(m.blocker);
  if (m.blocker && !coordinator) return undefined;
@@ -227,6 +249,7 @@ export function operatorCommands(m: Mission | undefined, pending: boolean, snaps
  if (worker?.handle && worker.state !== 'closed' && ['orca', 'herdr'].includes(worker.frontend ?? 'orca')) commands.push(`focus ${worker.beadId}`);
  if (!m || m.phase === 'complete' || p.nativePlan || operation) return commands;
  if (p.resumeHold || !p.owned || m.evidence.verify?.outcome==='failed' || isProviderBlocker(m.blocker)) commands.push('continue');
+ if(reviewChurnReason(m)){if(p.owned&&!p.resumeHold&&!m.blocker)commands.push('review');return commands;}
  commands.push('mode');
  // A scheduled automatic retry is the extension's step, so the operator is not asked for it.
  if (m.evidence.deliver?.outcome === 'passed' && m.evidence.verify?.outcome !== 'failed' && !m.blocker &&
@@ -260,6 +283,7 @@ export function operatorStep(m: Mission, action: Action, p: PolicyContext, owner
  if (p.nativePlan) return {text: m.phase === 'plan' ? 'Approve the plan to start the mission' : 'Plan mode is read-only; leave plan mode to continue'};
  if (ownershipError) return {command: '/mission continue', text: `Lost control of the mission (${ownershipError}); take it back`};
  if (p.resumeHold) return {command: '/mission continue', text: 'Take control of this resumed mission'};
+ const churn=reviewChurnReason(m);if(churn)return {command:'/mission review',text:churn};
  if (action.gate) return {command: '/mission approve', text: action.gate.detail};
  if (m.blocker) return {command: isProviderBlocker(m.blocker) ? '/mission continue' : '/mission', text: m.blocker};
  if(verificationParked(m))return {command:'/mission continue',text:`Verification blocked: ${m.evidence.verify!.detail}. Continue releases the hold so the fix can be bound and dispatched; it does not mark the blocker fixed`};

@@ -14,7 +14,7 @@ import { acquireOwnership, listMissions, loadMission, missionId, missionPath, sa
 import type { Ownership } from './store';
 import { readClaimActor, readGraph, readHistory } from './beads';
 import { createWorkerDriver } from './workers';
-import { approveGate, autoDispatchAllowed, consumeGate, deliverUrl, displayPhase, effectiveGraph, enforceGate, enforceMutation, isProviderBlocker, modelRetryTargets, nextAction, operatorCommands, operatorStep, QUOTA_BLOCKER, RATE_BLOCKER, requireBeadsGraph, revisionGate, reviewFailureStep, setMode, terminalCapacity, waveGate } from './controller';
+import { approveGate, autoDispatchAllowed, consumeGate, deliverUrl, displayPhase, effectiveGraph, enforceGate, enforceMutation, isProviderBlocker, modelRetryTargets, nextAction, operatorCommands, operatorStep, QUOTA_BLOCKER, RATE_BLOCKER, requireBeadsGraph, revisionGate, reviewChurnReason, reviewFailureStep, setMode, terminalCapacity, waveGate } from './controller';
 import { alignVerifiedRevision, captureRevision, Reviewer, roleModelString } from './review';
 import { beadTask, checkPrompt, coordinatorPrompt, guide, planSlug, workerPrompt } from './prompts';
 import { createMissionWidget, createMissionInspector, phaseLabel } from './ui';
@@ -99,7 +99,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
  // In-process workers report back here: a clean result already closed the bead; a rejected one waits for the operator.
  async function settleSubagent(beadId:string,outcome:{ok:true;summary:string}|{ok:false;error:string}){const m=mission;if(!m)return;const w=m.workers.findLast(x=>x.beadId===beadId&&x.state!=='closed');if(!w)return;if(outcome.ok){w.state='closed';w.error=undefined;}else w.error=outcome.error;try{if(ownership&&!resumeHold)await persist(m);}catch{/* ownership lost: the next resume reconciles from bd */}if(!outcome.ok&&ctx)ctx.ui.notify(`Worker ${beadId}: ${outcome.error}`,'warning');await refresh(true);}
  const workerAgents=new SubagentRunner({run,agentDir,config:()=>config,context:()=>ctx,onSettled:(beadId,outcome)=>{void settleSubagent(beadId,outcome);}});
- const driver=createWorkerDriver(run,{subagent:workerAgents,canMutate:()=>!!ctx&&!!ownership&&!resumeHold&&!ownershipError&&!nativePlan(ctx),persist:async value=>{if(value!==mission)throw new Error('Session changed during worker operation');if(ownership&&!resumeHold)await persist(value);},prompt:(mission,worker,task)=>config.frontend==='subagent'?subagentPrompt(mission,worker,task):workerPrompt(mission,worker,config.frontend,task),agentDir,model:()=>roleModelString(config.workerRole),frontend:()=>config.frontend,customCommand:()=>config.customCommand});
+ const driver=createWorkerDriver(run,{subagent:workerAgents,canMutate:()=>!!ctx&&!!ownership&&!resumeHold&&!ownershipError&&!nativePlan(ctx)&&!!mission&&!reviewChurnReason(mission),persist:async value=>{if(value!==mission)throw new Error('Session changed during worker operation');if(ownership&&!resumeHold)await persist(value);},prompt:(mission,worker,task)=>config.frontend==='subagent'?subagentPrompt(mission,worker,task):workerPrompt(mission,worker,config.frontend,task),agentDir,model:()=>roleModelString(config.workerRole),frontend:()=>config.frontend,customCommand:()=>config.customCommand});
  function policy(context:ExtensionContext){return {resumeHold,owned:!!ownership&&!ownershipError,nativePlan:nativePlan(context),fresh:!!snapshot&&!snapshot.error&&Date.now()-snapshot.fetchedAt<35000,maxWorkers:config.maxWorkers};}
  // A hint is attached once per distinct text. The action detail is always sent, so recovery does not depend on it.
  let guided='';
@@ -291,7 +291,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
      if(epoch!==generation||mission!==current)return;
     }
     await driver.reconcile(current,new Map(next.beads.map(bead=>[bead.id,bead])));
-    if(ctx&&ownership&&!resumeHold&&!ownershipError&&!nativePlan(ctx)){for(const worker of current.workers.filter(w=>w.state==='missing')){const bead=next.beads.find(b=>b.id===worker.beadId);if(bead)try{await driver.recover(current,worker.beadId,bead);}catch{/* claimed or not ready: stays held for the operator */}}}
+    if(ctx&&ownership&&!resumeHold&&!ownershipError&&!nativePlan(ctx)&&!reviewChurnReason(current)){for(const worker of current.workers.filter(w=>w.state==='missing')){const bead=next.beads.find(b=>b.id===worker.beadId);if(bead)try{await driver.recover(current,worker.beadId,bead);}catch{/* claimed or not ready: stays held for the operator */}}}
     if(epoch!==generation||mission!==current)return;
     const audit=selected&&!selected.startsWith('subagent:')&&next.beads.some(bead=>bead.id===selected)?selected:undefined;
     if(audit){try{history=await readHistory(run,current.workspace.cwd,audit,{BEADS_DIR:current.workspace.beadsDir??''});}catch{history=undefined;}}
@@ -316,8 +316,9 @@ export default async function missionExtension(pi: ExtensionAPI) {
   const m=mission;if(!m||!autoDispatchAllowed(m,action,config.autoDispatch,policy(context)))return false;
   const signature=dispatchSignature(m,action);
   if(signature===autoBlocked)return false;
+  autoBlocked=signature;
   try{await control({operation:'dispatch'},context);context.ui.notify(`Auto-dispatched ${action.ids?.join(', ')}`,'info');return true;}
-  catch(error){autoBlocked=signature;context.ui.notify(`Auto-dispatch held, handing to the coordinator: ${error instanceof Error?error.message:String(error)}`,'warning');return false;}
+  catch(error){context.ui.notify(`Auto-dispatch held, handing to the coordinator: ${error instanceof Error?error.message:String(error)}`,'warning');return false;}
  }
  // Workers cannot resolve the coordinator's local:// root, so the approved plan is copied where their assignment points. Best effort: a missing plan only costs workers the slice text.
  async function sharePlan(m:Mission,context:ExtensionContext){
@@ -391,7 +392,7 @@ async function finishMission(context:ExtensionContext){
  async function decision(context:ExtensionContext,verb:string,arg?:string){
   if(!mission)throw new Error('No active mission');if(nativePlan(context))throw new Error('Mission mutations are forbidden in native plan mode');
   if(verb==='mode'){const modes:Mode[]=['auto','pause','force'];const mode=z.enum(['auto','pause','force']).parse(arg??modes[(modes.indexOf(mission.mode)+1)%3]);setMode(mission,mode);if(resumeHold)inspectionIntent.mode=mode;}
-  else if(verb==='review'){mission.reviewRequested=true;if(mission.evidence.review?.outcome==='failed')delete mission.evidence.review;if(resumeHold)inspectionIntent.reviewRequested=true;}
+  else if(verb==='review'){if(reviewChurnReason(mission)){if(resumeHold||!ownership||ownershipError)throw new Error('Take controller ownership with /mission continue before acknowledging the review pause');await ownership.assertOwned();if(operation)throw new Error('Wait for the current operation before acknowledging the review pause');mission.reviewAcknowledged=mission.reviews.length;}mission.reviewRequested=true;if(mission.evidence.review?.outcome==='failed')delete mission.evidence.review;if(resumeHold)inspectionIntent.reviewRequested=true;}
   else if(verb==='approve'){if(resumeHold)throw new Error('Resumed session is read-only: run /mission continue first, then /mission approve');if(!mission.gate)throw new Error('No gate is waiting for approval. /mission shows what is next');approveGate(mission,mission.gate.token);}
   if(ownership)await persist(mission);await render();
   if(!resumeHold&&ownership&&!operation&&(verb==='review'||verb==='approve')){
@@ -415,6 +416,7 @@ async function finishMission(context:ExtensionContext){
   const m=mission;if(!m||action.kind!=='review'||action.gate||!m.reviewRequested)return false;
   const signature=reviewSignature(m);
   if(signature===reviewBlocked)return false;
+  reviewBlocked=signature;
   const startedAt=Date.now();
   context.ui.notify('Independent review started in its own session. It can take several minutes; the result is reported here.','info');
   // Fire and forget: a review can outlast the command handler, and every outcome is reported through notify.
@@ -624,6 +626,7 @@ async function finishMission(context:ExtensionContext){
    }
    else{
     if(!mission)throw new Error('No active mission');enforceMutation(mission,policy(context));await ownership!.assertOwned();
+    const churn=reviewChurnReason(mission);if(churn&&!['reject_finding','release','reap'].includes(params.operation))throw new Error(churn);
     if(params.operation==='bind_workspace'){
      let {cwd,beadsDir,delivery,base}=params;let note='';
      if(!cwd){const isolated=await isolateCheckout(run,{source:mission.source,start:mission.workspace.cwd,base,delivery,create:!internal.reuseOnly});cwd=isolated.cwd;base??=isolated.base;delivery??=isolated.delivery;note=`${isolated.created?'created':'reusing'} ${cwd}`;}
@@ -740,7 +743,7 @@ async function finishMission(context:ExtensionContext){
    }
    await render();return status(context,true);
   }catch(error){if(epoch===generation&&mission&&ownership&&reviewStarted){mission.evidence.review={outcome:'failed',detail:String(error),revision:mission.evidence.verify?.revision,at:new Date().toISOString(),attempts:(mission.evidence.review?.attempts??0)+1};measurements(mission).reviewFailures++;await persist(mission);}await render();throw error;}
-  finally{_signal?.removeEventListener('abort',cancelReview);operation=false;operationSignal=undefined;if(epoch===generation){lastWake='';await wakeCoordinator();}}
+  finally{_signal?.removeEventListener('abort',cancelReview);operation=false;operationSignal=undefined;if(epoch===generation){lastWake='';await render();await wakeCoordinator();}}
  }
  pi.registerTool({name:'mission_control',defaultInactive:true,loadMode:'essential',label:'Mission control',description:'Drive approved mission phases/workers/review. Every operation preserves native approvals, Pause gates, resume hold and ownership.',approval:'exec',parameters:controlSchema,execute:async(_id,rawParams,signal,_update,context)=>({content:[{type:'text',text:JSON.stringify(await control(rawParams,context,signal))}],details:{}})});
  pi.registerCommand('mission',{description:'Plan and coordinate work from a ticket or task through verification and review.',getArgumentCompletions:prefix=>{syncCompletions();return missionArgumentCompletions(prefix,completionState);},handler:command});
