@@ -4,6 +4,7 @@ import { resolve, relative, isAbsolute, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { inScope } from './scope';
 import { AgentRegistry, createAgentSession, discoverContextFiles, SessionManager, Settings, settings, type AgentSession, type ExtensionContext } from '@oh-my-pi/pi-coding-agent';
+import { getRetryFallbackChains } from '@oh-my-pi/pi-coding-agent/session/retry-fallback-chains';
 import { openUnlistedSession } from './session-file';
 import type { Finding, Mission, ReviewBaseline, ReviewRound, Run } from './types';
 import { isRecord } from './guards';
@@ -488,7 +489,7 @@ export class Reviewer {
    requireYieldTool: false, customTools: [], skills: [], rules: [],
    promptTemplates: [], slashCommands: [],
    sessionManager: manager,
-   settings: Settings.isolated({'advisor.enabled':false,'autolearn.enabled':false,'compaction.enabled':false,'retry.enabled':true}),
+   settings: Settings.isolated({'advisor.enabled':false,'autolearn.enabled':false,'compaction.enabled':false,'retry.enabled':true,...reviewFallbackSettings()}),
    // A subagent of the main session in the global registry, like a bead worker, so Agent Hub lists it while it runs.
    agentId: agent.id, agentDisplayName: `mission review ${agent.label}`, parentAgentId: 'Main', taskDepth: 1, agentRegistry: AgentRegistry.global(),
    deadline: Date.now() + budgetMs,
@@ -498,4 +499,12 @@ export class Reviewer {
  async run(m: Mission, ctx: ExtensionContext, run: Run, role = 'default', contextFiles?: Array<{ path: string; content: string }>): Promise<ReviewRound> {
   return this.runPerBead(m,ctx,run,role,contextFiles,[],1);
  }
+}
+/**
+ * Reviewer and subagent-worker sessions use isolated settings, so OMP's model fallback had no chains and a
+ * throttled or exhausted model failed the work. Carry only the configured chains and role assignments.
+ */
+export function reviewFallbackSettings(): Record<string, unknown> {
+ try { return {'retry.fallbackChains':getRetryFallbackChains(settings),modelRoles:settings.getModelRoles()}; }
+ catch { return {}; } // settings not initialised (headless harness): no fallback, as before
 }

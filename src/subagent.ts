@@ -3,7 +3,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { AgentRegistry, createAgentSession, Settings, type ExtensionContext } from '@oh-my-pi/pi-coding-agent';
 import { contextFilesFor, type ContextFile } from './context';
-import { missionModel, roleModelString, roleThinkingLevel } from './review';
+import { missionModel, reviewFallbackSettings, roleModelString, roleThinkingLevel } from './review';
 import { openUnlistedSession } from './session-file';
 import { inScope, outOfScope } from './scope';
 import { planNote, sourceFilePath } from './hosts';
@@ -148,7 +148,7 @@ const defaultFactory: SessionFactory = async request => {
 		agentRegistry: AgentRegistry.global(), sessionManager: manager,
 		// A worker has no wait tool and its turn ends at yield, so a command moved to a background job left it
 		// yielding "not done: waiting" while the job still ran. Long commands block instead.
-		settings: Settings.isolated({ 'advisor.enabled': false, 'autolearn.enabled': false, 'tools.approvalMode': 'yolo', 'bash.autoBackground.enabled': false, 'async.enabled': false }),
+		settings: Settings.isolated({ 'advisor.enabled': false, 'autolearn.enabled': false, 'tools.approvalMode': 'yolo', 'bash.autoBackground.enabled': false, 'async.enabled': false, ...reviewFallbackSettings() }),
 	});
 	return { session: session as unknown as SubagentSession, file: manager.getSessionFile() ?? '' };
 };
