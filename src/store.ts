@@ -50,7 +50,7 @@ export function validateFinding(value: unknown): Finding {
   const finding: Finding = { id: text(row.id, "finding.id", 1000), severity, path: text(row.path, "finding.path", 4000), line, title: text(row.title, "finding.title", 10_000), body: text(row.body, "finding.body", 50_000), ...(row.rejection === undefined ? {} : { rejection: text(row.rejection, "finding.rejection", 10_000) }), ...(row.beadId === undefined ? {} : { beadId: text(row.beadId, "finding.beadId", 1000) }) };
   if (row.triage !== undefined) {
     const triage = object(row.triage, "finding.triage");
-    if (triage.disposition !== "repair" && triage.disposition !== "reject" && triage.disposition !== "escalate") invalid("finding.triage.disposition is unsupported");
+    if (triage.disposition !== "repair" && triage.disposition !== "reject" && triage.disposition !== "defer" && triage.disposition !== "escalate") invalid("finding.triage.disposition is unsupported");
     if (triage.disposition === "reject" && !finding.rejection) invalid("rejected triage requires finding.rejection");
     finding.triage = { disposition: triage.disposition, detail: text(triage.detail, "finding.triage.detail", 10_000), ...(triage.previousFindingId === undefined ? {} : { previousFindingId: text(triage.previousFindingId, "finding.triage.previousFindingId", 1000) }) };
   }
@@ -189,6 +189,8 @@ export function validateMission(value: unknown): Mission {
     mission.graph = row.graph;
   }
   if (controllerNonce !== undefined) mission.controllerNonce = controllerNonce;
+  const advisoryPosted = optionalText(row.advisoryPosted, "advisoryPosted", 100);
+  if (advisoryPosted !== undefined) mission.advisoryPosted = advisoryPosted;
   if (blocker !== undefined) mission.blocker = blocker;
   if (row.check !== undefined && row.check !== null) {
     const item = object(row.check, "check");

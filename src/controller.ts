@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { Action, FindingDecision, FindingTriage, Gate, Graph, Mission, Mode, Phase, PolicyContext, Snapshot, Step } from './types';
+import type { Action, Finding, FindingDecision, FindingTriage, Gate, Graph, Mission, Mode, Phase, PolicyContext, ReviewRound, Snapshot, Step } from './types';
 import { scopesOverlap } from './scope';
 export function token(value: unknown): string { return createHash('sha256').update(JSON.stringify(value)).digest('hex'); }
 const quotaHold = /quota.{0,80}exhausted|insufficient.{0,40}(?:credits|balance|funds)|usage[_ -]?limit|usage_limit_reached|run out of credits|out of credits|out of (?:extra )?usage|spending[- ]?limit|personal-team-blocked|requires more credits|more credits, or fewer max_tokens/i;
@@ -40,15 +40,46 @@ export function reviewFailureStep(detail:string,completed=0,total=0):Step{
  if(/deadline exceeded|timed out|timeout/i.test(detail))return {command:'/mission review',text:`Review timed out${progress}.${completed?' Retry only failed reviewers; completed results are retained':' Retry the failed review'}`};
  return {command:'/mission review',text:`Review failed${progress}.${completed?' Retry only failed reviewers; completed results are retained':' Retry it'}`};
 }
-/** Review failures a later run clears by itself: throttles, provider overload, dropped connections, a reviewer deadline. Quota needs a person. */
-const transientReview = /deadline exceeded|timed out|timeout|overloaded|rate_limit_error|\b(?:502|503|504|529)\b|internal server error|econnreset|socket hang up|fetch failed|network error/i;
 export const REVIEW_RETRIES = 3;
-export const reviewRetryLimit=(m:Pick<Mission,'reviews'>)=>m.reviews.length?1:REVIEW_RETRIES;
+/** Every failed review except unfunded quota retries on its own; a repeat of a deterministic failure then holds. */
+export const reviewRetryLimit=(m:Pick<Mission,'reviews'>)=>m.reviews.length?2:REVIEW_RETRIES;
 export const REPAIR_CYCLES = 2;
+/** A finding that still needs repair: not rejected and not deferred as an advisory note. */
+export const openFinding=(finding:Finding)=>!finding.rejection&&finding.triage?.disposition!=='defer';
+const LOW_DEFERRED='Low severity: recorded as an advisory PR note, not repaired automatically';
+const BUDGET_DEFERRED='Repair budget exhausted: medium finding recorded as an advisory PR note, not repaired automatically';
+/**
+ * Low findings never drive repair work, and once the automatic repair budget is spent neither do medium
+ * ones: only critical/high defects can hold a mission. Deferred findings are posted to the PR at completion.
+ */
+export function deferAdvisory(m:Pick<Mission,'repairBudget'>,round:ReviewRound):void {
+ for(const finding of round.findings){
+  if(finding.rejection||finding.triage)continue;
+  if(finding.severity==='low')finding.triage={disposition:'defer',detail:LOW_DEFERRED};
+  else if(finding.severity==='medium'&&m.repairBudget===0)finding.triage={disposition:'defer',detail:BUDGET_DEFERRED};
+ }
+}
+/** Markdown for the delivered PR: every deferred finding from valid rounds, once per path and title. */
+export function advisoryNotes(m:Pick<Mission,'reviews'>,limit=40):string|undefined {
+ const seen=new Set<string>();const rows:string[]=[];
+ for(const round of m.reviews){
+  if(round.invalidated)continue;
+  for(const finding of round.findings){
+   if(finding.rejection||finding.triage?.disposition!=='defer')continue;
+   const key=`${finding.path}\0${finding.title.trim().toLowerCase().replace(/\s+/g,' ')}`;
+   if(seen.has(key))continue;seen.add(key);
+   const body=finding.body.replace(/\s+/g,' ').trim();
+   rows.push(`- **${finding.severity}** \`${finding.path}:${finding.line}\` ${finding.title.trim()}: ${body.length>400?`${body.slice(0,400)}…`:body}`);
+  }
+ }
+ if(!rows.length)return undefined;
+ const more=rows.length>limit?`\n\n…and ${rows.length-limit} more in the mission record.`:'';
+ return `### Advisory review notes\nNon-blocking findings from the independent mission review, recorded instead of repaired. Later changes may already address some.\n\n${rows.slice(0,limit).join('\n')}${more}`;
+}
 export function repairBudgetReason(m:Mission):string|undefined {
  const review=m.reviews.at(-1);
  if(m.phase==='complete'||m.repairBudget!==0||!review||review.invalidated||m.evidence.verify?.outcome!=='passed'||m.evidence.verify.revision!==review.revision)return undefined;
- const open=review.findings.filter(finding=>!finding.rejection);
+ const open=review.findings.filter(openFinding);
  if(!open.length||open.some(finding=>!finding.triage))return undefined;
  return `Automatic repair budget exhausted. Unresolved findings: ${open.map(finding=>finding.id).join(', ')}. No further automatic repair wave; inspect the recorded evidence. Operator /mission review authorizes exactly one additional repair cycle`;
 }
@@ -66,7 +97,6 @@ const REVIEW_BACKOFF_MS = [2 * 60_000, 10 * 60_000, 30 * 60_000];
 export function reviewRetryAt(m: Pick<Mission, 'id' | 'evidence' | 'reviews'>): number | undefined {
  const review = m.evidence.review;
  if (review?.outcome !== 'failed' || providerCapacity(review.detail) === 'quota') return undefined;
- if (providerCapacity(review.detail) !== 'rate' && !transientReview.test(review.detail)) return undefined;
  const attempts = review.attempts ?? 1;
  if (attempts > reviewRetryLimit(m)) return undefined;
  const failedAt = Date.parse(review.at);
@@ -97,7 +127,7 @@ export function waveGate(m: Mission, ids: string[], snapshot: Snapshot): Gate {
   return {kind:'wave',token:token([m.id,m.round,ids.map(id=>[id,m.scopes[id],snapshot.beads.find(b=>b.id===id)?.status,snapshot.ready.includes(id)])]),detail:`Start workers: ${ids.join(', ')}`,approved:false};
 }
 export function revisionGate(m: Mission, kind: 'review' | 'repairs', revision: string): Gate {
- return {kind,token:token([m.id,m.round,kind,revision,kind==='repairs'?m.reviews.at(-1)?.findings:[]]),detail:kind==='review'?`Review revision ${revision}`:`Repair findings: ${m.reviews.at(-1)?.findings.filter(f=>!f.rejection).map(f=>f.id).join(', ')}`,approved:false};
+ return {kind,token:token([m.id,m.round,kind,revision,kind==='repairs'?m.reviews.at(-1)?.findings:[]]),detail:kind==='review'?`Review revision ${revision}`:`Repair findings: ${m.reviews.at(-1)?.findings.filter(openFinding).map(f=>f.id).join(', ')}`,approved:false};
 }
 export function setMode(m: Mission, mode: Mode): void { m.mode=mode; if(mode==='force')m.reviewRequested=true; if(mode!=='pause')delete m.gate; }
 /** Beads Auto/Force keep moving: the failure detail becomes the repair step. Pause and the local graph wait for the operator. */
@@ -108,23 +138,24 @@ export function approveGate(m: Mission, expected: string): void { if(!m.gate || 
 export function reviewTriageAction(m: Mission): Action | undefined {
  const review=m.reviews.at(-1);
  if(m.phase==='complete'||!review||review.invalidated||m.evidence.verify?.outcome!=='passed'||m.evidence.verify.revision!==review.revision)return undefined;
- const open=review.findings.filter(finding=>!finding.rejection);
+ const open=review.findings.filter(openFinding);
  const escalated=open.filter(finding=>finding.triage?.disposition==='escalate');
  if(escalated.length)return {kind:'hold',detail:`Review escalation: ${escalated.map(finding=>`${finding.id}: ${finding.triage!.detail}`).join('; ')}. Operator inspection required; /mission review explicitly authorizes another repair attempt`};
  const pending=open.filter(finding=>!finding.triage);
- if(pending.length)return {kind:'triage',ids:pending.map(finding=>finding.id),detail:`Validate ${pending.length} review finding${pending.length===1?'':'s'} against the requirements, current code and prior repair evidence; record evidence-based repair, reject or escalate decisions before creating repair work`};
+ if(pending.length)return {kind:'triage',ids:pending.map(finding=>finding.id),detail:`Validate ${pending.length} review finding${pending.length===1?'':'s'} against the requirements, current code and prior repair evidence; record evidence-based repair, reject, defer or escalate decisions before creating repair work`};
  const budget=repairBudgetReason(m);return budget?{kind:'hold',detail:budget}:undefined;
 }
 export function triageFindings(m: Mission, decisions: readonly FindingDecision[]): void {
  const review=m.reviews.at(-1);
  if(m.phase==='complete'||!review||review.invalidated)throw new Error('No current independent findings to triage');
- if(review.findings.some(finding=>!finding.rejection&&finding.triage?.disposition==='escalate'))throw new Error('An escalated finding requires an operator decision');
- const pending=review.findings.filter(finding=>!finding.rejection&&!finding.triage);
+ if(review.findings.some(finding=>openFinding(finding)&&finding.triage?.disposition==='escalate'))throw new Error('An escalated finding requires an operator decision');
+ const pending=review.findings.filter(finding=>openFinding(finding)&&!finding.triage);
  if(!pending.length||decisions.length!==pending.length||new Set(decisions.map(decision=>decision.findingId)).size!==pending.length)throw new Error('Triage must decide every pending finding exactly once');
  const history=m.reviews.slice(0,-1).filter(round=>!round.invalidated);
  const prepared=decisions.map(decision=>{
   const finding=pending.find(finding=>finding.id===decision.findingId);
-  if(!finding||!decision.detail.trim()||decision.detail.length>9000||!['repair','reject','escalate'].includes(decision.disposition))throw new Error(`Invalid finding decision: ${decision.findingId}`);
+  if(!finding||!decision.detail.trim()||decision.detail.length>9000||!['repair','reject','defer','escalate'].includes(decision.disposition))throw new Error(`Invalid finding decision: ${decision.findingId}`);
+  if(decision.disposition==='defer'&&(finding.severity==='critical'||finding.severity==='high'))throw new Error(`A ${finding.severity} finding cannot be deferred: ${decision.findingId}`);
   if(decision.previousFindingId&&!history.some(round=>round.findings.some(prior=>prior.id===decision.previousFindingId&&!prior.rejection&&prior.triage?.disposition==='repair')))throw new Error(`Previous confirmed finding missing: ${decision.previousFindingId}`);
   let predecessor=decision.previousFindingId;
   let nextRevision=review.revision;
@@ -247,7 +278,7 @@ export function nextAction(m: Mission, snapshot: Snapshot | undefined, policy: P
  }
  const review = m.reviews.at(-1);
  if (review && !review.invalidated && review.revision === revision) {
-  if (!review.findings.some(finding => !finding.rejection)) return {kind: 'complete', detail: 'Verified current revision independently reviewed clean'};
+  if (!review.findings.some(openFinding)) return {kind: 'complete', detail: 'Verified current revision independently reviewed with no blocking findings'};
   const gate = revisionGate(m, 'repairs', revision);
   if (m.mode === 'pause' && (m.gate?.token !== gate.token || !m.gate.approved)) return {kind: 'hold', detail: gate.detail, gate};
   return {kind: 'repairs', detail: local ? 'Repair findings in this pane, then rereview' : 'Create scoped repair beads linked to actionable findings'};

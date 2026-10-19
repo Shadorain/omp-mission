@@ -82,7 +82,7 @@ test('independent review -> repair -> rereview loop state transitions', () => {
   expect(nextAction(m, emptySnapshot, basePolicy).kind).toBe('complete');
 });
 
-test('a throttled or timed-out review reruns by itself after its backoff, and only quota or a spent budget waits for the operator', () => {
+test('a failed review reruns by itself after its backoff, and only quota or a spent budget waits for the operator', () => {
   const m = mkMission();
   m.epicId = 'E';
   m.reviewRequested = true;
@@ -111,9 +111,10 @@ test('a throttled or timed-out review reruns by itself after its backoff, and on
   expect(spent.detail).toStartWith('Review failed; /mission review explicitly retries');
   expect(operatorStep(m, spent, basePolicy).command).toBe('/mission review');
 
-  // Quota and non-transient failures never rerun by themselves.
+  // Quota never reruns by itself; any other failure (including a deterministic one) retries within the budget.
   expect(fail('Reviewer error: quota exhausted for this month', 24 * 3600_000).detail).toStartWith('Review failed; /mission review explicitly retries');
-  expect(fail('Revision changed during review; result invalidated', 24 * 3600_000).detail).toStartWith('Review failed; /mission review explicitly retries');
+  expect(fail('Revision changed during review; result invalidated', 24 * 3600_000).kind).toBe('review');
+  expect(fail('Reviewer returned invalid JSON twice', 24 * 3600_000, REVIEW_RETRIES + 1).detail).toStartWith('Review failed; /mission review explicitly retries');
 });
 
 test('provider waits longer than six hours are honored with bounded jitter and the longest hint wins', () => {
@@ -147,13 +148,15 @@ test('resource_exhausted with a timed free-model rate limit waits for reset, not
  expect(providerCapacity('resource_exhausted')).toBe('quota');
 });
 
-test('a follow-up review retries once, not through the full-audit backoff ladder',()=>{
+test('a follow-up review retries twice, not through the full-audit backoff ladder',()=>{
  const m=mkMission();m.epicId='E';m.reviewRequested=true;
  m.evidence.verify={outcome:'passed',revision:'repair',detail:'Verified',at:'now'};m.evidence.deliver={...m.evidence.verify};
  m.reviews=[{round:1,revision:'previous',model:'independent',summary:'Earlier audit',findings:[],at:'now'}];
  m.evidence.review={outcome:'failed',revision:'repair',detail:'Reviewer deadline exceeded',attempts:1,at:new Date(Date.now()-3*60_000).toISOString()};
  expect(nextAction(m,emptySnapshot,basePolicy).kind).toBe('review');
  m.evidence.review.attempts=2;m.evidence.review.at=new Date(Date.now()-24*3600_000).toISOString();
+ expect(nextAction(m,emptySnapshot,basePolicy).kind).toBe('review');
+ m.evidence.review.attempts=3;
  expect(reviewRetryAt(m)).toBeUndefined();
  expect(nextAction(m,emptySnapshot,basePolicy).kind).toBe('hold');
  expect(nextAction(m,emptySnapshot,basePolicy).detail).toContain('explicitly retries');

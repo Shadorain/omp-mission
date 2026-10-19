@@ -249,6 +249,7 @@ function evidenceRows(mission: Mission): string[] {
 		for (const finding of review.findings) {
 			rows.push(`${finding.id} · ${finding.severity} · ${finding.path}:${finding.line} · ${finding.title}: ${finding.body}`);
 			if (finding.rejection) rows.push(`Rejected: ${finding.rejection}`);
+			else if (finding.triage?.disposition === "defer") rows.push(`Deferred: ${finding.triage.detail}`);
 			const repairs = Object.entries(mission.repairLinks).filter(([, findings]) => findings.includes(finding.id)).map(([beadId]) => beadId);
 			if (repairs.length) rows.push(`Repair beads: ${repairs.join(", ")}`);
 		}

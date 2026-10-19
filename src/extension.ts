@@ -14,7 +14,7 @@ import { acquireOwnership, listMissions, loadMission, missionId, missionPath, sa
 import type { Ownership } from './store';
 import { readClaimActor, readGraph, readHistory } from './beads';
 import { createWorkerDriver } from './workers';
-import { approveGate, autoDispatchAllowed, consumeGate, consumeRepairBudget, deliverUrl, displayPhase, effectiveGraph, enforceGate, enforceMutation, isProviderBlocker, modelRetryTargets, nextAction, operatorCommands, operatorStep, QUOTA_BLOCKER, RATE_BLOCKER, REPAIR_CYCLES, repairBudgetReason, requireBeadsGraph, revisionGate, reviewTriageAction, reviewFailureStep, setMode, terminalCapacity, triageFindings, waveGate } from './controller';
+import { advisoryNotes, approveGate, autoDispatchAllowed, consumeGate, consumeRepairBudget, deferAdvisory, deliverUrl, displayPhase, effectiveGraph, enforceGate, enforceMutation, isProviderBlocker, modelRetryTargets, nextAction, openFinding, operatorCommands, operatorStep, QUOTA_BLOCKER, RATE_BLOCKER, REPAIR_CYCLES, repairBudgetReason, requireBeadsGraph, revisionGate, reviewTriageAction, reviewFailureStep, setMode, terminalCapacity, triageFindings, waveGate } from './controller';
 import { alignVerifiedRevision, captureRevision, Reviewer, roleModelString } from './review';
 import { beadTask, checkPrompt, coordinatorPrompt, guide, planSlug, workerPrompt } from './prompts';
 import { createMissionWidget, createMissionInspector, phaseLabel } from './ui';
@@ -342,7 +342,15 @@ async function tryComplete(m:Mission,evidence:Omit<Evidence,'outcome'>){
  m.phase='complete';
  m.evidence.complete={...evidence,outcome:'passed'};
  if(m.evidence.repair?.outcome==='active')m.evidence.repair={...m.evidence.complete};
+ await postAdvisory(m);
  return true;
+}
+/** Deferred findings go to the delivered PR once; a failed post never blocks completion. */
+async function postAdvisory(m:Mission){
+ if(m.advisoryPosted||m.workspace.delivery!=='pr')return;
+ const url=deliverUrl(m);const body=advisoryNotes(m);if(!url||!body)return;
+ const posted=await run('gh',['pr','comment',url,'--body',body],m.workspace.cwd).catch(()=>undefined);
+ if(posted?.code===0)m.advisoryPosted=new Date().toISOString();
 }
 async function finishMission(context:ExtensionContext){
  const m=mission;const review=m?.reviews.at(-1);if(!m||!review||!ownership||resumeHold||ownershipError)return;
@@ -430,12 +438,13 @@ async function finishMission(context:ExtensionContext){
   context.ui.notify('Independent review started in its own session. It can take several minutes; the result is reported here.','info');
   // Fire and forget: a review can outlast the command handler, and every outcome is reported through notify.
   void control({operation:'run_review'},context).then(()=>{
-   const round=mission?.reviews.at(-1);const open=round?.findings.filter(finding=>!finding.rejection).length??0;
+   const round=mission?.reviews.at(-1);const open=round?.findings.filter(openFinding).length??0;const advisory=round?round.findings.length-open-round.findings.filter(finding=>finding.rejection).length:0;
    const took=`${Math.round((Date.now()-startedAt)/1000)}s`;
    const transcripts=mission?.reviews.at(-1)?.transcripts?` Reviewer transcripts: ${Object.keys(mission.reviews.at(-1)!.transcripts!).join(', ')} (paths in /mission show, evidence view; open one with omp --resume <path>).`:'';
    // A bare "passed" proves nothing happened; say what the reviewers reported, and where the full text is.
    const checked=round?.summary.replace(/\s+/g,' ').trim();const excerpt=checked?` ${checked.length>280?`${checked.slice(0,280)}…`:checked} (full text: /mission show, evidence view)`:'';
-   context.ui.notify(round?(open?`Independent review found ${open} issue${open===1?'':'s'} in ${took}. /mission shows the next step.${transcripts}`:`Independent review passed with no findings in ${took}.${excerpt}${transcripts}`):'Independent review finished.','info');
+   const notes=advisory?` ${advisory} advisory note${advisory===1?'':'s'} recorded for the PR.`:'';
+   context.ui.notify(round?(open?`Independent review found ${open} blocking issue${open===1?'':'s'} in ${took}.${notes} /mission shows the next step.${transcripts}`:`Independent review passed with no blocking findings in ${took}.${notes}${excerpt}${transcripts}`):'Independent review finished.','info');
   },error=>{reviewBlocked=signature;const detail=error instanceof Error?error.message:String(error);const progress=mission?.reviewProgress;const step=reviewFailureStep(detail,progress?Object.keys(progress.targets).length:0,progress?Object.keys(progress.inputs).length:0);context.ui.notify(`${detail}. ${step.text}${step.command?` (${step.command})`:''}`,'error');});
   return true;
  }
@@ -561,7 +570,7 @@ async function finishMission(context:ExtensionContext){
   checkState:z.enum(['clean','merged','closed','conflict','threads','checks','fixing','unknown']).optional(),
   conflicts:z.array(z.string()).max(200).optional(),threads:z.object({open:z.number().int().min(0),total:z.number().int().min(0)}).optional(),
   model:z.string().min(1).max(1000).optional(),
-  decisions:z.array(z.object({findingId:z.string().min(1).max(1000),disposition:z.enum(['repair','reject','escalate']),detail:z.string().trim().min(1).max(9000),previousFindingId:z.string().min(1).max(1000).optional()})).min(1).max(1000).optional()
+  decisions:z.array(z.object({findingId:z.string().min(1).max(1000),disposition:z.enum(['repair','reject','defer','escalate']),detail:z.string().trim().min(1).max(9000),previousFindingId:z.string().min(1).max(1000).optional()})).min(1).max(1000).optional()
  });
  async function control(rawParams:unknown,context:ExtensionContext,_signal?:AbortSignal,internal:{reuseOnly?:boolean;operator?:boolean}={}){
   const params=controlSchema.parse(rawParams);
@@ -654,7 +663,7 @@ async function finishMission(context:ExtensionContext){
      if(params.operation==='bind_repairs'){
       if(mission.phase!=='repair'||mission.evidence.repair?.outcome!=='active')throw new Error('Accept findings before binding repairs');
       if(!params.repairLinks)throw new Error('Finding links required');
-      const findingIds=mission.reviews.at(-1)!.findings.filter(f=>!f.rejection).map(f=>f.id);
+      const findingIds=mission.reviews.at(-1)!.findings.filter(openFinding).map(f=>f.id);
       for(const id of Object.keys(params.scopes)){const links=params.repairLinks[id];if(!links?.length||links.some(link=>!findingIds.includes(link)))throw new Error(`Invalid finding links: ${id}`);}
       if(findingIds.some(id=>!Object.values(params.repairLinks!).some(links=>links.includes(id))))throw new Error('Every actionable finding needs a repair bead');
       consumeRepairBudget(mission);Object.assign(mission.repairLinks,params.repairLinks);mission.round++;delete mission.evidence.verify;delete mission.evidence.deliver;delete mission.gate;
@@ -678,7 +687,7 @@ async function finishMission(context:ExtensionContext){
      if (!params.detail || params.passed === undefined) throw new Error('Actual command/result detail and passed required');
      const captured = await captureRevision(mission, run);
      const previous = mission.reviews.at(-1);
-     if (params.passed && previous && previous.findings.some(finding => !finding.rejection) && mission.round > previous.round && previous.revision === captured.revision) {
+     if (params.passed && previous && previous.findings.some(openFinding) && mission.round > previous.round && previous.revision === captured.revision) {
       throw new Error('Repair output unchanged; verification cannot resolve findings');
      }
      const evidence: Evidence = {
@@ -717,8 +726,9 @@ async function finishMission(context:ExtensionContext){
      const reviewFiles=await contextFilesFor(config.reviewContext,mission.workspace.cwd,agentDir);const targets=config.frontend==='subagent'&&mission.graph==='beads'&&snapshot?snapshot.leaves.filter(b=>mission!.scopes[b.id]?.length).map(b=>({id:b.id,title:b.title,text:beadTask(b)??b.title,files:mission!.scopes[b.id]!})):[];const result=targets.length>1?await reviewer.runPerBead(mission,context,run,config.modelRole,reviewFiles,targets,config.reviewConcurrency):await reviewer.run(mission,context,run,config.modelRole,reviewFiles);if(epoch!==generation)throw new Error('Session changed during review');
      consumeGate(mission);
      mission.reviews.push(result);
+     deferAdvisory(mission,result);
      mission.evidence.review = {outcome:'passed',detail:result.summary,revision:result.revision,at:result.at};
-     if (!result.findings.length) {
+     if (!result.findings.some(openFinding)) {
       await tryComplete(mission,{detail:'Verification, delivery and independent review complete',revision:result.revision,at:result.at});
      }
     }else if(params.operation==='triage_findings'){
@@ -726,11 +736,11 @@ async function finishMission(context:ExtensionContext){
      if(!review||(await captureRevision(mission,run)).revision!==review.revision)throw new Error('Review revision changed; reverify/rereview before triage');
      triageFindings(mission,params.decisions??[]);
      await refresh(false);
-     if(nextAction(mission,snapshot,policy(context)).kind==='complete')await tryComplete(mission,{detail:'All independent findings rejected with recorded evidence',revision:review.revision,at:new Date().toISOString()});
+     if(nextAction(mission,snapshot,policy(context)).kind==='complete')await tryComplete(mission,{detail:'No blocking independent findings remain after evidence-based triage',revision:review.revision,at:new Date().toISOString()});
     }else if(params.operation==='accept_repairs'){
      const review = mission.reviews.at(-1);
-     if (!review || review.invalidated || !review.findings.some(finding => !finding.rejection)) throw new Error('No actionable findings');
-     if(review.findings.some(finding=>!finding.rejection&&finding.triage?.disposition!=='repair'))throw new Error('Validate and triage every finding before accepting repairs');
+     if (!review || review.invalidated || !review.findings.some(openFinding)) throw new Error('No actionable findings');
+     if(review.findings.some(finding=>openFinding(finding)&&finding.triage?.disposition!=='repair'))throw new Error('Validate and triage every finding before accepting repairs');
      if ((await captureRevision(mission, run)).revision !== review.revision) throw new Error('Review revision changed; reverify/rereview');
      enforceGate(mission, revisionGate(mission, 'repairs', review.revision));
      const local = effectiveGraph(mission) === 'local';
@@ -757,7 +767,7 @@ async function finishMission(context:ExtensionContext){
      finding.rejection = params.detail;
      finding.triage={disposition:'reject',detail:params.detail};
      const evidence: Evidence = {outcome:'passed',detail:'All independent findings explicitly rejected with recorded reasons',revision:review.revision,at:new Date().toISOString()};
-     if (!review.findings.some(finding => !finding.rejection) && mission.evidence.repair?.outcome === 'active') {
+     if (!review.findings.some(openFinding) && mission.evidence.repair?.outcome === 'active') {
       mission.evidence.repair = {...evidence, outcome:'skipped'};
      }
      await refresh(false);

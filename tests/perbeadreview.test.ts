@@ -155,6 +155,29 @@ test('unchanged scopes with unresolved findings are reviewed alongside changed s
  expect(review.findings).toEqual([expect.objectContaining({id:'bd-a:still-open'})]);
 });
 
+test('deferred findings do not pull unchanged scopes back into a follow-up and are shown as deferred',async()=>{
+ await writeFile(join(root,'a','one.txt'),'changed a');
+ await writeFile(join(root,'b','two.txt'),'changed b');
+ const m=await missionAt();
+ const first=await new Reviewer(opener([],payload=>({summary:'Initial review',findings:beadOf(payload)==='bd-a'?[{...finding('note'),severity:'low'}]:[]}))).runPerBead(m,ctx,real,'default',undefined,targets);
+ first.findings[0]!.triage={disposition:'defer',detail:'Low severity: advisory'};
+ m.reviews.push(first);
+ await writeFile(join(root,'b','two.txt'),'repaired b only');
+ m.round=2;m.evidence.verify={outcome:'passed',detail:'Verified changed output',revision:(await captureRevision(m,real)).revision,at:'now'};
+ const sent:Array<{note:string;payload:Record<string,unknown>}>=[];
+ await new Reviewer(opener(sent,()=>({summary:'Review',findings:[]}))).runPerBead(m,ctx,real,'default',undefined,targets);
+ expect(sent.map(item=>beadOf(item.payload))).toEqual(['bd-b']);
+ await writeFile(join(root,'a','one.txt'),'repaired a later');
+ m.evidence.verify={outcome:'passed',detail:'Verified changed output',revision:(await captureRevision(m,real)).revision,at:'now'};
+ sent.length=0;
+ await new Reviewer(opener(sent,()=>({summary:'Review',findings:[]}))).runPerBead(m,ctx,real,'default',undefined,targets);
+ const beadA=sent.find(item=>beadOf(item.payload)==='bd-a')!;
+ const decisions=beadA.payload.priorDecisions;
+ expect(Array.isArray(decisions)?decisions.map(decision=>decision&&typeof decision==='object'&&'status' in decision?decision.status:undefined):decisions).toEqual(['deferred']);
+ const scope=beadA.payload.reviewScope;
+ expect(scope&&typeof scope==='object'&&'unresolvedFindings' in scope?scope.unresolvedFindings:scope).toEqual([]);
+});
+
 test('repair ownership transfer reviews only the repair delta, not the cumulative branch',async()=>{
  await writeFile(join(root,'a','one.txt'),'reviewed first wave\n');
  const m=await missionAt();

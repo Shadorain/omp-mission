@@ -1,5 +1,5 @@
 import {test,expect} from 'bun:test';
-import {nextAction,operatorStep,operatorCommands,modelRetryTargets,setMode,approveGate,enforceMutation,enforceGate,waveGate,terminalCapacity,QUOTA_BLOCKER,reviewTriageAction,triageFindings,consumeRepairBudget} from '../src/controller';
+import {nextAction,operatorStep,operatorCommands,modelRetryTargets,setMode,approveGate,enforceMutation,enforceGate,waveGate,terminalCapacity,QUOTA_BLOCKER,reviewTriageAction,triageFindings,consumeRepairBudget,deferAdvisory,advisoryNotes} from '../src/controller';
 import { validateMission } from '../src/store';
 import type {Mission,Snapshot,PolicyContext,ReviewRound} from '../src/types';
 export function fixture(): Mission {return {version:1,id:'freeform-test',source:{kind:'freeform',id:'test',title:'test',body:'test',comments:'',extra:''},workspace:{key:'key',cwd:'/tmp',delivery:'local'},epicId:'epic',scopes:{a:['a.ts'],b:['b.ts']},phase:'execute',evidence:{},mode:'auto',keep:false,reviewRequested:false,workers:[],reviews:[],repairLinks:{},round:1,createdAt:'now',updatedAt:'now'};}
@@ -342,4 +342,50 @@ test('zero repair budget still permits evidence triage and clean completion',()=
  expect(nextAction(m,closed,policy).kind).toBe('triage');
  triageFindings(m,[{findingId:'false',disposition:'reject',detail:'a.ts:1 case-sensitive substring comparison is false'}]);
  expect(nextAction(m,closed,policy).kind).toBe('complete');
+});
+
+function severityRound(revision:string,severities:Array<'critical'|'high'|'medium'|'low'>):ReviewRound{
+ return {round:1,revision,model:'independent',summary:'Findings',at:'now',findings:severities.map((severity,index)=>({id:`${severity}-${index}`,severity,path:`f${index}.ts`,line:1,title:`${severity} finding ${index}`,body:'Consumer-visible effect'}))};
+}
+function reviewed(m:Mission,round:ReviewRound){m.phase='review';m.reviewRequested=true;m.evidence.verify={outcome:'passed',revision:round.revision,detail:'Verified',at:'now'};m.evidence.deliver={...m.evidence.verify};m.reviews.push(round);deferAdvisory(m,round);}
+
+test('low findings never drive repair work: a round of only low findings completes and keeps them as advisory notes',()=>{
+ const m=fixture();reviewed(m,severityRound('r',['low','low']));
+ expect(nextAction(m,closed,policy).kind).toBe('complete');
+ expect(m.reviews[0]!.findings.every(finding=>finding.triage?.disposition==='defer'&&!finding.rejection)).toBe(true);
+ expect(validateMission(m).reviews[0]!.findings[0]!.triage?.disposition).toBe('defer');
+});
+
+test('only critical/high findings and medium findings triaged repair block completion',()=>{
+ const m=fixture();reviewed(m,severityRound('r',['high','medium','low']));
+ expect(reviewTriageAction(m)).toMatchObject({kind:'triage',ids:['high-0','medium-1']});
+ expect(()=>triageFindings(m,[{findingId:'high-0',disposition:'defer',detail:'f0.ts:1 minor'},{findingId:'medium-1',disposition:'defer',detail:'f1.ts:1 edge path only'}])).toThrow('cannot be deferred');
+ triageFindings(m,[{findingId:'high-0',disposition:'reject',detail:'f0.ts:1 already guarded by the caller'},{findingId:'medium-1',disposition:'defer',detail:'f1.ts:1 edge path only; no acceptance criterion affected'}]);
+ expect(nextAction(m,closed,policy).kind).toBe('complete');
+ const other=fixture();reviewed(other,severityRound('r',['medium']));
+ triageFindings(other,[{findingId:'medium-0',disposition:'repair',detail:'f0.ts:1 breaks an acceptance criterion'}]);
+ expect(nextAction(other,closed,policy).kind).toBe('repairs');
+});
+
+test('an exhausted repair budget defers medium findings and holds only on critical/high',()=>{
+ const medium=fixture();medium.repairBudget=0;reviewed(medium,severityRound('r',['medium','low']));
+ expect(nextAction(medium,closed,policy).kind).toBe('complete');
+ const high=fixture();high.repairBudget=0;reviewed(high,severityRound('r',['high','medium']));
+ triageFindings(high,[{findingId:'high-0',disposition:'repair',detail:'f0.ts:1 reproduced'}]);
+ expect(nextAction(high,closed,policy)).toMatchObject({kind:'hold',detail:expect.stringContaining('high-0')});
+ expect(nextAction(high,closed,policy).detail).not.toContain('medium-1');
+});
+
+test('advisory notes list each deferred finding once across valid rounds',()=>{
+ const m=fixture();
+ const first=severityRound('a',['low','medium']);first.findings[1]!.rejection='not reproducible';first.findings[1]!.triage={disposition:'reject',detail:'not reproducible'};
+ const repeat=severityRound('b',['low']);
+ const stale={...severityRound('c',['low']),invalidated:'Source changed'};stale.findings[0]!.path='stale.ts';
+ for(const round of [first,repeat,stale])deferAdvisory(m,round);
+ m.reviews=[first,repeat,stale];
+ const notes=advisoryNotes(m)!;
+ expect(notes.match(/`f0\.ts:1`/g)).toHaveLength(1);
+ expect(notes).not.toContain('f1.ts');
+ expect(notes).not.toContain('stale.ts');
+ expect(advisoryNotes(fixture())).toBeUndefined();
 });

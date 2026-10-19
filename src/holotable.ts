@@ -5,7 +5,7 @@ import { createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import type { ExtensionContext, PlanReviewChoice } from '@oh-my-pi/pi-coding-agent';
-import { deliverUrl, displayPhase, effectiveGraph, modelRetryTargets, operatorCommands, providerCapacity, quotaBlocked, repairBudgetReason, reviewTriageAction, reviewRetryAt } from './controller';
+import { deliverUrl, displayPhase, effectiveGraph, modelRetryTargets, openFinding, operatorCommands, providerCapacity, quotaBlocked, repairBudgetReason, reviewTriageAction, reviewRetryAt } from './controller';
 import { isRecord } from './guards';
 import { displaySourceId } from './sources';
 import { missionDirectory } from './store';
@@ -347,7 +347,7 @@ export async function buildContactStatus(input: StatusInput): Promise<ContactSta
   repeatedFailedRevision:measured.repeatedFailedRevision,mergePreflightFailures:measured.mergePreflightFailures,
   boundaryFailures:measured.boundaryFailures,reviewFailures:measured.reviewFailures,acceptedRepairs:measured.acceptedRepairs,
   completedRounds:m.reviews.length,invalidatedRounds,findingOccurrences,
-  latestActionable:latest&&!latest.invalidated?latest.findings.filter(f=>!f.rejection).length:0,
+  latestActionable:latest&&!latest.invalidated?latest.findings.filter(openFinding).length:0,
   latestRejected:latest&&!latest.invalidated?latest.findings.filter(f=>!!f.rejection).length:0,
   severity,workerAttempts:m.workers.length,workerBeads:new Set(m.workers.map(w=>w.beadId)).size,
   repairRound:m.round,repairLinks,config:input.measurementConfig,
