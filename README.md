@@ -127,7 +127,7 @@ Provider quota or credit exhaustion parks the coordinator, worker or reviewer wi
 
 Coordinator model selection belongs to OMP. `/mission continue` never selects a model: a later manual choice remains in effect, including when Holotable sends automatic Continue. Obsolete saved coordinator overrides are ignored on load.
 
-A failed `record_verification` is a durable hold. The model cannot record success or release it. After resolving the blocker, the operator runs `/mission continue`; verification becomes pending, not passed.
+A failed `record_verification` parks Pause and local-graph missions: after resolving the blocker, the operator runs `/mission continue`, which resets verification to pending, not passed. Beads Auto/Force instead keep the failure as the coordinator's repair step so it can fix the defect and rerun checks without an operator Continue.
 
 
 Linear checkout inference uses the first ticket identifier in each branch/path component. Later identifiers for the same project, or uppercase identifiers for other projects, still flag conflicts; lowercase title suffixes such as `chr-143-domain-error-2` do not create an `ERROR-2` ticket.
@@ -155,6 +155,8 @@ A malformed reviewer reply is sent back once in the same session with the reason
 Every completed review with open findings wakes the coordinator for evidence-based triage before repair work can begin. It checks each claim against requirements, current code and earlier repairs, then records `mission_control triage_findings` decisions for every pending finding: **repair**, **reject with evidence**, or **escalate a genuine unresolved conflict**. Low severity alone is not a rejection reason. Confirmed defects become one scoped repair wave; duplicate, cosmetic, speculative or already-fixed claims need a recorded explanation, not another blind fix/review cycle. Subsequent independent review covers changed scopes and scopes with unresolved findings.
 
 Automatic repair work has a persisted **two-cycle budget**: one cycle is a whole bound repair wave, not each worker or reviewer. The last allowed wave still runs verification, delivery and independent review. Pending claims can still be rejected with evidence, and a clean result completes normally. If confirmed findings remain afterward—even different new findings—the mission stops **blocked**, names the unresolved IDs and does not create more repair work. `/mission review` grants exactly one additional cycle after inspection; Continue, Force, model recovery and restarts never refill the budget. An already-active legacy repair wave counts as the first cycle when resumed with this policy.
+
+Holotable can opt into **Extra repair cycle** (`auto.repairs`): one additional authorization per contact, durably bounded by its history. Updated panes distinguish a confirmed budget hold as `problem.source: repair-budget`; scoped socket `review` with `args.repairBudgetOnly: true` rejects Pause and other holds, including genuine escalations. Ordinary ownership, resume, gate and revision guards still apply. Existing panes need a restart/relaunch to load this capability; board Auto and Recovery remain separate opt-ins.
 
 A confirmed defect surviving two linked repair attempts on distinct reviewed revisions may escalate earlier; invalidated, unchanged and untriaged legacy verdicts do not count as confirmed failed attempts. Native approval, Pause gates and ownership remain required.
 

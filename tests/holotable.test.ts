@@ -149,6 +149,7 @@ test('only an evidence-backed escalation parks review and Continue cannot releas
   expect(continued.actions).toContain('review');
   expect(run.sent).toEqual([]);
   expect((await ctl(socket,{v:1,op:'review'})).ok).toBe(false);
+  expect((await ctl(socket,{v:1,op:'review',operator:true,args:{repairBudgetOnly:true}})).ok).toBe(false);
   expect((await ctl(socket,{v:1,op:'review',operator:true})).ok).toBe(true);
   const saved=(await listMissions(run.root))[0]!.mission;
   expect(saved.reviews[0]!.findings[0]!.triage).toMatchObject({disposition:'repair',detail:expect.stringContaining('Operator authorized')});
@@ -987,4 +988,27 @@ test('detach flushes late coordinator usage inside the normal sampling window',a
  expect(final.usage?.tokens.input).toBe(9);
  expect(final.usageEvidence?.sources[0]?.pricedMessages).toBe(2);
  expect(final.ctl).toBeNull();
+});
+
+test('a confirmed repair-budget hold publishes its capability and grants exactly one cycle over the socket',async()=>{
+ const mission=baseMission('/tmp',{phase:'review',reviewRequested:true,repairBudget:0});
+ const {revision}=await captureRevision(mission,async()=>{throw new Error('Unexpected command');});
+ mission.evidence.verify={outcome:'passed',revision,detail:'Verified output',at:'now'};
+ mission.evidence.deliver={...mission.evidence.verify,detail:'Delivered output'};
+ mission.reviews=[{round:1,revision,model:'independent',at:'now',summary:'Defect',findings:[{id:'f',severity:'high',path:'task.ts',line:1,title:'Unresolved defect',body:'A consumer workflow fails',triage:{disposition:'repair',detail:'task.ts:1 confirmed against acceptance'}}]}];
+ const run=await session({mission,child:true});
+ try{
+  const socket=(await statusOf(run,mission)).ctl!.socket;
+  expect((await ctl(socket,{v:1,op:'continue',operator:true})).ok).toBe(true);
+  expect((await statusOf(run,mission)).problem?.source).toBe('repair-budget');
+  expect((await ctl(socket,{v:1,op:'mode',operator:true,args:{mode:'pause'}})).ok).toBe(true);
+  expect((await ctl(socket,{v:1,op:'review',operator:true,args:{repairBudgetOnly:true}})).ok).toBe(false);
+  expect((await ctl(socket,{v:1,op:'mode',operator:true,args:{mode:'auto'}})).ok).toBe(true);
+  expect((await ctl(socket,{v:1,op:'review',operator:true,args:{repairBudgetOnly:true}})).ok).toBe(true);
+  const saved=(await listMissions(run.root))[0]!.mission;
+  expect(saved.repairBudget).toBe(1);
+  expect(saved.evidence.verify?.outcome).toBe('passed');
+  expect(saved.reviews[0]!.findings[0]!.triage?.disposition).toBe('repair');
+  expect((await ctl(socket,{v:1,op:'review',operator:true,args:{repairBudgetOnly:true}})).ok).toBe(false);
+ }finally{await run.event('session_shutdown',{});}
 });

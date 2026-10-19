@@ -5,7 +5,7 @@ import { createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import type { ExtensionContext, PlanReviewChoice } from '@oh-my-pi/pi-coding-agent';
-import { deliverUrl, displayPhase, effectiveGraph, modelRetryTargets, operatorCommands, providerCapacity, quotaBlocked, reviewTriageAction, reviewRetryAt } from './controller';
+import { deliverUrl, displayPhase, effectiveGraph, modelRetryTargets, operatorCommands, providerCapacity, quotaBlocked, repairBudgetReason, reviewTriageAction, reviewRetryAt } from './controller';
 import { isRecord } from './guards';
 import { displaySourceId } from './sources';
 import { missionDirectory } from './store';
@@ -34,7 +34,8 @@ function missionProblem(m: Mission, graphError?: string): MissionProblem | null 
  const worker = m.workers.find(w => w.state !== 'closed' && w.error);
  const triage=reviewTriageAction(m);
  const escalation=triage?.kind==='hold'?triage.detail:undefined;
- const source = graphError ? 'graph' : m.blocker ? 'coordinator' : escalation ? 'triage'
+ const budgetExhausted=escalation!==undefined&&escalation===repairBudgetReason(m);
+ const source = graphError ? 'graph' : m.blocker ? 'coordinator' : escalation ? budgetExhausted?'repair-budget':'triage'
   : review?.outcome === 'failed' ? 'review' : worker ? 'worker'
   : m.evidence.verify?.outcome === 'failed' ? 'verification' : undefined;
  const detail = graphError ?? m.blocker ?? escalation ?? (source === 'review' ? review!.detail : worker?.error ?? (source === 'verification' ? m.evidence.verify!.detail : undefined));
@@ -42,7 +43,7 @@ function missionProblem(m: Mission, graphError?: string): MissionProblem | null 
  const capacity = providerCapacity(detail);
  const retry = source === 'review' ? reviewRetryAt(m) : undefined;
  return {
-  kind: capacity === 'quota' ? 'quota' : capacity === 'rate' ? 'rate-limit'
+  kind: source === 'repair-budget' ? 'error' : capacity === 'quota' ? 'quota' : capacity === 'rate' ? 'rate-limit'
    : /deadline exceeded|timed out|timeout/i.test(detail) ? 'timeout' : 'error',
   source, detail, retryAt: retry === undefined ? null : new Date(retry).toISOString(),
   attempt: source === 'review' ? review!.attempts ?? 1 : null,
@@ -665,6 +666,8 @@ export class HolotableBridge {
 			} else if (op === 'clear') {
 				await this.hooks.clear(context);
 			} else if (op === 'plan-edit') {
+        if (op === 'review' && args.repairBudgetOnly === true && (!mission || mission.mode === 'pause' || missionProblem(mission)?.source !== 'repair-budget'))
+          return fail('rejected', 'No confirmed repair-budget hold to authorize');
 				if (mission || !pending) return fail('rejected', 'No pending plan is awaiting approval');
 				if (typeof args.text !== 'string') return fail('bad-request', 'plan-edit requires args.text');
 				if (Buffer.byteLength(args.text, 'utf8') > MAX_PLAN) return fail('bad-request', 'Plan text exceeds 256 KiB');
