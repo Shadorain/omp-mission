@@ -101,6 +101,19 @@ test('commands that rewrite checkout files are blocked', () => {
   ]) blocked(command);
 });
 
+test('branch-history rewrites and force pushes are blocked; plain pushes and dry runs pass', () => {
+  for (const command of [
+    'git commit-tree HEAD^{tree} -p origin/main -m replant', 'git update-ref refs/heads/feature abc', 'git read-tree origin/main',
+    'git reset --soft origin/main', 'git replace abc def', 'git filter-branch --all', 'git symbolic-ref HEAD refs/heads/other',
+    'git push --force origin feature', 'git push -f origin feature', 'git push -uf origin feature', 'git push --force-with-lease',
+    'git push origin +feature', 'T=$(git commit-tree t -p p -m m) && git update-ref HEAD $T',
+  ]) blocked(command);
+  for (const command of ['git push origin feature', 'git push -u origin feature', 'git read-tree -n HEAD', 'git symbolic-ref HEAD'])
+    allowed(command);
+  const merge = checkCommand('git merge origin/main');
+  expect(merge.allowed ? '' : merge.reason).toContain('merge_base');
+});
+
 test('fingerprinting reports bash-made content and mode mutations inside scopes with exact paths', async () => {
   const before = await fingerprintScopes(real, cwd, guard.scopes);
   await bash(cwd, 'echo changed >> src/b.ts && chmod 755 src/a.ts && echo new > src/c.ts && rm notes.md');

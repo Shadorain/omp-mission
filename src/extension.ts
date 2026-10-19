@@ -27,7 +27,7 @@ import { copyPlanFile, sourceFilePath, writeSourceFile } from './hosts';
 import { noteSubagentSpawn, noteSubagentToolEnd, noteSubagentToolStart, noteSubagentTurnEnd } from './subagents';
 import { checkToolCall, fingerprintScopes, implementationScopes, isImplementationPath, mutatedPaths, type GuardScope } from './coordinator-guard';
 import { autostartMessage, envBase, envCheckout, envDelivery, envGraph, gateTokenId, HolotableBridge, planRevision } from './holotable';
-import { mergeConflictPaths } from './mergecheck';
+import { foreignDetail, foreignPaths, mergeBaseInto, mergeConflictPaths } from './mergecheck';
 
 const controls = ['show','clear','continue','mode','approve','review','check','history','focus','resend','release','dispatch','reap','actions','config'];
 export function nativePlan(ctx: ExtensionContext): boolean {
@@ -330,13 +330,19 @@ export default async function missionExtension(pi: ExtensionAPI) {
 // review (a PR retarget, say) that otherwise stays in phase `review` forever.
 // tryComplete is the single gate before phase `complete`: a branch that still conflicts with its base is marked
 // verify-failed instead, so the normal verify/repair machinery drives the merge resolution rather than landing a conflict.
+/** Reopens verification with `detail`: the coordinator's next step becomes the fix, not completion. */
+function reopenVerification(m:Mission,detail:string){
+ m.evidence.verify={outcome:'failed',detail,at:new Date().toISOString()};
+ measurements(m).mergePreflightFailures++;
+ delete m.evidence.deliver;
+ m.phase='verify';
+}
 async function tryComplete(m:Mission,evidence:Omit<Evidence,'outcome'>){
+ const foreign=await foreignPaths(m,run);
+ if(foreign&&foreign.length){reopenVerification(m,foreignDetail(m,foreign));return false;}
  const conflicts=await mergeConflictPaths(m,run);
  if(conflicts&&conflicts.length){
-  m.evidence.verify={outcome:'failed',detail:`Branch conflicts with ${m.workspace.base}: ${conflicts.join(', ')}. Merge ${m.workspace.base} into this branch and resolve before completion.`,at:new Date().toISOString()};
-  measurements(m).mergePreflightFailures++;
-  delete m.evidence.deliver;
-  m.phase='verify';
+  reopenVerification(m,`Branch conflicts with ${m.workspace.base}: ${conflicts.join(', ')}. Run mission_control merge_base to merge ${m.workspace.base} into this branch, resolve the conflicts through a scoped leaf, then verify again.`);
   return false;
  }
  m.phase='complete';
@@ -562,7 +568,7 @@ async function finishMission(context:ExtensionContext){
  const scopesSchema=z.record(z.string(),z.array(z.string()).min(1));
  pi.registerTool({name:'mission_status',defaultInactive:true,loadMode:'essential',label:'Mission status',description:'Inspect authoritative cached mission graph, hold, gates and next coordinator action.',approval:'read',parameters:z.object({}),execute:async(_id,_params,_signal,_update,context)=>{if(!eligible(context))throw new Error('Mission coordinator only');if(!operation)await refresh(false);return {content:[{type:'text',text:JSON.stringify(status(context))}],details:{}};}});
  const controlSchema=z.object({
-  operation:z.enum(['start','clear','continue','retry-model','bind_workspace','bind_graph','dispatch','check','record_check','record_verification','record_delivery','run_review','triage_findings','accept_repairs','bind_repairs','resend','release','reap','reject_finding']),
+  operation:z.enum(['start','clear','continue','retry-model','bind_workspace','bind_graph','dispatch','check','record_check','record_verification','record_delivery','run_review','triage_findings','accept_repairs','bind_repairs','merge_base','resend','release','reap','reject_finding']),
   cwd:z.string().optional(),base:z.string().optional(),beadsDir:z.string().optional(),delivery:z.enum(['pr','local']).optional(),
   epicId:z.string().optional(),scopes:scopesSchema.optional(),repairLinks:z.record(z.string(),z.array(z.string())).optional(),
   beadId:z.string().optional(),detail:z.string().optional(),files:z.array(z.string()).max(50).optional().describe('resend only: extra workspace-relative paths the stopped subagent worker may edit'),passed:z.boolean().optional(),url:z.string().optional(),
@@ -715,7 +721,16 @@ async function finishMission(context:ExtensionContext){
       if(!/^https:\/\/[^\s]+\/pull\/\d+$/.test(params.url??''))throw new Error('Actual PR URL required');
       await assertPrBase(mission,params.url);
      }
-     mission.evidence.deliver={outcome:'passed',detail:params.url?`${params.url}\n${params.detail}`:params.detail,revision:captured.revision,at:new Date().toISOString()};mission.phase='review';
+     // A branch carrying files no bead owns is not this mission's work; catching it here saves a review round.
+     const foreign=await foreignPaths(mission,run);
+     if(foreign&&foreign.length)reopenVerification(mission,foreignDetail(mission,foreign));
+     else{mission.evidence.deliver={outcome:'passed',detail:params.url?`${params.url}\n${params.detail}`:params.detail,revision:captured.revision,at:new Date().toISOString()};mission.phase='review';}
+    }else if(params.operation==='merge_base'){
+     if(!mission.workspace.commonDir||!mission.workspace.base)throw new Error('Bound Git workspace and base required');
+     if(mission.workers.some(worker=>worker.state!=='closed'))throw new Error('Wait until every worker has closed before merging the base');
+     const result=await mergeBaseInto(mission,run);
+     if(result.conflicts.length)reopenVerification(mission,`Merging ${result.ref} stopped on conflicts in ${result.conflicts.join(', ')}. Bind a leaf scoped to exactly these paths that resolves the conflict markers keeping both sides' intent, dispatch it, conclude the merge with git commit --no-edit, then verify again.`);
+     else if(result.merged){delete mission.evidence.verify;delete mission.evidence.deliver;mission.phase='verify';}
     }else if(params.operation==='run_review'){
      await refresh(false);const action=nextAction(mission,snapshot,policy(context));
      if(!(action.kind==='review'||action.kind==='hold'&&action.gate?.kind==='review')||!mission.reviewRequested||mission.evidence.verify?.outcome!=='passed'||mission.evidence.deliver?.outcome!=='passed')throw new Error(action.detail);

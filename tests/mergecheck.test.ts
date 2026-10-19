@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { mergeConflictPaths } from '../src/mergecheck';
+import { foreignPaths, mergeBaseInto, mergeConflictPaths } from '../src/mergecheck';
 import type { Mission, Run } from '../src/types';
 
 const run: Run = async (command, args, cwd, env) => {
@@ -62,4 +62,44 @@ test('clean merge returns an empty list', async () => {
 test('non-git workspace or missing base skips the check', async () => {
 	expect(await mergeConflictPaths(mission(root, ''), run)).toBeNull();
 	expect(await mergeConflictPaths({ ...mission(root), workspace: { ...mission(root).workspace, base: undefined } }, run)).toBeNull();
+});
+
+const beads = (cwd: string): Mission => ({ ...mission(cwd), graph: 'beads', scopes: { leaf: ['f.txt'] } });
+
+test('a stale tree replanted onto a newer base is caught as files no bead owns', async () => {
+	await git(root, 'checkout', '-qb', 'feat');
+	await writeFile(join(root, 'f.txt'), 'mission\n');
+	await git(root, 'commit', '-qam', 'mission work');
+	expect(await foreignPaths(beads(root), run)).toEqual([]);
+	await git(root, 'checkout', '-q', 'main');
+	await writeFile(join(root, 'g.txt'), 'base moved on\n');
+	await writeFile(join(root, 'h.txt'), 'new base file\n');
+	await git(root, 'add', '.');
+	await git(root, 'commit', '-qm', 'base work');
+	// The coordinator's replant: the feature tree committed on top of the new base.
+	const replant = await git(root, 'commit-tree', 'feat^{tree}', '-p', 'main', '-m', 'replant');
+	await git(root, 'checkout', '-q', replant);
+	expect((await foreignPaths(beads(root), run))?.sort()).toEqual(['g.txt', 'h.txt']);
+	expect(await foreignPaths(mission(root), run)).toBeNull();
+	expect(await foreignPaths({ ...beads(root), scopes: {} }, run)).toBeNull();
+});
+
+test('merging the base integrates it with a merge commit, or stops on conflicts with markers in place', async () => {
+	await git(root, 'checkout', '-qb', 'feat');
+	await writeFile(join(root, 'f.txt'), 'mission\n');
+	await git(root, 'commit', '-qam', 'mission work');
+	await git(root, 'checkout', '-q', 'main');
+	await writeFile(join(root, 'g.txt'), 'base\n');
+	await git(root, 'commit', '-qam', 'base work');
+	await git(root, 'checkout', '-q', 'feat');
+	expect(await mergeBaseInto(beads(root), run)).toEqual({ ref: 'main', merged: true, conflicts: [] });
+	expect(await git(root, 'show', 'HEAD:g.txt')).toBe('base');
+	expect(await foreignPaths(beads(root), run)).toEqual([]);
+	expect(await mergeBaseInto(beads(root), run)).toEqual({ ref: 'main', merged: false, conflicts: [] });
+	await git(root, 'checkout', '-q', 'main');
+	await writeFile(join(root, 'f.txt'), 'base edit\n');
+	await git(root, 'commit', '-qam', 'base edits f');
+	await git(root, 'checkout', '-q', 'feat');
+	expect(await mergeBaseInto(beads(root), run)).toEqual({ ref: 'main', merged: false, conflicts: ['f.txt'] });
+	expect(await run('git', ['rev-parse', '-q', '--verify', 'MERGE_HEAD'], root)).toMatchObject({ code: 0 });
 });

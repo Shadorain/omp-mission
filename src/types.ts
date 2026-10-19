@@ -11,7 +11,7 @@ export interface FindingTriage { disposition: 'repair' | 'reject' | 'defer' | 'e
 export interface FindingDecision extends FindingTriage { findingId: string }
 export interface Finding { id: string; severity: 'critical' | 'high' | 'medium' | 'low'; path: string; line: number; title: string; body: string; rejection?: string; beadId?: string; triage?: FindingTriage }
 export interface ReviewRound { round: number; revision: string; model: string; summary: string; findings: Finding[]; at: string; invalidated?: string; baseline?: ReviewBaseline; /** Per-bead scope hashes retained for review history. */ beads?: Record<string, string>; /** Reviewer label to saved transcript. */ transcripts?: Record<string, string> }
-export interface ReviewBaseline { tree?: string; base: string; files: Record<string,string> }
+export interface ReviewBaseline { tree?: string; base: string; files: Record<string,string>; /** Merge-base with the base branch when reviewed: what the mission's own diff was measured from. */ fork?: string }
 /** One finished per-target review kept while its round is incomplete. */
 export interface ReviewTargetResult { summary: string; findings: Finding[]; transcript?: string; model?: string }
 /**

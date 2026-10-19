@@ -312,7 +312,7 @@ function wholeTree(pathspec: string): boolean {
 	return p === '.' || p === '' || p === '*' || p === '..' || p.startsWith('../') || p === ':(top)' || p.startsWith(':(top,');
 }
 
-/** Stops whole-tree staging/commit and checkout-rewriting git; returns the violation or undefined. */
+/** Stops whole-tree staging/commit, checkout-rewriting git and branch-history rewrites; returns the violation or undefined. */
 function gitVerdict(argv: readonly string[]): string | undefined {
 	let i = 0;
 	while (i < argv.length) {
@@ -361,14 +361,27 @@ function gitVerdict(argv: readonly string[]): string | undefined {
 		return `git ${sub} rewrites checkout files mid-mission; the coordinator stays on the bound branch`;
 	if (sub === 'clean')
 		return rest.some(arg => arg === '--dry-run' || (arg.startsWith('-') && !arg.startsWith('--') && arg.includes('n'))) ? undefined : 'git clean deletes untracked files that belong to workers';
-	if (sub === 'reset')
+	if (sub === 'reset') {
+		if (rest.includes('--soft')) return 'git reset --soft moves the branch under the mission; integrate the base with mission_control merge_base';
 		return rest.some(arg => arg === '--hard' || arg === '--merge' || arg === '--keep') ? `git reset ${rest.find(arg => arg.startsWith('--'))} discards checkout changes` : undefined;
+	}
 	if (sub === 'stash') {
 		const action = rest.find(arg => !arg.startsWith('-')) ?? 'push';
 		return ['list', 'show', 'create', 'store'].includes(action) ? undefined : `git stash ${action} moves checkout files; leave the workers' tree alone`;
 	}
-	if (sub === 'merge' || sub === 'rebase' || sub === 'pull' || sub === 'cherry-pick' || sub === 'revert' || sub === 'am' || sub === 'apply' || sub === 'rm' || sub === 'mv' || sub === 'worktree' || sub === 'bisect')
+	if (sub === 'merge' || sub === 'rebase' || sub === 'pull')
+		return `git ${sub} mutates the mission checkout; integrate the base with mission_control merge_base`;
+	if (sub === 'cherry-pick' || sub === 'revert' || sub === 'am' || sub === 'apply' || sub === 'rm' || sub === 'mv' || sub === 'worktree' || sub === 'bisect')
 		return `git ${sub} mutates the mission checkout; use mission_control and scoped staging`;
+	// A tree rebuilt with plumbing onto a newer base silently reverts every base change since: never allowed.
+	if (sub === 'commit-tree' || sub === 'update-ref' || sub === 'replace' || sub === 'filter-branch' || sub === 'filter-repo')
+		return `git ${sub} rewrites branch history behind the mission; integrate the base with mission_control merge_base`;
+	if (sub === 'read-tree')
+		return rest.some(arg => arg === '-n' || arg === '--dry-run') ? undefined : 'git read-tree replaces the index behind the mission; integrate the base with mission_control merge_base';
+	if (sub === 'symbolic-ref' && rest.filter(arg => !arg.startsWith('-')).length > 1)
+		return 'git symbolic-ref repoints the mission branch';
+	if (sub === 'push' && rest.some(arg => arg === '--force' || arg.startsWith('--force-with-lease') || arg === '--force-if-includes' || arg.startsWith('+') || (/^-[A-Za-z]+$/.test(arg) && arg.includes('f'))))
+		return 'git push --force rewrites the delivered branch; push new commits only';
 	if (sub === 'submodule')
 		return rest.find(arg => !arg.startsWith('-')) === 'update' ? 'git submodule update rewrites checkout files' : undefined;
 	return undefined;

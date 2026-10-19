@@ -202,6 +202,8 @@ async function captureBaseline(m:Mission,captured:RevisionCapture,run:Run):Promi
   const pinned=await run('git',['update-ref',`refs/omp-mission/reviews/${key}/${tree}`,tree],m.workspace.cwd);
   if(pinned.code)throw new Error(pinned.stderr||'Cannot retain reviewed snapshot');
   baseline.tree=tree;
+  const fork=await diffBase(m,run);
+  if(/^[a-f0-9]{40,64}$/.test(fork))baseline.fork=fork;
   return baseline;
  }finally{await rm(root,{recursive:true,force:true});}
 }
@@ -303,9 +305,19 @@ export class Reviewer {
    deltaFiles=delta.stdout.split('\0').filter(Boolean);
   }
   const unresolvedIds=new Set(unresolved.map(finding=>finding.id));
-  const affected=!followup?universe:previous.baseline
+  // A merged base rehashes every file the base touched. Base-only files match the fork in both rounds;
+  // anything the mission changed in either round (including a repair that undoes its own change) stays.
+  let own:Set<string>|undefined;
+  const priorFork=followup?previous.baseline?.fork:undefined,priorTree=followup?previous.baseline?.tree:undefined;
+  if(priorFork&&priorTree&&baseline.tree&&m.workspace.commonDir){
+   const names=async(from:string,to:string)=>{const out=await run('git',['diff','--name-only','-z','--no-renames',from,to,'--'],m.workspace.cwd);return out.code?undefined:out.stdout.split('\0').filter(Boolean);};
+   const now=await names(await diffBase(m,run),baseline.tree),before=await names(priorFork,priorTree);
+   if(now&&before)own=new Set([...now,...before]);
+  }
+  const delta=!followup?universe:previous.baseline
    ?new Set([...universe].filter(file=>previous.baseline!.files[file]!==baseline.files[file]))
    :new Set([...deltaFiles.filter(file=>!claim(file)),...targets.filter(target=>m.repairLinks[target.id]?.some(id=>unresolvedIds.has(id))).flatMap(owned),...unresolvedPaths]);
+  const affected=own?new Set([...delta].filter(file=>own.has(file)||unresolvedPaths.has(file))):delta;
   const selected=(target:BeadReviewTarget)=>owned(target).filter(file=>!followup||affected.has(file)||unresolvedPaths.has(file));
   const changed=targets.filter(target=>selected(target).length);
   const integrationFiles=followup?[...new Set([...affected,...unresolvedPaths])].filter(file=>!claim(file)):captured.files;

@@ -155,6 +155,26 @@ test('unchanged scopes with unresolved findings are reviewed alongside changed s
  expect(review.findings).toEqual([expect.objectContaining({id:'bd-a:still-open'})]);
 });
 
+test('after the base is merged in, follow-up review covers the mission diff, not files only the base changed',async()=>{
+ await real('git',['checkout','-qb','feat'],root);
+ await writeFile(join(root,'a','one.txt'),'mission change');
+ await real('git',['commit','-qam','mission'],root);
+ const m=await missionAt();m.workspace.base='main';
+ m.evidence.verify={outcome:'passed',detail:'ok',revision:(await captureRevision(m,real)).revision,at:'now'};
+ m.reviews.push(await new Reviewer(opener([],()=>({summary:'Initial audit',findings:[]}))).runPerBead(m,ctx,real,'default',undefined,targets));
+ expect(m.reviews[0]!.baseline?.fork).toMatch(/^[a-f0-9]{40}$/);
+ await real('git',['checkout','-q','main'],root);
+ await writeFile(join(root,'b','two.txt'),'another PR on the base');
+ await real('git',['commit','-qam','base work'],root);
+ await real('git',['checkout','-q','feat'],root);
+ await real('git',['merge','-q','--no-edit','main'],root);
+ await writeFile(join(root,'a','one.txt'),'mission repair');
+ m.round=2;m.evidence.verify={outcome:'passed',detail:'ok',revision:(await captureRevision(m,real)).revision,at:'now'};
+ const sent:Array<{note:string;payload:Record<string,unknown>}>=[];
+ await new Reviewer(opener(sent,()=>({summary:'Repair verified',findings:[]}))).runPerBead(m,ctx,real,'default',undefined,targets);
+ expect(sent.map(item=>beadOf(item.payload))).toEqual(['bd-a']);
+});
+
 test('deferred findings do not pull unchanged scopes back into a follow-up and are shown as deferred',async()=>{
  await writeFile(join(root,'a','one.txt'),'changed a');
  await writeFile(join(root,'b','two.txt'),'changed b');
