@@ -790,11 +790,15 @@ async function finishMission(context:ExtensionContext){
       await tryComplete(mission,evidence);
      }
     }else if(params.operation==='resend'||params.operation==='release'||params.operation==='reap'){
-     requireBeadsGraph(mission);if(!params.beadId)throw new Error('beadId required');await refresh(false);
-     const bead=snapshot?.beads.find(b=>b.id===params.beadId);if(!bead||snapshot?.error)throw new Error('Fresh mission bead required');
-     if(params.operation==='resend')await driver.resend(mission,params.beadId,bead,params.detail,params.files);
-     else if(params.operation==='release'){await driver.release(mission,params.beadId,bead);await refresh(false);}
-     else await driver.reap(mission,params.beadId,bead);
+     requireBeadsGraph(mission);await refresh(false);
+     // The board's Resend carries no bead: the controller's pending resend step names it, as the status `next` line shows.
+     let beadId=params.beadId;
+     if(!beadId&&params.operation==='resend'){const step=nextAction(mission,snapshot,policy(context));if(step.kind==='resend')beadId=step.ids?.[0];}
+     if(!beadId)throw new Error(params.operation==='resend'?'beadId required: no worker is waiting for a resend':'beadId required');
+     const bead=snapshot?.beads.find(b=>b.id===beadId);if(!bead||snapshot?.error)throw new Error('Fresh mission bead required');
+     if(params.operation==='resend')await driver.resend(mission,beadId,bead,params.detail,params.files);
+     else if(params.operation==='release'){await driver.release(mission,beadId,bead);await refresh(false);}
+     else await driver.reap(mission,beadId,bead);
     }
     if(epoch!==generation)throw new Error('Session changed during operation');await persist(mission);
    }
