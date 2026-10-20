@@ -171,6 +171,36 @@ test('reading a live sibling\'s file in bash is not editing it, so the sibling\'
   await runner.abortAll();
 });
 
+test('an edit whose text cites a live sibling\'s path did not edit that path', async () => {
+  const sibling = worker('bd-code', ['b/**']);
+  const w = worker('bd-docs', ['a/**']);
+  let docsStarted!: () => void;
+  const started = new Promise<void>(resolve => { docsStarted = resolve; });
+  let codeEdited!: () => void;
+  const edited = new Promise<void>(resolve => { codeEdited = resolve; });
+  const held = fake(async ({ cwd, messages }) => {
+    await started;
+    messages.push(toolCall('edit', { input: '[b/two.txt#AB12]\nPUT 1:\n+gate' }));
+    await writeFile(join(cwd, 'b', 'two.txt'), 'gate');
+    codeEdited();
+  }, true);
+  const f = fake(async ({ cwd, messages }) => {
+    docsStarted();
+    await edited;
+    await writeFile(join(cwd, 'a', 'one.txt'), 'The gate lives in b/two.txt.');
+    messages.push(toolCall('edit', { input: '[a/one.txt#CD34]\nPUT 1:\n+The gate lives in b/two.txt.' }), yielded({ done: true, summary: 'docs' }));
+  });
+  const sessions = [held, f];
+  let n = 0;
+  const { runner, settled } = harness(async () => ({ session: sessions[n++]!.session, file: join(root, `s${n}.jsonl`) }));
+  const m = mission([sibling, w]);
+  await runner.launch(m, sibling);
+  await runner.launch(m, w);
+  await runner.whenDone('bd-docs');
+  expect(settled.find(([id]) => id === 'bd-docs')![1]).toEqual({ ok: true, summary: 'docs' });
+  await runner.abortAll();
+});
+
 test('a file that was already dirty at launch is judged by what the worker changed, not by being dirty', async () => {
   await writeFile(join(cwd, 'b', 'two.txt'), 'dirty before the worker');
   const f = fake(async ({ cwd, messages }) => { await writeFile(join(cwd, 'a', 'one.txt'), 'mine'); messages.push(yielded({ done: true, summary: 'ok' })); });

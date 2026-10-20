@@ -115,17 +115,35 @@ export async function hashPaths(run: Run, cwd: string, paths: readonly string[])
 	return snapshot;
 }
 
-/** Everything a worker's mutating tools were asked to touch, one `<tool>\t<arguments>` line per call: the evidence for who made a stray file. */
+/**
+ * Everything a worker's mutating tools were asked to touch, one `<tool>\t<json>` line per call: the evidence for who made a stray file.
+ * Edit and write calls record only their target paths: a doc edit that cites `crates/x/src/lib.rs` in its text did not edit that file.
+ */
 export function mutationText(messages: readonly unknown[]): string {
 	const parts: string[] = [];
 	for (const message of messages) {
 		const content = (message as { role?: string; content?: unknown }).content;
 		if (!Array.isArray(content)) continue;
 		for (const block of content as Array<{ type?: string; name?: string; arguments?: unknown }>) {
-			if (block.type === 'toolCall' && (block.name === 'edit' || block.name === 'write' || block.name === 'bash')) parts.push(`${block.name}\t${JSON.stringify(block.arguments ?? {})}`);
+			if (block.type !== 'toolCall' || (block.name !== 'edit' && block.name !== 'write' && block.name !== 'bash')) continue;
+			const targets = block.name === 'bash' ? undefined : writeTargets(block.arguments);
+			parts.push(`${block.name}\t${JSON.stringify(targets ?? block.arguments ?? {})}`);
 		}
 	}
 	return parts.join('\n');
+}
+
+/** Paths an edit/write call writes: path-style arguments, hashline `[path#TAG]` section headers and `MV` destinations. Undefined for an unknown shape. */
+function writeTargets(args: unknown): string[] | undefined {
+	if (!args || typeof args !== 'object') return undefined;
+	const a = args as Record<string, unknown>;
+	const targets: string[] = [];
+	for (const key of ['path', 'file_path', 'filePath']) if (typeof a[key] === 'string') targets.push(a[key] as string);
+	if (typeof a.input === 'string') {
+		for (const match of a.input.matchAll(/^\[([^\]\n#]+)#[0-9A-Fa-f]{4}\]/gm)) targets.push(match[1]!);
+		for (const match of a.input.matchAll(/^MV\s+"?([^"\n]+?)"?\s*$/gm)) targets.push(match[1]!);
+	}
+	return targets.length ? targets : undefined;
 }
 
 function mentions(text: string, path: string): boolean {
