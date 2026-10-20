@@ -110,14 +110,14 @@ export async function snapshotChanges(run: Run, cwd: string): Promise<Record<str
 	return snapshot;
 }
 
-/** Everything a worker's mutating tools were asked to touch, as one string: the evidence for who made a stray file. */
+/** Everything a worker's mutating tools were asked to touch, one `<tool>\t<arguments>` line per call: the evidence for who made a stray file. */
 export function mutationText(messages: readonly unknown[]): string {
 	const parts: string[] = [];
 	for (const message of messages) {
 		const content = (message as { role?: string; content?: unknown }).content;
 		if (!Array.isArray(content)) continue;
 		for (const block of content as Array<{ type?: string; name?: string; arguments?: unknown }>) {
-			if (block.type === 'toolCall' && (block.name === 'edit' || block.name === 'write' || block.name === 'bash')) parts.push(JSON.stringify(block.arguments ?? {}));
+			if (block.type === 'toolCall' && (block.name === 'edit' || block.name === 'write' || block.name === 'bash')) parts.push(`${block.name}\t${JSON.stringify(block.arguments ?? {})}`);
 		}
 	}
 	return parts.join('\n');
@@ -125,6 +125,11 @@ export function mutationText(messages: readonly unknown[]): string {
 
 function mentions(text: string, path: string): boolean {
 	return text.includes(path);
+}
+
+/** Named by an edit or write call: unlike a bash line, which is as often `grep path` as `sed -i path`, that is authorship. */
+function edited(text: string, path: string): boolean {
+	return text.split('\n').some(line => (line.startsWith('edit\t') || line.startsWith('write\t')) && line.includes(path));
 }
 
 export function changedSince(before: Record<string, string>, after: Record<string, string>): string[] {
@@ -296,8 +301,10 @@ export class SubagentRunner implements SubagentPort {
 			others.push(running ? mutationText(running.session.state.messages) : await this.#readMentions(mission, other));
 		}
 		// A sibling scope, including one rebound after dispatch, is that sibling's edit. A shared lockfile in both scopes is neither worker's stray. Basename matches are not attribution: lib.rs is not crates/http/src/lib.rs.
-		const unowned = outOfScope(changed, [...mine, ...sibling]).filter(path => mentions(mutations, path) || !others.some(text => mentions(text, path)));
-		const crossed = outOfScope(changed, mine).filter(path => inScope(path, sibling) && mentions(mutations, path));
+		// Workers share one checkout, so reading a sibling's file in bash is not editing it: a path another worker wrote with edit/write is that worker's unless this one did too.
+		const blamed = (path: string) => edited(mutations, path) || (mentions(mutations, path) && !others.some(text => edited(text, path)));
+		const unowned = outOfScope(changed, [...mine, ...sibling]).filter(path => blamed(path) || !others.some(text => mentions(text, path)));
+		const crossed = outOfScope(changed, mine).filter(path => inScope(path, sibling) && blamed(path));
 		const stray = [...new Set([...unowned, ...crossed])];
 		if (stray.length) return { ok: false, error: `edits outside the allowed paths (${stray.slice(0, 8).join(', ')}${stray.length > 8 ? ', …' : ''}); bead left open for review` };
 		// Review diffs only see new files once they are staged, and staging is bookkeeping, not judgment: do it here instead of

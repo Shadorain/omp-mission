@@ -139,6 +139,38 @@ test('a worker that mutates a live sibling\'s scope and names the path is reject
   await runner.abortAll();
 });
 
+test('reading a live sibling\'s file in bash is not editing it, so the sibling\'s concurrent edit does not stop this worker', async () => {
+  const sibling = worker('bd-live', ['b/**']);
+  const w = worker('bd-mine', ['a/**']);
+  let mineStarted!: () => void;
+  const started = new Promise<void>(resolve => { mineStarted = resolve; });
+  let ownerEdited!: () => void;
+  const edited = new Promise<void>(resolve => { ownerEdited = resolve; });
+  // The owner edits only after this worker's launch baseline, as in a shared checkout mid-wave.
+  const held = fake(async ({ cwd, messages }) => {
+    await started;
+    messages.push(toolCall('edit', { input: '[b/two.txt#AB12]\nPUT 1:\n+edited' }));
+    await writeFile(join(cwd, 'b', 'two.txt'), 'edited by its owner');
+    ownerEdited();
+  }, true);
+  const f = fake(async ({ cwd, messages }) => {
+    mineStarted();
+    await edited;
+    messages.push(toolCall('bash', { command: 'grep -n two b/two.txt; sed -n 1,5p b/two.txt' }));
+    await writeFile(join(cwd, 'a', 'one.txt'), 'mine');
+    messages.push(toolCall('edit', { input: '[a/one.txt#CD34]\nPUT 1:\n+mine' }), yielded({ done: true, summary: 'mine' }));
+  });
+  const sessions = [held, f];
+  let n = 0;
+  const { runner, settled } = harness(async () => ({ session: sessions[n++]!.session, file: join(root, `s${n}.jsonl`) }));
+  const m = mission([sibling, w]);
+  await runner.launch(m, sibling);
+  await runner.launch(m, w);
+  await runner.whenDone('bd-mine');
+  expect(settled.find(([id]) => id === 'bd-mine')![1]).toEqual({ ok: true, summary: 'mine' });
+  await runner.abortAll();
+});
+
 test('a file that was already dirty at launch is judged by what the worker changed, not by being dirty', async () => {
   await writeFile(join(cwd, 'b', 'two.txt'), 'dirty before the worker');
   const f = fake(async ({ cwd, messages }) => { await writeFile(join(cwd, 'a', 'one.txt'), 'mine'); messages.push(yielded({ done: true, summary: 'ok' })); });
