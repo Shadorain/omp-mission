@@ -198,7 +198,7 @@ Usage includes the whole associated coordinator session, only this mission's sub
 
 Status also carries `problem` for failed reviews, active-worker errors, coordinator blockers, verification failures and graph outages: kind, source, full detail, automatic retry timestamp, failed attempt and retained review counts. A null problem means healthy; missing means an older producer. Closed-worker historical errors are not current failures. A beads mission with a readable, fully closed implementation graph reports Verify rather than Running while awaiting verification.
 
-A main-agent `ask` wait publishes `hold: question`, the question text and no control actions. Holotable surfaces **Answer in mission** to focus the original OMP prompt; answering there clears the hold. Planning rate-limit and provider failures publish their blocker instead of inviting plan approval.
+A main-agent `ask` wait publishes `hold: question`, the question text and no control actions. When every question parses, status also carries `ask`: the tool call id and each question's option labels, recommendation and multi-select flag. Holotable then shows the choices on the card and types the operator's answer into this pane. Without `ask`, it surfaces **Answer in mission** to focus the original OMP prompt. Either way, answering in the pane clears the hold. Planning rate-limit and provider failures publish their blocker instead of inviting plan approval.
 
 A completed mission stays Complete after its pane restarts; the resumed session's inspection-only flag is not published as unfinished work. This does not authorize Continue or clear gates, blockers or quota holds.
 

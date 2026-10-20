@@ -26,7 +26,7 @@ import { SubagentRunner, subagentPrompt } from './subagent';
 import { copyPlanFile, sourceFilePath, writeSourceFile } from './hosts';
 import { noteSubagentSpawn, noteSubagentToolEnd, noteSubagentToolStart, noteSubagentTurnEnd } from './subagents';
 import { checkToolCall, fingerprintScopes, implementationScopes, isImplementationPath, mutatedPaths, type GuardScope } from './coordinator-guard';
-import { autostartMessage, envBase, envCheckout, envDelivery, envGraph, gateTokenId, HolotableBridge, planRevision } from './holotable';
+import { askQuestions, autostartMessage, envBase, envCheckout, envDelivery, envGraph, gateTokenId, HolotableBridge, planRevision, type AskQuestion } from './holotable';
 import { foreignDetail, foreignPaths, mergeBaseInto, mergeConflictPaths } from './mergecheck';
 
 const controls = ['show','clear','continue','mode','approve','review','check','history','focus','resend','release','dispatch','reap','actions','config'];
@@ -49,8 +49,10 @@ export default async function missionExtension(pi: ExtensionAPI) {
  let inspectionIntent:{mode?:Mode;reviewRequested?:boolean}={};
  let reviewRows:SubagentRow[]=[];
  let planReview:PlanReviewRequestedEvent|undefined;
- const pendingQuestions=new Map<string,string>();
- const question=()=>[...pendingQuestions.values()].join(' · ')||undefined;
+ const pendingQuestions=new Map<string,{text:string;questions:AskQuestion[]}>();
+ const question=()=>[...pendingQuestions.values()].map(q=>q.text).join(' · ')||undefined;
+ // The oldest open ask is the one on screen; the board answers it by its tool call id.
+ const ask=()=>{const first=[...pendingQuestions.entries()][0];return first&&first[1].questions.length?{id:first[0],questions:first[1].questions}:undefined;};
  let openedPlanRevision:string|undefined;
  let openingPlanReview=false;
  // Reviewers are in-process sessions: list them in the mission outline while they run, and keep their transcripts (also in Agent Hub) so a finished review can be inspected.
@@ -135,6 +137,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
   },
   sessionInfo:()=>({id:(()=>{const manager=ctx?.sessionManager;const id=typeof manager?.getSessionId==='function'?manager.getSessionId():null;return typeof id==='string'&&id?id:`pid-${process.pid}`;})(),owned:mission?!!ownership&&!ownershipError:true}),
   question,
+  ask,
   gateId:()=>mission?.gate?gateTokenId(mission.gate.token):undefined,
   decide:(context,verb,arg)=>decision(context,verb,arg),
   request:(context,op,extra)=>request(context,op,extra),
@@ -889,7 +892,9 @@ async function finishMission(context:ExtensionContext){
   if(eligible(context)&&event.toolName==='ask'&&(mission||pending)){
    const args=isRecord(event.args)?event.args:{};
    const prompts=Array.isArray(args.questions)?args.questions.filter(isRecord).map(value=>value.question).filter((value):value is string=>typeof value==='string'&&!!value.trim()):[];
-   pendingQuestions.set(event.toolCallId,prompts.join(' · ')||'A question needs your answer');
+   // The board answers by dialog position, so a partly parsed ask is not published at all.
+   const parsed=askQuestions(args.questions);
+   pendingQuestions.set(event.toolCallId,{text:prompts.join(' · ')||'A question needs your answer',questions:parsed.length===prompts.length?parsed:[]});
   }
   await render();
  });

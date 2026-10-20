@@ -84,9 +84,26 @@ export interface ContactStatus {
  measurements?: Measurements | null;
  usageEvidence?: UsageEvidence | null;
 	ctl: { socket: string; generation: number } | null;
+	/** The pane's open `ask` while hold is 'question': its tool call id and each question's choices, so the board can answer it. */
+	ask?: { id: string; questions: AskQuestion[] } | null;
 	updatedAt: string;
 	/** Identity of the publishing process; owned=false marks a read-only inspection pane. */
 	session?: { id: string; pid: number; processStart: string | null; terminal: string | null; owned: boolean };
+}
+
+/** One question of an open `ask` call, as the pane's dialog shows it: the options, then "Other". */
+export interface AskQuestion { question: string; options: string[]; recommended: number | null; multi: boolean }
+
+/** The `questions` argument of an `ask` tool call, reduced to what answering it needs. Malformed entries are dropped. */
+export function askQuestions(raw: unknown): AskQuestion[] {
+	if (!Array.isArray(raw)) return [];
+	return raw.filter(isRecord).flatMap(q => {
+		if (typeof q.question !== 'string' || !q.question.trim() || !Array.isArray(q.options)) return [];
+		const options = q.options.map(o => isRecord(o) && typeof o.label === 'string' ? o.label : typeof o === 'string' ? o : null);
+		if (options.some(o => o === null)) return [];
+		const recommended = Number.isInteger(q.recommended) && (q.recommended as number) >= 0 && (q.recommended as number) < options.length ? q.recommended as number : null;
+		return [{ question: q.question, options: options as string[], recommended, multi: q.multi === true }];
+	});
 }
 
 // Linux /proc start-time beats PID reuse; null on other platforms or an exited process.
@@ -300,6 +317,7 @@ export interface StatusInput {
 	planPath?: string;
 	planReview?: boolean;
 	question?: string;
+	ask?: { id: string; questions: AskQuestion[] };
 	/** Publish identity: the board tests process liveness directly, independent of socket or freshness. */
 	session?: { id: string; owned: boolean };
 }
@@ -378,6 +396,7 @@ export async function buildContactStatus(input: StatusInput): Promise<ContactSta
 		check: m.check ?? null,
 		session: input.session ? { ...input.session, pid: process.pid, processStart: processStartTicks(process.pid), terminal: process.env.ORCA_TERMINAL_HANDLE ?? null } : undefined,
 		ctl: input.ctl,
+		ask: question && input.ask ? input.ask : null,
 		usage: input.usage,
   measurements,
   usageEvidence:input.usageEvidence??null,
@@ -425,6 +444,7 @@ export interface HolotableHooks {
  measurementConfig?():MeasurementConfig;
  review?():ReviewStatus|null;
 	question(): string | undefined;
+	ask?(): { id: string; questions: AskQuestion[] } | undefined;
 	gateId(): string | undefined;
 	decide(context: ExtensionContext, verb: string, arg?: string): Promise<void>;
 	request(context: ExtensionContext, op: string, extra?: Record<string, unknown>): Promise<void>;
@@ -509,6 +529,7 @@ export class HolotableBridge {
 			planPath: this.hooks.planPath(),
 			planReview: this.hooks.planReview()?.canApprove === true,
 			question: this.hooks.question(),
+			ask: this.hooks.ask?.(),
 		});
 		const serialized = `${JSON.stringify(status, null, 2)}\n`;
 		const file = statusFilePath(this.agentDir, current);
@@ -662,12 +683,12 @@ export class HolotableBridge {
 				if (gate !== undefined && gate !== this.hooks.gateId()) return fail('stale', 'The gate id no longer matches; read the status file again');
 				await this.hooks.decide(context, 'approve', undefined);
 			} else if (op === 'mode' || op === 'review') {
+        if (op === 'review' && args.repairBudgetOnly === true && (!mission || mission.mode === 'pause' || missionProblem(mission)?.source !== 'repair-budget'))
+          return fail('rejected', 'No confirmed repair-budget hold to authorize');
 				await this.hooks.decide(context, op, typeof args.mode === 'string' ? args.mode : undefined);
 			} else if (op === 'clear') {
 				await this.hooks.clear(context);
 			} else if (op === 'plan-edit') {
-        if (op === 'review' && args.repairBudgetOnly === true && (!mission || mission.mode === 'pause' || missionProblem(mission)?.source !== 'repair-budget'))
-          return fail('rejected', 'No confirmed repair-budget hold to authorize');
 				if (mission || !pending) return fail('rejected', 'No pending plan is awaiting approval');
 				if (typeof args.text !== 'string') return fail('bad-request', 'plan-edit requires args.text');
 				if (Buffer.byteLength(args.text, 'utf8') > MAX_PLAN) return fail('bad-request', 'Plan text exceeds 256 KiB');
