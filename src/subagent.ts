@@ -336,12 +336,18 @@ export class SubagentRunner implements SubagentPort {
 		if (stray.length) return { ok: false, error: `edits outside the allowed paths (${stray.slice(0, 8).join(', ')}${stray.length > 8 ? ', …' : ''}); bead left open for review` };
 		// Review diffs only see new files once they are staged, and staging is bookkeeping, not judgment: do it here instead of
 		// spending a model call (a full ~10k-token prefix re-read) on it. Only this worker's own paths, never a sibling's work in progress.
-		// A path already committed has nothing to stage, and `git add` rejects one that is gone from both index and disk.
+		// A path already committed has nothing to stage. A deleted path goes through `git rm --cached --ignore-unmatch`:
+		// `git add` rejects a path gone from both index and disk, which is exactly a deletion already staged.
 		const own = changed.filter(path => inScope(path, worker.files) && path in dirty);
-		if (own.length) {
-			const staged = await this.#serial(() => this.#o.run('git', ['add', '-A', '--', ...own], worker.cwd));
-			if (staged.code !== 0) return { ok: false, error: `git add failed: ${(staged.stderr || staged.stdout).trim().slice(0, 300)}` };
-		}
+		const present = own.filter(path => dirty[path] !== 'deleted');
+		const gone = own.filter(path => dirty[path] === 'deleted');
+		const stage = async (args: string[]) => {
+			const staged = await this.#serial(() => this.#o.run('git', args, worker.cwd));
+			return staged.code === 0 ? undefined : `git ${args[0]} failed: ${(staged.stderr || staged.stdout).trim().slice(0, 300)}`;
+		};
+		const failed = (present.length ? await stage(['add', '-A', '--', ...present]) : undefined)
+			?? (gone.length ? await stage(['rm', '-r', '--cached', '--quiet', '--ignore-unmatch', '--', ...gone]) : undefined);
+		if (failed) return { ok: false, error: failed };
 		const reason = [result.summary, result.verification ? `Verified: ${result.verification}` : ''].filter(Boolean).join('\n').slice(0, 4000);
 		const closed = await this.#o.run('bd', ['close', worker.beadId, '--reason', reason, '--json'], worker.cwd, this.#env(mission, worker));
 		if (closed.code !== 0) return { ok: false, error: `bd close failed: ${(closed.stderr || closed.stdout).trim().slice(0, 300)}` };

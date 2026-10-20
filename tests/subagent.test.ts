@@ -244,6 +244,24 @@ test('a file the worker deleted and committed, as a merge repair taking the base
   expect(settled[0]![1]).toEqual({ ok: true, summary: 'merged' });
 });
 
+test('a worker that deletes its own files finishes with both deletions staged, already staged or not', async () => {
+  await writeFile(join(cwd, 'a', 'two.txt'), 'second');
+  await git(cwd, 'add', 'a/two.txt');
+  await git(cwd, 'commit', '-qm', 'two');
+  const f = fake(async ({ cwd: dir, messages }) => {
+    messages.push(toolCall('bash', { command: 'git rm -q a/one.txt && rm a/two.txt' }));
+    await git(dir, 'rm', '-q', 'a/one.txt');
+    await rm(join(dir, 'a', 'two.txt'));
+    messages.push(yielded({ done: true, summary: 'removed' }));
+  });
+  const { runner, settled } = harness(async () => ({ session: f.session, file: join(root, 's.jsonl') }));
+  const w = worker('bd-1', ['a/**']);
+  await runner.launch(mission([w]), w);
+  await runner.whenDone('bd-1');
+  expect(settled[0]![1]).toEqual({ ok: true, summary: 'removed' });
+  expect((await git(cwd, 'status', '--porcelain')).trim().split('\n').sort()).toEqual(['D  a/one.txt', 'D  a/two.txt']);
+});
+
 test('missing yields are chased twice, then the worker is reported as failed', async () => {
   const f = fake(() => {});
   const { runner, settled } = harness(async () => ({ session: f.session, file: join(root, 's.jsonl') }));
