@@ -315,10 +315,10 @@ export class SubagentRunner implements SubagentPort {
 		const owned = (beadId: string, files: readonly string[]) => [...files, ...(mission.scopes[beadId] ?? [])];
 		const mine = owned(worker.beadId, worker.files);
 		const sibling = mission.workers.filter(other => other.beadId !== worker.beadId).flatMap(other => owned(other.beadId, other.files));
-		const after = await snapshotChanges(this.#o.run, worker.cwd);
+		const dirty = await snapshotChanges(this.#o.run, worker.cwd);
 		// A path that left git status was committed (a repair finishing the base merge commits every auto-merged base file):
 		// it changed only if its content differs from the baseline.
-		Object.assign(after, await hashPaths(this.#o.run, worker.cwd, Object.keys(live.baseline).filter(path => !(path in after))));
+		const after = { ...dirty, ...await hashPaths(this.#o.run, worker.cwd, Object.keys(live.baseline).filter(path => !(path in dirty))) };
 		const changed = changedSince(live.baseline, after);
 		const mutations = mutationText(live.session.state.messages);
 		const others: string[] = [];
@@ -336,7 +336,8 @@ export class SubagentRunner implements SubagentPort {
 		if (stray.length) return { ok: false, error: `edits outside the allowed paths (${stray.slice(0, 8).join(', ')}${stray.length > 8 ? ', …' : ''}); bead left open for review` };
 		// Review diffs only see new files once they are staged, and staging is bookkeeping, not judgment: do it here instead of
 		// spending a model call (a full ~10k-token prefix re-read) on it. Only this worker's own paths, never a sibling's work in progress.
-		const own = changed.filter(path => inScope(path, worker.files));
+		// A path already committed has nothing to stage, and `git add` rejects one that is gone from both index and disk.
+		const own = changed.filter(path => inScope(path, worker.files) && path in dirty);
 		if (own.length) {
 			const staged = await this.#serial(() => this.#o.run('git', ['add', '-A', '--', ...own], worker.cwd));
 			if (staged.code !== 0) return { ok: false, error: `git add failed: ${(staged.stderr || staged.stdout).trim().slice(0, 300)}` };

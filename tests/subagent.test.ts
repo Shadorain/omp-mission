@@ -228,6 +228,22 @@ test('committing files that were already staged at launch, as a repair finishing
   expect(settled[0]![1]).toEqual({ ok: true, summary: 'merged' });
 });
 
+test('a file the worker deleted and committed, as a merge repair taking the base\'s move does, is not re-staged', async () => {
+  await writeFile(join(cwd, 'a', 'one.txt'), 'conflicted during the merge');
+  await git(cwd, 'add', 'a/one.txt');
+  const f = fake(async ({ cwd: dir, messages }) => {
+    messages.push(toolCall('bash', { command: 'git rm -qf a/one.txt && git commit --no-edit' }));
+    await git(dir, 'rm', '-qf', 'a/one.txt');
+    await git(dir, 'commit', '-qm', 'merge');
+    messages.push(yielded({ done: true, summary: 'merged' }));
+  });
+  const { runner, settled } = harness(async () => ({ session: f.session, file: join(root, 's.jsonl') }));
+  const w = worker('bd-1', ['a/**']);
+  await runner.launch(mission([w]), w);
+  await runner.whenDone('bd-1');
+  expect(settled[0]![1]).toEqual({ ok: true, summary: 'merged' });
+});
+
 test('missing yields are chased twice, then the worker is reported as failed', async () => {
   const f = fake(() => {});
   const { runner, settled } = harness(async () => ({ session: f.session, file: join(root, 's.jsonl') }));
