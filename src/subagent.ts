@@ -94,6 +94,11 @@ export async function snapshotChanges(run: Run, cwd: string): Promise<Record<str
 		if (entry[0] === 'R' || entry[0] === 'C') paths.add(entries[++index] ?? '');
 	}
 	paths.delete('');
+	return hashPaths(run, cwd, [...paths]);
+}
+
+/** path -> content hash, or 'deleted' when the path is gone. */
+export async function hashPaths(run: Run, cwd: string, paths: readonly string[]): Promise<Record<string, string>> {
 	const snapshot: Record<string, string> = {};
 	const present: string[] = [];
 	for (const path of paths) {
@@ -292,7 +297,11 @@ export class SubagentRunner implements SubagentPort {
 		const owned = (beadId: string, files: readonly string[]) => [...files, ...(mission.scopes[beadId] ?? [])];
 		const mine = owned(worker.beadId, worker.files);
 		const sibling = mission.workers.filter(other => other.beadId !== worker.beadId).flatMap(other => owned(other.beadId, other.files));
-		const changed = changedSince(live.baseline, await snapshotChanges(this.#o.run, worker.cwd));
+		const after = await snapshotChanges(this.#o.run, worker.cwd);
+		// A path that left git status was committed (a repair finishing the base merge commits every auto-merged base file):
+		// it changed only if its content differs from the baseline.
+		Object.assign(after, await hashPaths(this.#o.run, worker.cwd, Object.keys(live.baseline).filter(path => !(path in after))));
+		const changed = changedSince(live.baseline, after);
 		const mutations = mutationText(live.session.state.messages);
 		const others: string[] = [];
 		for (const other of mission.workers) {
