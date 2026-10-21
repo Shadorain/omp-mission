@@ -28,6 +28,7 @@ test('an unlisted session never becomes the terminal session that omp -c resumes
 	} finally {
 		await rm(crumb, { force: true });
 		await rm(dir, { recursive: true, force: true });
-		if (previousPane === undefined) delete process.env.TMUX_PANE; else process.env.TMUX_PANE = previousPane;
+		if (previousPane === undefined) delete process.env.TMUX_PANE;
+		else process.env.TMUX_PANE = previousPane;
 	}
 });

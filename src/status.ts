@@ -5,20 +5,30 @@ import { REPAIR_CYCLES } from './controller';
 // worker assignments, timestamps, lock nonce); none of it helps a decision, and every
 // tool result stays in context for the rest of the session, so views carry only state
 // the model can act on.
-const clip = (text: string, max: number): string => text.length > max ? `${text.slice(0, max)}…` : text;
+const clip = (text: string, max: number): string => (text.length > max ? `${text.slice(0, max)}…` : text);
 
 export type NextView = Action & { guide?: string };
-interface Input { mission?: Mission; pending?: Mission; snapshot?: Snapshot; resumeHold: boolean; ownershipError?: string; next?: NextView }
+interface Input {
+	mission?: Mission;
+	pending?: Mission;
+	snapshot?: Snapshot;
+	resumeHold: boolean;
+	ownershipError?: string;
+	next?: NextView;
+}
 
 // Terminal handles are UUIDs (many tokens) and the model addresses workers by bead id.
 function openWorkers(mission: Mission): string[] {
-	return mission.workers.filter(worker => worker.state !== 'closed').map(({ beadId, state, error }) => `${beadId}:${state}${error ? ` (${clip(error, 120)})` : ''}`);
+	return mission.workers
+		.filter(worker => worker.state !== 'closed')
+		.map(({ beadId, state, error }) => `${beadId}:${state}${error ? ` (${clip(error, 120)})` : ''}`);
 }
 
 function outstanding(snapshot: Snapshot | undefined): Record<string, number> | undefined {
 	if (!snapshot) return undefined;
 	const counts: Record<string, number> = {};
-	for (const bead of snapshot.leaves) if (bead.category !== 'closed') counts[bead.category] = (counts[bead.category] ?? 0) + 1;
+	for (const bead of snapshot.leaves)
+		if (bead.category !== 'closed') counts[bead.category] = (counts[bead.category] ?? 0) + 1;
 	return counts;
 }
 
@@ -35,7 +45,15 @@ export function briefView({ mission, pending, snapshot, resumeHold, ownershipErr
 		...(mission.blocker ? { blocker: mission.blocker } : {}),
 		...(resumeHold ? { resumeHold: true } : {}),
 		...(ownershipError ? { ownershipError } : {}),
-		...(mission.reviewProgress ? { reviewProgress: { completed: Object.keys(mission.reviewProgress.targets).length, total: Object.keys(mission.reviewProgress.inputs).length, failed: Object.keys(mission.reviewProgress.failures) } } : {}),
+		...(mission.reviewProgress
+			? {
+					reviewProgress: {
+						completed: Object.keys(mission.reviewProgress.targets).length,
+						total: Object.keys(mission.reviewProgress.inputs).length,
+						failed: Object.keys(mission.reviewProgress.failures),
+					},
+				}
+			: {}),
 		next,
 		workers: openWorkers(mission),
 		outstanding: outstanding(snapshot),
@@ -47,9 +65,13 @@ export function briefView({ mission, pending, snapshot, resumeHold, ownershipErr
 export function statusView(input: Input) {
 	const { mission, pending, snapshot } = input;
 	const brief = briefView(input);
-	if (!mission) return { ...brief, pending: pending ? { id: pending.id, source: pending.source.id, title: pending.source.title } : undefined };
+	if (!mission)
+		return {
+			...brief,
+			pending: pending ? { id: pending.id, source: pending.source.id, title: pending.source.title } : undefined,
+		};
 	const review = mission.reviews.at(-1);
- const paths=new Set(review?.findings.map(finding=>finding.path));
+	const paths = new Set(review?.findings.map(finding => finding.path));
 	return {
 		...brief,
 		mission: mission.id,
@@ -57,10 +79,35 @@ export function statusView(input: Input) {
 		epic: mission.epicId,
 		keep: mission.keep,
 		reviewRequested: mission.reviewRequested,
-		evidence: Object.fromEntries(Object.entries(mission.evidence).map(([phase, item]) => [phase, item && `${item.outcome}: ${clip(item.detail, 160)}`])),
-		review: review && { round: review.round, summary: clip(review.summary, 300), invalidated: review.invalidated, findings: review.findings },
+		evidence: Object.fromEntries(
+			Object.entries(mission.evidence).map(([phase, item]) => [
+				phase,
+				item && `${item.outcome}: ${clip(item.detail, 160)}`,
+			]),
+		),
+		review: review && {
+			round: review.round,
+			summary: clip(review.summary, 300),
+			invalidated: review.invalidated,
+			findings: review.findings,
+		},
 		reviewRounds: mission.reviews.length,
-  priorFindings: mission.reviews.slice(-3,-1).filter(round=>!round.invalidated).flatMap(round=>round.findings.filter(finding=>paths.has(finding.path)).map(finding=>({id:finding.id,round:round.round,path:finding.path,title:finding.title,triage:finding.triage,rejection:finding.rejection,repairedBy:Object.keys(mission.repairLinks).filter(id=>mission.repairLinks[id]!.includes(finding.id))}))),
+		priorFindings: mission.reviews
+			.slice(-3, -1)
+			.filter(round => !round.invalidated)
+			.flatMap(round =>
+				round.findings
+					.filter(finding => paths.has(finding.path))
+					.map(finding => ({
+						id: finding.id,
+						round: round.round,
+						path: finding.path,
+						title: finding.title,
+						triage: finding.triage,
+						rejection: finding.rejection,
+						repairedBy: Object.keys(mission.repairLinks).filter(id => mission.repairLinks[id]!.includes(finding.id)),
+					})),
+			),
 		beads: snapshot?.beads.map(bead => `${bead.id} ${bead.category} ${clip(bead.title, 60)}`),
 		ready: snapshot?.ready,
 		closed: snapshot?.closed,

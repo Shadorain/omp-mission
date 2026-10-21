@@ -7,57 +7,148 @@ import { join, resolve, sep } from 'node:path';
 import type { ExtensionContext, PlanReviewChoice } from '@oh-my-pi/pi-coding-agent';
 import { parseBoardAnswers, type BoardAnswer } from './ask-bridge';
 import type { OpenApproval } from './approval-bridge';
-import { deliverUrl, displayPhase, effectiveGraph, modelRetryTargets, openFinding, operatorCommands, providerCapacity, quotaBlocked, repairBudgetReason, reviewTriageAction, reviewRetryAt } from './controller';
+import {
+	deliverUrl,
+	displayPhase,
+	effectiveGraph,
+	modelRetryTargets,
+	openFinding,
+	operatorCommands,
+	providerCapacity,
+	quotaBlocked,
+	repairBudgetReason,
+	reviewTriageAction,
+	reviewRetryAt,
+} from './controller';
 import { isRecord } from './guards';
 import { displaySourceId } from './sources';
 import { missionDirectory } from './store';
-import { phases, type Evidence, type Frontend, type Mission, type MissionCheck, type MissionMeasurements, type Mode, type PolicyContext, type Snapshot, type Step } from './types';
+import {
+	phases,
+	type Evidence,
+	type Frontend,
+	type Mission,
+	type MissionCheck,
+	type MissionMeasurements,
+	type Mode,
+	type PolicyContext,
+	type Snapshot,
+	type Step,
+} from './types';
 
 // The holotable fleet contract (omp-holotable/docs/contract.md). Kept local: the repos do not import across.
-export const OPERATOR_OPS = ['approve', 'continue', 'mode', 'review', 'dispatch', 'check', 'resend', 'release', 'reap', 'clear', 'plan-approve', 'retry-model'] as const;
-const SOCKET_OPS: Record<string, true> = { ping: true, answer: true, permit: true, approve: true, continue: true, mode: true, review: true, dispatch: true, check: true, resend: true, release: true, reap: true, clear: true, plan: true, 'plan-edit': true, 'plan-refine': true, 'plan-approve': true, 'retry-model': true };
+export const OPERATOR_OPS = [
+	'approve',
+	'continue',
+	'mode',
+	'review',
+	'dispatch',
+	'check',
+	'resend',
+	'release',
+	'reap',
+	'clear',
+	'plan-approve',
+	'retry-model',
+] as const;
+const SOCKET_OPS: Record<string, true> = {
+	ping: true,
+	answer: true,
+	permit: true,
+	approve: true,
+	continue: true,
+	mode: true,
+	review: true,
+	dispatch: true,
+	check: true,
+	resend: true,
+	release: true,
+	reap: true,
+	clear: true,
+	plan: true,
+	'plan-edit': true,
+	'plan-refine': true,
+	'plan-approve': true,
+	'retry-model': true,
+};
 // 1 MiB: a plan-edit request carries up to 256 KiB of text plus JSON escaping overhead.
 const MAX_LINE = 1024 * 1024;
 const MAX_PLAN = 256 * 1024;
 
 export interface MissionProblem {
- kind: 'quota' | 'rate-limit' | 'timeout' | 'error';
- source: string;
- detail: string;
- retryAt: string | null;
- attempt: number | null;
- completed: number | null;
- total: number | null;
+	kind: 'quota' | 'rate-limit' | 'timeout' | 'error';
+	source: string;
+	detail: string;
+	retryAt: string | null;
+	attempt: number | null;
+	completed: number | null;
+	total: number | null;
 }
 
 function missionProblem(m: Mission, graphError?: string): MissionProblem | null {
- if (m.phase === 'complete') return null;
- const review = m.evidence.review;
- const worker = m.workers.find(w => w.state !== 'closed' && w.error);
- const triage=reviewTriageAction(m);
- const escalation=triage?.kind==='hold'?triage.detail:undefined;
- const budgetExhausted=escalation!==undefined&&escalation===repairBudgetReason(m);
- const source = graphError ? 'graph' : m.blocker ? 'coordinator' : escalation ? budgetExhausted?'repair-budget':'triage'
-  : review?.outcome === 'failed' ? 'review' : worker ? 'worker'
-  : m.evidence.verify?.outcome === 'failed' ? 'verification' : undefined;
- const detail = graphError ?? m.blocker ?? escalation ?? (source === 'review' ? review!.detail : worker?.error ?? (source === 'verification' ? m.evidence.verify!.detail : undefined));
- if (!source || !detail) return null;
- const capacity = providerCapacity(detail);
- const retry = source === 'review' ? reviewRetryAt(m) : undefined;
- return {
-  kind: source === 'repair-budget' ? 'error' : capacity === 'quota' ? 'quota' : capacity === 'rate' ? 'rate-limit'
-   : /deadline exceeded|timed out|timeout/i.test(detail) ? 'timeout' : 'error',
-  source, detail, retryAt: retry === undefined ? null : new Date(retry).toISOString(),
-  attempt: source === 'review' ? review!.attempts ?? 1 : null,
-  completed: source === 'review' && m.reviewProgress ? Object.keys(m.reviewProgress.targets).length : null,
-  total: source === 'review' && m.reviewProgress ? Object.keys(m.reviewProgress.inputs).length : null,
- };
+	if (m.phase === 'complete') return null;
+	const review = m.evidence.review;
+	const worker = m.workers.find(w => w.state !== 'closed' && w.error);
+	const triage = reviewTriageAction(m);
+	const escalation = triage?.kind === 'hold' ? triage.detail : undefined;
+	const budgetExhausted = escalation !== undefined && escalation === repairBudgetReason(m);
+	const source = graphError
+		? 'graph'
+		: m.blocker
+			? 'coordinator'
+			: escalation
+				? budgetExhausted
+					? 'repair-budget'
+					: 'triage'
+				: review?.outcome === 'failed'
+					? 'review'
+					: worker
+						? 'worker'
+						: m.evidence.verify?.outcome === 'failed'
+							? 'verification'
+							: undefined;
+	const detail =
+		graphError ??
+		m.blocker ??
+		escalation ??
+		(source === 'review'
+			? review!.detail
+			: (worker?.error ?? (source === 'verification' ? m.evidence.verify!.detail : undefined)));
+	if (!source || !detail) return null;
+	const capacity = providerCapacity(detail);
+	const retry = source === 'review' ? reviewRetryAt(m) : undefined;
+	return {
+		kind:
+			source === 'repair-budget'
+				? 'error'
+				: capacity === 'quota'
+					? 'quota'
+					: capacity === 'rate'
+						? 'rate-limit'
+						: /deadline exceeded|timed out|timeout/i.test(detail)
+							? 'timeout'
+							: 'error',
+		source,
+		detail,
+		retryAt: retry === undefined ? null : new Date(retry).toISOString(),
+		attempt: source === 'review' ? (review!.attempts ?? 1) : null,
+		completed: source === 'review' && m.reviewProgress ? Object.keys(m.reviewProgress.targets).length : null,
+		total: source === 'review' && m.reviewProgress ? Object.keys(m.reviewProgress.inputs).length : null,
+	};
 }
 export interface ReviewStatus {
- startedAt:string; deadlineAt:string; active:number; completed:number; total:number; models:string[];
+	startedAt: string;
+	deadlineAt: string;
+	active: number;
+	completed: number;
+	total: number;
+	models: string[];
 }
 /** The coordinator agent in this pane: mid-turn (or about to continue on its own), or idle until someone sends it a message. */
-export interface CoordinatorActivity { state:'working'|'idle'; since:string }
+export interface CoordinatorActivity {
+	state: 'working' | 'idle';
+	since: string;
+}
 export interface ContactStatus {
 	schema: 1;
 	id: string;
@@ -79,14 +170,14 @@ export interface ContactStatus {
 	mode: Mode | null;
 	/** Latest verification outcome; 'failed' means `continue` would re-open broken work, so automation must not send it. */
 	verify: Evidence['outcome'] | null;
- problem?: MissionProblem | null;
- review?:ReviewStatus|null;
- model?:string|null;
+	problem?: MissionProblem | null;
+	review?: ReviewStatus | null;
+	model?: string | null;
 	/** Latest operator-requested PR check; absent until the first check or on older missions. */
 	check?: MissionCheck | null;
 	usage: UsageTotals | null;
- measurements?: Measurements | null;
- usageEvidence?: UsageEvidence | null;
+	measurements?: Measurements | null;
+	usageEvidence?: UsageEvidence | null;
 	ctl: { socket: string; generation: number } | null;
 	/** The pane's open `ask` while hold is 'question': its tool call id and each question's choices, so the board can answer it. */
 	ask?: { id: string; questions: AskQuestion[] } | null;
@@ -100,16 +191,26 @@ export interface ContactStatus {
 }
 
 /** One question of an open `ask` call, as the pane's dialog shows it: the options, then "Other". */
-export interface AskQuestion { question: string; options: string[]; recommended: number | null; multi: boolean }
+export interface AskQuestion {
+	question: string;
+	options: string[];
+	recommended: number | null;
+	multi: boolean;
+}
 
 /** The `questions` argument of an `ask` tool call, reduced to what answering it needs. Malformed entries are dropped. */
 export function askQuestions(raw: unknown): AskQuestion[] {
 	if (!Array.isArray(raw)) return [];
 	return raw.filter(isRecord).flatMap(q => {
 		if (typeof q.question !== 'string' || !q.question.trim() || !Array.isArray(q.options)) return [];
-		const options = q.options.map(o => isRecord(o) && typeof o.label === 'string' ? o.label : typeof o === 'string' ? o : null);
+		const options = q.options.map(o =>
+			isRecord(o) && typeof o.label === 'string' ? o.label : typeof o === 'string' ? o : null,
+		);
 		if (options.some(o => o === null)) return [];
-		const recommended = Number.isInteger(q.recommended) && (q.recommended as number) >= 0 && (q.recommended as number) < options.length ? q.recommended as number : null;
+		const recommended =
+			Number.isInteger(q.recommended) && (q.recommended as number) >= 0 && (q.recommended as number) < options.length
+				? (q.recommended as number)
+				: null;
 		return [{ question: q.question, options: options as string[], recommended, multi: q.multi === true }];
 	});
 }
@@ -136,38 +237,94 @@ export interface UsageTotals {
 	sessions: number;
 }
 
-export interface MeasurementConfig { graph:'local'|'beads'; frontend:Frontend; maxWorkers:number; reviewConcurrency:number; mode:Mode }
-export interface Measurements extends Omit<MissionMeasurements,'lastVerification'> {
- completedRounds:number; invalidatedRounds:number; findingOccurrences:number; latestActionable:number; latestRejected:number;
- severity:{critical:number;high:number;medium:number;low:number};
- workerAttempts:number; workerBeads:number; repairRound:number; repairLinks:number; config:MeasurementConfig;
+export interface MeasurementConfig {
+	graph: 'local' | 'beads';
+	frontend: Frontend;
+	maxWorkers: number;
+	reviewConcurrency: number;
+	mode: Mode;
 }
-export interface UsageSource extends UsageTotals { role:'coordinator'|'worker'|'review'; id:string; pricedMessages:number; unpricedMessages:number }
+export interface Measurements extends Omit<MissionMeasurements, 'lastVerification'> {
+	completedRounds: number;
+	invalidatedRounds: number;
+	findingOccurrences: number;
+	latestActionable: number;
+	latestRejected: number;
+	severity: { critical: number; high: number; medium: number; low: number };
+	workerAttempts: number;
+	workerBeads: number;
+	repairRound: number;
+	repairLinks: number;
+	config: MeasurementConfig;
+}
+export interface UsageSource extends UsageTotals {
+	role: 'coordinator' | 'worker' | 'review';
+	id: string;
+	pricedMessages: number;
+	unpricedMessages: number;
+}
 export interface UsageEvidence {
- v:1; measuredAt:string; sources:UsageSource[]; missing:number; unsupportedWorkers:number;
- malformedLines:number; resets:number; backlogBytes:number; partial:boolean;
+	v: 1;
+	measuredAt: string;
+	sources: UsageSource[];
+	missing: number;
+	unsupportedWorkers: number;
+	malformedLines: number;
+	resets: number;
+	backlogBytes: number;
+	partial: boolean;
 }
-export interface UsageMeasurement { usage:UsageTotals|null; evidence:UsageEvidence }
-interface UsageAccumulator { totals:UsageTotals; pricedMessages:number; unpricedMessages:number; malformedLines:number }
+export interface UsageMeasurement {
+	usage: UsageTotals | null;
+	evidence: UsageEvidence;
+}
+interface UsageAccumulator {
+	totals: UsageTotals;
+	pricedMessages: number;
+	unpricedMessages: number;
+	malformedLines: number;
+}
 
-function usageAccumulator():UsageAccumulator {
- return {totals:{tokens:{input:0,output:0,cacheRead:0,cacheWrite:0},costUsd:null,sessions:0},pricedMessages:0,unpricedMessages:0,malformedLines:0};
+function usageAccumulator(): UsageAccumulator {
+	return {
+		totals: { tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, costUsd: null, sessions: 0 },
+		pricedMessages: 0,
+		unpricedMessages: 0,
+		malformedLines: 0,
+	};
 }
-function consumeUsage(acc:UsageAccumulator,record:unknown):void {
- if(!isRecord(record)||record.type!=='message'||!isRecord(record.message)||record.message.role!=='assistant')return;
- const usage=record.message.usage;
- if(!isRecord(usage)){acc.malformedLines++;return;}
- for(const key of TOKEN_KEYS){
-  const value=usage[key];
-  if(value===undefined&&(key==='cacheRead'||key==='cacheWrite'))continue;
-  if(typeof value!=='number'||!Number.isSafeInteger(value)||value<0){acc.malformedLines++;return;}
- }
- const cost=isRecord(usage.cost)?usage.cost.total:undefined;
- if(cost!==undefined&&(typeof cost!=='number'||!Number.isFinite(cost)||cost<0)){acc.malformedLines++;return;}
- for(const key of TOKEN_KEYS)acc.totals.tokens[key]+=(usage[key] as number|undefined)??0;
- acc.totals.sessions=1;
- if(typeof cost==='number'){acc.totals.costUsd=(acc.totals.costUsd??0)+cost;acc.pricedMessages++;}
- else acc.unpricedMessages++;
+function consumeUsage(acc: UsageAccumulator, record: unknown): void {
+	if (
+		!isRecord(record) ||
+		record.type !== 'message' ||
+		!isRecord(record.message) ||
+		record.message.role !== 'assistant'
+	)
+		return;
+	const usage = record.message.usage;
+	if (!isRecord(usage)) {
+		acc.malformedLines++;
+		return;
+	}
+	for (const key of TOKEN_KEYS) {
+		const value = usage[key];
+		if (value === undefined && (key === 'cacheRead' || key === 'cacheWrite')) continue;
+		if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+			acc.malformedLines++;
+			return;
+		}
+	}
+	const cost = isRecord(usage.cost) ? usage.cost.total : undefined;
+	if (cost !== undefined && (typeof cost !== 'number' || !Number.isFinite(cost) || cost < 0)) {
+		acc.malformedLines++;
+		return;
+	}
+	for (const key of TOKEN_KEYS) acc.totals.tokens[key] += (usage[key] as number | undefined) ?? 0;
+	acc.totals.sessions = 1;
+	if (typeof cost === 'number') {
+		acc.totals.costUsd = (acc.totals.costUsd ?? 0) + cost;
+		acc.pricedMessages++;
+	} else acc.unpricedMessages++;
 }
 
 const TOKEN_KEYS = ['input', 'output', 'cacheRead', 'cacheWrite'] as const;
@@ -179,9 +336,9 @@ function mergeUsage(target: UsageTotals, source: UsageTotals | null): void {
 	target.sessions += source.sessions;
 }
 
-export function sumAssistantUsage(records:readonly unknown[],acc=usageAccumulator()):UsageTotals|null {
- for(const record of records)consumeUsage(acc,record);
- return acc.totals.sessions?acc.totals:null;
+export function sumAssistantUsage(records: readonly unknown[], acc = usageAccumulator()): UsageTotals | null {
+	for (const record of records) consumeUsage(acc, record);
+	return acc.totals.sessions ? acc.totals : null;
 }
 
 export function gateTokenId(token: string): string {
@@ -195,119 +352,248 @@ export function statusFilePath(agentDir: string, mission: Pick<Mission, 'id' | '
 	return join(missionDirectory(agentDir, mission.workspace.key), 'status', `${mission.id}.json`);
 }
 
-interface FileUsage extends UsageAccumulator { offset:number; size:number; dev:number; ino:number; discard:boolean; role:'worker'|'review' }
+interface FileUsage extends UsageAccumulator {
+	offset: number;
+	size: number;
+	dev: number;
+	ino: number;
+	discard: boolean;
+	role: 'worker' | 'review';
+}
 
 export class UsageProbe {
- private readonly files=new Map<string,FileUsage>();
- private stamp=0;
- private key='';
- private cursor=0;
- private resetCount=0;
- private cache:UsageMeasurement|undefined;
- private scratch:{chunk:Buffer;line:Buffer}|undefined;
- constructor(private readonly agentDir:string,private readonly now:()=>number=Date.now,private readonly intervalMs=30_000){}
+	private readonly files = new Map<string, FileUsage>();
+	private stamp = 0;
+	private key = '';
+	private cursor = 0;
+	private resetCount = 0;
+	private cache: UsageMeasurement | undefined;
+	private scratch: { chunk: Buffer; line: Buffer } | undefined;
+	constructor(
+		private readonly agentDir: string,
+		private readonly now: () => number = Date.now,
+		private readonly intervalMs = 30_000,
+	) {}
 
- async measure(mission:Mission,coordinator:()=>{sessionFile:string|null;entries:readonly unknown[]}|undefined,force=false):Promise<UsageMeasurement>{
-  const key=`${mission.workspace.key} ${mission.id}`,now=this.now();
-  if(!force&&this.key===key&&this.cache&&now-this.stamp<this.intervalMs)return this.cache;
-  if(this.key!==key){this.files.clear();this.cursor=0;this.resetCount=0;}
-  this.key=key;this.stamp=now;
-  const evidence:UsageEvidence={v:1,measuredAt:new Date(now).toISOString(),sources:[],missing:0,unsupportedWorkers:0,malformedLines:0,resets:0,backlogBytes:0,partial:false};
-  const totals:UsageTotals={tokens:{input:0,output:0,cacheRead:0,cacheWrite:0},costUsd:null,sessions:0};
-  const coord=coordinator(),acc=usageAccumulator();
-  const coordinatorUsage=sumAssistantUsage(coord?.entries??[],acc);
-  mergeUsage(totals,coordinatorUsage);
-  evidence.malformedLines+=acc.malformedLines;
-  if(!coord?.sessionFile)evidence.missing++;
-  else if(coordinatorUsage)evidence.sources.push({role:'coordinator',id:`coordinator:${createHash('sha256').update(coord.sessionFile).digest('hex').slice(0,32)}`,...coordinatorUsage,pricedMessages:acc.pricedMessages,unpricedMessages:acc.unpricedMessages});
-  const base=missionDirectory(this.agentDir,mission.workspace.key);
-  const workerDir=await realpath(join(base,'workers')).catch(()=>resolve(base,'workers'));
-  const reviewDir=await realpath(join(base,'reviews',mission.id)).catch(()=>resolve(base,'reviews',mission.id));
-  const owned=new Map<string,'worker'|'review'>();
-  const add=async(path:string,root:string,role:'worker'|'review')=>{
-   const canonical=await realpath(path).catch(()=>resolve(path));
-   if(!canonical.startsWith(`${root}${sep}`)||!canonical.endsWith('.jsonl')){evidence.missing++;return;}
-   owned.set(canonical,role);
-  };
-  for(const worker of mission.workers){
-   if(worker.frontend!=='subagent'){evidence.unsupportedWorkers++;continue;}
-   if(!worker.incarnationId){evidence.missing++;continue;}
-   await add(worker.incarnationId,workerDir,'worker');
-  }
-  let reviewNames:string[]=[];
-  try{reviewNames=await readdir(reviewDir);}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')evidence.missing++;}
-  const reviewPaths=new Set(reviewNames.filter(name=>name.endsWith('.jsonl')).map(name=>join(reviewDir,name)));
-  // Saved rounds and reusable checkpoints remain spend evidence after review invalidation.
-  for(const round of mission.reviews)for(const path of Object.values(round.transcripts??{}))reviewPaths.add(path);
-  for(const target of Object.values(mission.reviewProgress?.targets??{}))if(target.transcript)reviewPaths.add(target.transcript);
-  for(const path of reviewPaths)await add(path,reviewDir,'review');
-  if(!reviewPaths.size&&(mission.reviews.length>0||mission.reviewProgress||mission.evidence.review&&['active','passed','failed'].includes(mission.evidence.review.outcome)))evidence.missing++;
-  const paths=[...owned.keys()].sort(),seen=new Set<string>();
-  const scratch=paths.length?(this.scratch??={chunk:Buffer.allocUnsafe(64*1024),line:Buffer.allocUnsafe(1024*1024)}):undefined;
-  const budget={remaining:4*1024*1024};
-  for(let i=0;i<paths.length;i++){
-   const path=paths[(this.cursor+i)%paths.length]!;
-   seen.add(path);
-   await this.readUsageFile(path,owned.get(path)!,budget,scratch!.chunk,scratch!.line,evidence);
-  }
-  if(paths.length)this.cursor=(this.cursor+1)%paths.length;
-  for(const [path] of this.files)if(!seen.has(path))evidence.missing++;
-  for(const role of ['worker','review'] as const){
-   const aggregate=usageAccumulator();
-   for(const entry of this.files.values())if(entry.role===role){
-    mergeUsage(aggregate.totals,entry.totals);
-    aggregate.pricedMessages+=entry.pricedMessages;aggregate.unpricedMessages+=entry.unpricedMessages;aggregate.malformedLines+=entry.malformedLines;
-   }
-   evidence.malformedLines+=aggregate.malformedLines;
-   if(aggregate.totals.sessions){
-    const source:UsageSource={role,id:`${role}:${createHash('sha256').update(mission.id).digest('hex').slice(0,32)}`,...aggregate.totals,pricedMessages:aggregate.pricedMessages,unpricedMessages:aggregate.unpricedMessages};
-    evidence.sources.push(source);mergeUsage(totals,source);
-   }
-  }
-  evidence.resets=this.resetCount;
-  evidence.partial=evidence.missing>0||evidence.unsupportedWorkers>0||evidence.malformedLines>0||evidence.resets>0||evidence.backlogBytes>0||acc.unpricedMessages>0||evidence.sources.some(s=>s.unpricedMessages>0);
-  this.cache={usage:totals.sessions?totals:null,evidence};
-  return this.cache;
- }
+	async measure(
+		mission: Mission,
+		coordinator: () => { sessionFile: string | null; entries: readonly unknown[] } | undefined,
+		force = false,
+	): Promise<UsageMeasurement> {
+		const key = `${mission.workspace.key} ${mission.id}`,
+			now = this.now();
+		if (!force && this.key === key && this.cache && now - this.stamp < this.intervalMs) return this.cache;
+		if (this.key !== key) {
+			this.files.clear();
+			this.cursor = 0;
+			this.resetCount = 0;
+		}
+		this.key = key;
+		this.stamp = now;
+		const evidence: UsageEvidence = {
+			v: 1,
+			measuredAt: new Date(now).toISOString(),
+			sources: [],
+			missing: 0,
+			unsupportedWorkers: 0,
+			malformedLines: 0,
+			resets: 0,
+			backlogBytes: 0,
+			partial: false,
+		};
+		const totals: UsageTotals = {
+			tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			costUsd: null,
+			sessions: 0,
+		};
+		const coord = coordinator(),
+			acc = usageAccumulator();
+		const coordinatorUsage = sumAssistantUsage(coord?.entries ?? [], acc);
+		mergeUsage(totals, coordinatorUsage);
+		evidence.malformedLines += acc.malformedLines;
+		if (!coord?.sessionFile) evidence.missing++;
+		else if (coordinatorUsage)
+			evidence.sources.push({
+				role: 'coordinator',
+				id: `coordinator:${createHash('sha256').update(coord.sessionFile).digest('hex').slice(0, 32)}`,
+				...coordinatorUsage,
+				pricedMessages: acc.pricedMessages,
+				unpricedMessages: acc.unpricedMessages,
+			});
+		const base = missionDirectory(this.agentDir, mission.workspace.key);
+		const workerDir = await realpath(join(base, 'workers')).catch(() => resolve(base, 'workers'));
+		const reviewDir = await realpath(join(base, 'reviews', mission.id)).catch(() =>
+			resolve(base, 'reviews', mission.id),
+		);
+		const owned = new Map<string, 'worker' | 'review'>();
+		const add = async (path: string, root: string, role: 'worker' | 'review') => {
+			const canonical = await realpath(path).catch(() => resolve(path));
+			if (!canonical.startsWith(`${root}${sep}`) || !canonical.endsWith('.jsonl')) {
+				evidence.missing++;
+				return;
+			}
+			owned.set(canonical, role);
+		};
+		for (const worker of mission.workers) {
+			if (worker.frontend !== 'subagent') {
+				evidence.unsupportedWorkers++;
+				continue;
+			}
+			if (!worker.incarnationId) {
+				evidence.missing++;
+				continue;
+			}
+			await add(worker.incarnationId, workerDir, 'worker');
+		}
+		let reviewNames: string[] = [];
+		try {
+			reviewNames = await readdir(reviewDir);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== 'ENOENT') evidence.missing++;
+		}
+		const reviewPaths = new Set(reviewNames.filter(name => name.endsWith('.jsonl')).map(name => join(reviewDir, name)));
+		// Saved rounds and reusable checkpoints remain spend evidence after review invalidation.
+		for (const round of mission.reviews)
+			for (const path of Object.values(round.transcripts ?? {})) reviewPaths.add(path);
+		for (const target of Object.values(mission.reviewProgress?.targets ?? {}))
+			if (target.transcript) reviewPaths.add(target.transcript);
+		for (const path of reviewPaths) await add(path, reviewDir, 'review');
+		if (
+			!reviewPaths.size &&
+			(mission.reviews.length > 0 ||
+				mission.reviewProgress ||
+				(mission.evidence.review && ['active', 'passed', 'failed'].includes(mission.evidence.review.outcome)))
+		)
+			evidence.missing++;
+		const paths = [...owned.keys()].sort(),
+			seen = new Set<string>();
+		const scratch = paths.length
+			? (this.scratch ??= { chunk: Buffer.allocUnsafe(64 * 1024), line: Buffer.allocUnsafe(1024 * 1024) })
+			: undefined;
+		const budget = { remaining: 4 * 1024 * 1024 };
+		for (let i = 0; i < paths.length; i++) {
+			const path = paths[(this.cursor + i) % paths.length]!;
+			seen.add(path);
+			await this.readUsageFile(path, owned.get(path)!, budget, scratch!.chunk, scratch!.line, evidence);
+		}
+		if (paths.length) this.cursor = (this.cursor + 1) % paths.length;
+		for (const [path] of this.files) if (!seen.has(path)) evidence.missing++;
+		for (const role of ['worker', 'review'] as const) {
+			const aggregate = usageAccumulator();
+			for (const entry of this.files.values())
+				if (entry.role === role) {
+					mergeUsage(aggregate.totals, entry.totals);
+					aggregate.pricedMessages += entry.pricedMessages;
+					aggregate.unpricedMessages += entry.unpricedMessages;
+					aggregate.malformedLines += entry.malformedLines;
+				}
+			evidence.malformedLines += aggregate.malformedLines;
+			if (aggregate.totals.sessions) {
+				const source: UsageSource = {
+					role,
+					id: `${role}:${createHash('sha256').update(mission.id).digest('hex').slice(0, 32)}`,
+					...aggregate.totals,
+					pricedMessages: aggregate.pricedMessages,
+					unpricedMessages: aggregate.unpricedMessages,
+				};
+				evidence.sources.push(source);
+				mergeUsage(totals, source);
+			}
+		}
+		evidence.resets = this.resetCount;
+		evidence.partial =
+			evidence.missing > 0 ||
+			evidence.unsupportedWorkers > 0 ||
+			evidence.malformedLines > 0 ||
+			evidence.resets > 0 ||
+			evidence.backlogBytes > 0 ||
+			acc.unpricedMessages > 0 ||
+			evidence.sources.some(s => s.unpricedMessages > 0);
+		this.cache = { usage: totals.sessions ? totals : null, evidence };
+		return this.cache;
+	}
 
- private async readUsageFile(path:string,role:'worker'|'review',budget:{remaining:number},chunk:Buffer,line:Buffer,evidence:UsageEvidence):Promise<void>{
-  let file;
-  try{file=await open(path,'r');}catch{evidence.missing++;return;}
-  try{
-   const stat=await file.stat();
-   let entry=this.files.get(path);
-   if(entry&&(entry.dev!==stat.dev||entry.ino!==stat.ino||stat.size<entry.size)){this.resetCount++;entry=undefined;}
-   if(!entry){entry={...usageAccumulator(),offset:0,size:stat.size,dev:stat.dev,ino:stat.ino,discard:false,role};this.files.set(path,entry);}
-   entry.size=stat.size;
-   let position=entry.offset,length=0;
-   while(position<stat.size&&budget.remaining>0){
-    const size=Math.min(chunk.length,stat.size-position,budget.remaining);
-    const {bytesRead}=await file.read(chunk,0,size,position);
-    if(!bytesRead)break;
-    budget.remaining-=bytesRead;
-    let start=0;
-    while(start<bytesRead){
-     const newline=chunk.indexOf(0x0a,start),end=newline===-1||newline>=bytesRead?bytesRead:newline;
-     const bytes=end-start;
-     if(!entry.discard){
-      if(length+bytes>line.length){entry.discard=true;entry.malformedLines++;length=0;}
-      else{chunk.copy(line,length,start,end);length+=bytes;}
-     }
-     if(end<bytesRead){
-      if(!entry.discard&&length){
-       try{consumeUsage(entry,JSON.parse(line.toString('utf8',0,length)));}catch{entry.malformedLines++;}
-      }
-      entry.discard=false;length=0;entry.offset=position+end+1;
-     }
-     start=end+1;
-    }
-    position+=bytesRead;
-    if(entry.discard)entry.offset=position;
-   }
-   evidence.backlogBytes+=Math.max(0,stat.size-entry.offset);
-  }catch{evidence.missing++;}
-  finally{await file.close();}
- }
+	private async readUsageFile(
+		path: string,
+		role: 'worker' | 'review',
+		budget: { remaining: number },
+		chunk: Buffer,
+		line: Buffer,
+		evidence: UsageEvidence,
+	): Promise<void> {
+		let file;
+		try {
+			file = await open(path, 'r');
+		} catch {
+			evidence.missing++;
+			return;
+		}
+		try {
+			const stat = await file.stat();
+			let entry = this.files.get(path);
+			if (entry && (entry.dev !== stat.dev || entry.ino !== stat.ino || stat.size < entry.size)) {
+				this.resetCount++;
+				entry = undefined;
+			}
+			if (!entry) {
+				entry = {
+					...usageAccumulator(),
+					offset: 0,
+					size: stat.size,
+					dev: stat.dev,
+					ino: stat.ino,
+					discard: false,
+					role,
+				};
+				this.files.set(path, entry);
+			}
+			entry.size = stat.size;
+			let position = entry.offset,
+				length = 0;
+			while (position < stat.size && budget.remaining > 0) {
+				const size = Math.min(chunk.length, stat.size - position, budget.remaining);
+				const { bytesRead } = await file.read(chunk, 0, size, position);
+				if (!bytesRead) break;
+				budget.remaining -= bytesRead;
+				let start = 0;
+				while (start < bytesRead) {
+					const newline = chunk.indexOf(0x0a, start),
+						end = newline === -1 || newline >= bytesRead ? bytesRead : newline;
+					const bytes = end - start;
+					if (!entry.discard) {
+						if (length + bytes > line.length) {
+							entry.discard = true;
+							entry.malformedLines++;
+							length = 0;
+						} else {
+							chunk.copy(line, length, start, end);
+							length += bytes;
+						}
+					}
+					if (end < bytesRead) {
+						if (!entry.discard && length) {
+							try {
+								consumeUsage(entry, JSON.parse(line.toString('utf8', 0, length)));
+							} catch {
+								entry.malformedLines++;
+							}
+						}
+						entry.discard = false;
+						length = 0;
+						entry.offset = position + end + 1;
+					}
+					start = end + 1;
+				}
+				position += bytesRead;
+				if (entry.discard) entry.offset = position;
+			}
+			evidence.backlogBytes += Math.max(0, stat.size - entry.offset);
+		} catch {
+			evidence.missing++;
+		} finally {
+			await file.close();
+		}
+	}
 }
 
 export interface StatusInput {
@@ -322,11 +608,11 @@ export interface StatusInput {
 	operation: boolean;
 	ctl: { socket: string; generation: number } | null;
 	usage: UsageTotals | null;
- usageEvidence?:UsageEvidence;
- measurementConfig?:MeasurementConfig;
- review?:ReviewStatus|null;
- model?:string|null;
- coordinator?:CoordinatorActivity;
+	usageEvidence?: UsageEvidence;
+	measurementConfig?: MeasurementConfig;
+	review?: ReviewStatus | null;
+	model?: string | null;
+	coordinator?: CoordinatorActivity;
 	planPath?: string;
 	planReview?: boolean;
 	question?: string;
@@ -344,47 +630,96 @@ export async function buildContactStatus(input: StatusInput): Promise<ContactSta
 	// An unreadable bead graph stops the controller (nextAction holds on snapshot.error) even though no blocker is saved.
 	const graphDown = phase !== 'complete' && !!m.epicId && effectiveGraph(m) === 'beads' && !!input.snapshot?.error;
 	const question = phase !== 'complete' ? input.question : undefined;
- const triage=reviewTriageAction(m);const escalation=triage?.kind==='hold'?triage.detail:undefined;
-	const hold = question ? 'question'
-		: quotaBlocked(m) ? 'quota'
-		: input.pending ? (m.blocker ? 'blocked' : 'plan-approval')
-		: input.resumeHold && phase !== 'complete' ? 'resume'
-  : escalation ? 'blocked'
-		: m.gate ? 'gate'
-		: m.blocker || graphDown ? 'blocked'
-		: 'none';
+	const triage = reviewTriageAction(m);
+	const escalation = triage?.kind === 'hold' ? triage.detail : undefined;
+	const hold = question
+		? 'question'
+		: quotaBlocked(m)
+			? 'quota'
+			: input.pending
+				? m.blocker
+					? 'blocked'
+					: 'plan-approval'
+				: input.resumeHold && phase !== 'complete'
+					? 'resume'
+					: escalation
+						? 'blocked'
+						: m.gate
+							? 'gate'
+							: m.blocker || graphDown
+								? 'blocked'
+								: 'none';
 	// `ask` and `approval` are published only while the pane's prompt is open and answerable from outside (ask-bridge.ts, approval-bridge.ts).
-	const actions = question ? [...(input.ask ? ['answer'] : []), ...(input.approval ? ['permit'] : [])] : input.pending
-		// plan-approve answers OMP's interactive plan review, never a question or a parked planning turn.
-		? (!m.blocker && input.planReview ? ['plan-approve'] : [])
-		: [...new Set(
-			operatorCommands(m, false, input.snapshot, input.policy, input.selected, input.operation)
-				.map(command => command.split(' ')[0]!)
-				.filter((verb): verb is (typeof OPERATOR_OPS)[number] => (OPERATOR_OPS as readonly string[]).includes(verb)),
-		)];
-	if (!question && !input.pending && !input.operation && modelRetryTargets(m, input.snapshot, input.policy)) actions.push('retry-model');
+	const actions = question
+		? [...(input.ask ? ['answer'] : []), ...(input.approval ? ['permit'] : [])]
+		: input.pending
+			? // plan-approve answers OMP's interactive plan review, never a question or a parked planning turn.
+				!m.blocker && input.planReview
+				? ['plan-approve']
+				: []
+			: [
+					...new Set(
+						operatorCommands(m, false, input.snapshot, input.policy, input.selected, input.operation)
+							.map(command => command.split(' ')[0]!)
+							.filter((verb): verb is (typeof OPERATOR_OPS)[number] =>
+								(OPERATOR_OPS as readonly string[]).includes(verb),
+							),
+					),
+				];
+	if (!question && !input.pending && !input.operation && modelRetryTargets(m, input.snapshot, input.policy))
+		actions.push('retry-model');
 	const url = deliverUrl(m);
 	const branch = m.workspace.branch ?? null;
-	const next = question ? `Answer in mission: ${question}`.replace(/\s+/g, ' ').slice(0, 240)
-		: m.blocker ? m.blocker.replace(/\s+/g, ' ').slice(0, 240)
-  : escalation && !input.resumeHold ? escalation.slice(0,240)
-		: input.step ? `${input.step.command ? `${input.step.command} — ` : ''}${input.step.text}`.replace(/\s*\n\s*/g, ' ').slice(0, 240) : null;
- const measured=m.measurements;
- const latest=m.reviews.at(-1);
- const severity={critical:0,high:0,medium:0,low:0};
- let findingOccurrences=0,invalidatedRounds=0,repairLinks=0;
- for(const round of m.reviews){if(round.invalidated)invalidatedRounds++;for(const finding of round.findings){findingOccurrences++;severity[finding.severity]++;}}
- for(const links of Object.values(m.repairLinks))repairLinks+=links.length;
- const measurements:Measurements|null=measured&&input.measurementConfig?{
-  v:1,since:measured.since,recordedPassed:measured.recordedPassed,recordedFailed:measured.recordedFailed,
-  repeatedFailedRevision:measured.repeatedFailedRevision,mergePreflightFailures:measured.mergePreflightFailures,
-  boundaryFailures:measured.boundaryFailures,reviewFailures:measured.reviewFailures,acceptedRepairs:measured.acceptedRepairs,
-  completedRounds:m.reviews.length,invalidatedRounds,findingOccurrences,
-  latestActionable:latest&&!latest.invalidated?latest.findings.filter(openFinding).length:0,
-  latestRejected:latest&&!latest.invalidated?latest.findings.filter(f=>!!f.rejection).length:0,
-  severity,workerAttempts:m.workers.length,workerBeads:new Set(m.workers.map(w=>w.beadId)).size,
-  repairRound:m.round,repairLinks,config:input.measurementConfig,
- }:null;
+	const next = question
+		? `Answer in mission: ${question}`.replace(/\s+/g, ' ').slice(0, 240)
+		: m.blocker
+			? m.blocker.replace(/\s+/g, ' ').slice(0, 240)
+			: escalation && !input.resumeHold
+				? escalation.slice(0, 240)
+				: input.step
+					? `${input.step.command ? `${input.step.command} — ` : ''}${input.step.text}`
+							.replace(/\s*\n\s*/g, ' ')
+							.slice(0, 240)
+					: null;
+	const measured = m.measurements;
+	const latest = m.reviews.at(-1);
+	const severity = { critical: 0, high: 0, medium: 0, low: 0 };
+	let findingOccurrences = 0,
+		invalidatedRounds = 0,
+		repairLinks = 0;
+	for (const round of m.reviews) {
+		if (round.invalidated) invalidatedRounds++;
+		for (const finding of round.findings) {
+			findingOccurrences++;
+			severity[finding.severity]++;
+		}
+	}
+	for (const links of Object.values(m.repairLinks)) repairLinks += links.length;
+	const measurements: Measurements | null =
+		measured && input.measurementConfig
+			? {
+					v: 1,
+					since: measured.since,
+					recordedPassed: measured.recordedPassed,
+					recordedFailed: measured.recordedFailed,
+					repeatedFailedRevision: measured.repeatedFailedRevision,
+					mergePreflightFailures: measured.mergePreflightFailures,
+					boundaryFailures: measured.boundaryFailures,
+					reviewFailures: measured.reviewFailures,
+					acceptedRepairs: measured.acceptedRepairs,
+					completedRounds: m.reviews.length,
+					invalidatedRounds,
+					findingOccurrences,
+					latestActionable: latest && !latest.invalidated ? latest.findings.filter(openFinding).length : 0,
+					latestRejected: latest && !latest.invalidated ? latest.findings.filter(f => !!f.rejection).length : 0,
+					severity,
+					workerAttempts: m.workers.length,
+					workerBeads: new Set(m.workers.map(w => w.beadId)).size,
+					repairRound: m.round,
+					repairLinks,
+					config: input.measurementConfig,
+				}
+			: null;
 	return {
 		schema: 1,
 		id: m.id,
@@ -398,25 +733,39 @@ export async function buildContactStatus(input: StatusInput): Promise<ContactSta
 		gate: m.gate ? { kind: m.gate.kind, id: gateTokenId(m.gate.token) } : null,
 		next,
 		actions,
-		workers: m.workers.length ? { live: m.workers.filter(w => w.state !== 'closed').length, total: m.workers.length } : null,
+		workers: m.workers.length
+			? { live: m.workers.filter(w => w.state !== 'closed').length, total: m.workers.length }
+			: null,
 		delivery: url || branch ? { url, branch } : null,
 		complete: phase === 'complete',
-		plan: input.pending && input.planPath ? await readFile(input.planPath, 'utf8').then(text => ({ path: input.planPath!, revision: planRevision(text) })).catch(() => null) : null,
+		plan:
+			input.pending && input.planPath
+				? await readFile(input.planPath, 'utf8')
+						.then(text => ({ path: input.planPath!, revision: planRevision(text) }))
+						.catch(() => null)
+				: null,
 		revision: m.updatedAt,
 		mode: m.mode ?? null,
 		verify: m.evidence.verify?.outcome ?? null,
 		problem: missionProblem(m, graphDown ? input.snapshot?.error : undefined),
-  review:input.review??null,
-  model:input.model??null,
+		review: input.review ?? null,
+		model: input.model ?? null,
 		check: m.check ?? null,
-		session: input.session ? { ...input.session, pid: process.pid, processStart: processStartTicks(process.pid), terminal: process.env.ORCA_TERMINAL_HANDLE ?? null } : undefined,
+		session: input.session
+			? {
+					...input.session,
+					pid: process.pid,
+					processStart: processStartTicks(process.pid),
+					terminal: process.env.ORCA_TERMINAL_HANDLE ?? null,
+				}
+			: undefined,
 		ctl: input.ctl,
 		ask: question && input.ask ? input.ask : null,
 		coordinator: input.coordinator ?? null,
 		approval: question && input.approval ? input.approval : null,
 		usage: input.usage,
-  measurements,
-  usageEvidence:input.usageEvidence??null,
+		measurements,
+		usageEvidence: input.usageEvidence ?? null,
 		updatedAt: new Date().toISOString(),
 	};
 }
@@ -458,9 +807,9 @@ export interface HolotableHooks {
 	owned(): boolean;
 	selected(): string | undefined;
 	operation(): boolean;
- measurementConfig?():MeasurementConfig;
- review?():ReviewStatus|null;
- coordinator?():CoordinatorActivity|undefined;
+	measurementConfig?(): MeasurementConfig;
+	review?(): ReviewStatus | null;
+	coordinator?(): CoordinatorActivity | undefined;
 	question(): string | undefined;
 	/** The open ask the board may answer: published only while its dialog is on screen. */
 	ask?(): { id: string; questions: AskQuestion[] } | undefined;
@@ -478,7 +827,13 @@ export interface HolotableHooks {
 	touchPending(): void;
 	sendUserMessage(message: string): void;
 	// The open interactive plan review, when OMP exposes the review API (ctx.resolvePlanReview) and a review awaits an answer.
-	planReview(): { reviewId: string; canApprove: boolean; resolve(choice: PlanReviewChoice, input?: { feedback?: string }): boolean } | undefined;
+	planReview():
+		| {
+				reviewId: string;
+				canApprove: boolean;
+				resolve(choice: PlanReviewChoice, input?: { feedback?: string }): boolean;
+		  }
+		| undefined;
 	onNotify(message: string): void;
 	/** Publish identity: id distinguishes panes of one mission; owned is false for read-only inspections. */
 	sessionInfo?(): { id: string; owned: boolean } | undefined;
@@ -507,33 +862,54 @@ export class HolotableBridge {
 	private failed = false;
 	private writing: Promise<void> = Promise.resolve();
 	private readonly usage: UsageProbe;
- private completedKey='';
+	private completedKey = '';
 
-	constructor(private readonly agentDir: string, private readonly hooks: HolotableHooks) {
+	constructor(
+		private readonly agentDir: string,
+		private readonly hooks: HolotableHooks,
+	) {
 		this.usage = new UsageProbe(agentDir);
 	}
 
 	ctlFor(missionId: string): { socket: string; generation: number } | null {
-		return this.socketId === missionId && this.server && this.socketPath ? { socket: this.socketPath, generation: this.generation } : null;
+		return this.socketId === missionId && this.server && this.socketPath
+			? { socket: this.socketPath, generation: this.generation }
+			: null;
 	}
 
 	// Fire-and-forget status publication; serialized so concurrent renders cannot interleave the tmp file.
- publish(forceUsage=false):Promise<void> {
-  this.writing=this.writing.then(()=>this.write(forceUsage)).catch(()=>undefined);
+	publish(forceUsage = false): Promise<void> {
+		this.writing = this.writing.then(() => this.write(forceUsage)).catch(() => undefined);
 		return this.writing;
 	}
 
- private async write(forceUsage:boolean):Promise<void> {
+	private async write(forceUsage: boolean): Promise<void> {
 		const { mission, pending } = this.hooks.source();
 		const current = mission ?? pending;
 		if (!current) return;
 		// getEntries() (not getBranch()): every assistant message in the coordinator session counts toward spend.
 		// Lazy so a publish inside the probe's throttle window does not pay for the copy.
-  const coordinator=()=>{try{const context=this.hooks.context();if(!context)return undefined;const manager=context.sessionManager;return {sessionFile:typeof manager.getSessionFile==='function'?manager.getSessionFile()??null:null,entries:manager.getEntries()};}catch{return undefined;}};
-  const key=`${current.workspace.key} ${current.id}`;
-  const complete=current.phase==='complete';
-  const measured=await this.usage.measure(current,coordinator,forceUsage||(complete&&this.completedKey!==key));
-  this.completedKey=complete?key:'';
+		const coordinator = () => {
+			try {
+				const context = this.hooks.context();
+				if (!context) return undefined;
+				const manager = context.sessionManager;
+				return {
+					sessionFile: typeof manager.getSessionFile === 'function' ? (manager.getSessionFile() ?? null) : null,
+					entries: manager.getEntries(),
+				};
+			} catch {
+				return undefined;
+			}
+		};
+		const key = `${current.workspace.key} ${current.id}`;
+		const complete = current.phase === 'complete';
+		const measured = await this.usage.measure(
+			current,
+			coordinator,
+			forceUsage || (complete && this.completedKey !== key),
+		);
+		this.completedKey = complete ? key : '';
 		const status = await buildContactStatus({
 			mission: current,
 			pending: !mission && !!pending,
@@ -546,12 +922,15 @@ export class HolotableBridge {
 			operation: this.hooks.operation(),
 			session: this.hooks.sessionInfo?.(),
 			ctl: this.ctlFor(current.id),
-   usage:measured.usage,
-   usageEvidence:measured.evidence,
-   measurementConfig:this.hooks.measurementConfig?.(),
-   review:this.hooks.review?.(),
-   coordinator:this.hooks.coordinator?.(),
-   model:(()=>{const model=this.hooks.context()?.model;return model?`${model.provider}/${model.id}`:null;})(),
+			usage: measured.usage,
+			usageEvidence: measured.evidence,
+			measurementConfig: this.hooks.measurementConfig?.(),
+			review: this.hooks.review?.(),
+			coordinator: this.hooks.coordinator?.(),
+			model: (() => {
+				const model = this.hooks.context()?.model;
+				return model ? `${model.provider}/${model.id}` : null;
+			})(),
 			planPath: this.hooks.planPath(),
 			planReview: this.hooks.planReview()?.canApprove === true,
 			question: this.hooks.question(),
@@ -568,8 +947,11 @@ export class HolotableBridge {
 				const meta = await stat(file);
 				const existing = JSON.parse(await readFile(file, 'utf8'));
 				const prior = isRecord(existing) && isRecord(existing.session) ? existing.session : null;
-				if (prior && prior.owned === true && prior.id !== status.session.id && Date.now() - meta.mtimeMs < 45_000) return;
-			} catch { /* absent or unreadable: this pane is the only reporter */ }
+				if (prior && prior.owned === true && prior.id !== status.session.id && Date.now() - meta.mtimeMs < 45_000)
+					return;
+			} catch {
+				/* absent or unreadable: this pane is the only reporter */
+			}
 		}
 		try {
 			await mkdir(join(file, '..'), { recursive: true, mode: 0o700 });
@@ -595,7 +977,10 @@ export class HolotableBridge {
 	// A discarded pending plan leaves no status file: the run never existed. Saved missions keep their final snapshot.
 	async discard(mission: Pick<Mission, 'id' | 'workspace'>): Promise<void> {
 		const file = statusFilePath(this.agentDir, mission);
-		if (file === this.lastPath) { this.last = ''; this.lastPath = ''; }
+		if (file === this.lastPath) {
+			this.last = '';
+			this.lastPath = '';
+		}
 		await rm(file, { force: true });
 	}
 
@@ -605,8 +990,11 @@ export class HolotableBridge {
 	async open(mission: Pick<Mission, 'id' | 'workspace'>): Promise<void> {
 		if (this.socketId === mission.id && this.server) return;
 		const marker = join(statusFilePath(this.agentDir, mission), '..', `${mission.id}.ctl`);
-		const eligible = process.env.OMP_HOLOTABLE_CHILD === '1'
-			|| await lstat(marker).then(stat => stat.isFile()).catch(() => false);
+		const eligible =
+			process.env.OMP_HOLOTABLE_CHILD === '1' ||
+			(await lstat(marker)
+				.then(stat => stat.isFile())
+				.catch(() => false));
 		const owned = mission.id === this.hooks.source().pending?.id || this.hooks.owned();
 		if (!eligible || !owned) return;
 		await this.close();
@@ -615,12 +1003,14 @@ export class HolotableBridge {
 		const path = join(dir, `${createHash('sha256').update(mission.id).digest('hex').slice(0, 12)}-${process.pid}.sock`);
 		await mkdir(dir, { recursive: true, mode: 0o700 });
 		const stat = await lstat(dir);
-		if (!stat.isDirectory() || stat.uid !== process.getuid!()) throw new Error(`Refusing control socket dir ${dir}: not owned by uid ${process.getuid!()}`);
+		if (!stat.isDirectory() || stat.uid !== process.getuid!())
+			throw new Error(`Refusing control socket dir ${dir}: not owned by uid ${process.getuid!()}`);
 		await chmod(dir, 0o700);
 		// Drop sibling sockets whose pid exited so the directory does not grow forever.
 		for (const entry of await readdir(dir).catch(() => [] as string[])) {
 			const pid = Number(/-(\d+)\.sock$/.exec(entry)?.[1]);
-			if (Number.isInteger(pid) && pid !== process.pid && !processStartTicks(pid)) await rm(join(dir, entry), { force: true }).catch(() => undefined);
+			if (Number.isInteger(pid) && pid !== process.pid && !processStartTicks(pid))
+				await rm(join(dir, entry), { force: true }).catch(() => undefined);
 		}
 		await rm(path, { force: true });
 		this.generation = Date.now();
@@ -656,11 +1046,14 @@ export class HolotableBridge {
 		this.inflight.add(socket);
 		let buffer = '';
 		const reply = (line: string) => {
-			void this.handle(line).then(r => {
-				socket.end(`${JSON.stringify(r)}\n`);
-			}, () => {
-				socket.end(`${JSON.stringify(fail('bad-request', 'The request could not be handled'))}\n`);
-			});
+			void this.handle(line).then(
+				r => {
+					socket.end(`${JSON.stringify(r)}\n`);
+				},
+				() => {
+					socket.end(`${JSON.stringify(fail('bad-request', 'The request could not be handled'))}\n`);
+				},
+			);
 		};
 		socket.on('data', chunk => {
 			buffer += chunk.toString('utf8');
@@ -674,7 +1067,10 @@ export class HolotableBridge {
 			reply(line);
 		});
 		// A client that half-closes without a trailing newline still gets a reply.
-		socket.on('end', () => { if (buffer.length > 0 && buffer.length <= MAX_LINE) reply(buffer); buffer = ''; });
+		socket.on('end', () => {
+			if (buffer.length > 0 && buffer.length <= MAX_LINE) reply(buffer);
+			buffer = '';
+		});
 		socket.on('error', () => undefined);
 		socket.on('close', () => this.inflight.delete(socket));
 	}
@@ -686,7 +1082,13 @@ export class HolotableBridge {
 		} catch {
 			return fail('bad-request', 'Request is not valid JSON');
 		}
-		if (!isRecord(request) || request.v !== 1 || typeof request.op !== 'string' || !SOCKET_OPS[request.op] || (request.args !== undefined && !isRecord(request.args))) {
+		if (
+			!isRecord(request) ||
+			request.v !== 1 ||
+			typeof request.op !== 'string' ||
+			!SOCKET_OPS[request.op] ||
+			(request.args !== undefined && !isRecord(request.args))
+		) {
 			return fail('bad-request', 'Expected {"v":1,"op":"<op>","args":{...}}');
 		}
 		const { mission, pending } = this.hooks.source();
@@ -707,26 +1109,37 @@ export class HolotableBridge {
 			if (!ask || args.id !== ask.id) return fail('stale', 'That question is no longer open in the pane');
 			const answers = parseBoardAnswers(args.answers);
 			if (!answers) return fail('bad-request', 'answer requires args.answers: [{option} | {options} | {text}]');
-			const refused = this.hooks.answerAsk ? this.hooks.answerAsk(answers) : 'This pane cannot be answered from outside';
+			const refused = this.hooks.answerAsk
+				? this.hooks.answerAsk(answers)
+				: 'This pane cannot be answered from outside';
 			return refused ? fail('rejected', refused) : { v: 1, ok: true, revision: revision ?? '' };
 		}
 		if (request.op === 'permit') {
 			const approval = this.hooks.approval?.();
 			if (!approval || args.id !== approval.id) return fail('stale', 'That approval is no longer open in the pane');
-			if (typeof args.answer !== 'string') return fail('bad-request', 'permit requires args.answer: one of the approval\'s options');
-			const refused = this.hooks.permit ? this.hooks.permit(approval.id, args.answer) : 'This pane cannot be answered from outside';
+			if (typeof args.answer !== 'string')
+				return fail('bad-request', "permit requires args.answer: one of the approval's options");
+			const refused = this.hooks.permit
+				? this.hooks.permit(approval.id, args.answer)
+				: 'This pane cannot be answered from outside';
 			return refused ? fail('rejected', refused) : { v: 1, ok: true, revision: revision ?? '' };
 		}
-		if (this.hooks.question()) return fail('question-waiting', 'Answer the pending question in the mission pane before controlling the mission');
+		if (this.hooks.question())
+			return fail('question-waiting', 'Answer the pending question in the mission pane before controlling the mission');
 		const op = request.op;
 		try {
 			if (op === 'approve') {
 				const gate = args.gate;
-				if (gate !== undefined && gate !== this.hooks.gateId()) return fail('stale', 'The gate id no longer matches; read the status file again');
+				if (gate !== undefined && gate !== this.hooks.gateId())
+					return fail('stale', 'The gate id no longer matches; read the status file again');
 				await this.hooks.decide(context, 'approve', undefined);
 			} else if (op === 'mode' || op === 'review') {
-        if (op === 'review' && args.repairBudgetOnly === true && (!mission || mission.mode === 'pause' || missionProblem(mission)?.source !== 'repair-budget'))
-          return fail('rejected', 'No confirmed repair-budget hold to authorize');
+				if (
+					op === 'review' &&
+					args.repairBudgetOnly === true &&
+					(!mission || mission.mode === 'pause' || missionProblem(mission)?.source !== 'repair-budget')
+				)
+					return fail('rejected', 'No confirmed repair-budget hold to authorize');
 				await this.hooks.decide(context, op, typeof args.mode === 'string' ? args.mode : undefined);
 			} else if (op === 'clear') {
 				await this.hooks.clear(context);
@@ -734,11 +1147,13 @@ export class HolotableBridge {
 				if (mission || !pending) return fail('rejected', 'No pending plan is awaiting approval');
 				if (typeof args.text !== 'string') return fail('bad-request', 'plan-edit requires args.text');
 				if (Buffer.byteLength(args.text, 'utf8') > MAX_PLAN) return fail('bad-request', 'Plan text exceeds 256 KiB');
-				if (args.base !== undefined && typeof args.base !== 'string') return fail('bad-request', 'args.base must be a string');
+				if (args.base !== undefined && typeof args.base !== 'string')
+					return fail('bad-request', 'args.base must be a string');
 				const editPath = this.hooks.planPath();
 				const current = editPath ? await readFile(editPath, 'utf8').catch(() => undefined) : undefined;
 				if (editPath === undefined || current === undefined) return fail('no-plan', 'No pending plan file');
-				if (args.base !== undefined && args.base !== planRevision(current)) return fail('stale', 'The plan changed since this revision; read it again');
+				if (args.base !== undefined && args.base !== planRevision(current))
+					return fail('stale', 'The plan changed since this revision; read it again');
 				const mode = (await lstat(editPath)).mode & 0o777;
 				const temporary = `${editPath}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
 				try {
@@ -750,17 +1165,24 @@ export class HolotableBridge {
 				}
 				this.hooks.touchPending();
 				await this.publish();
-				return { v: 1, ok: true, revision: this.hooks.source().pending?.updatedAt ?? '', plan: { text: args.text, path: editPath, revision: planRevision(args.text) } };
+				return {
+					v: 1,
+					ok: true,
+					revision: this.hooks.source().pending?.updatedAt ?? '',
+					plan: { text: args.text, path: editPath, revision: planRevision(args.text) },
+				};
 			} else if (op === 'plan-approve') {
 				if (mission || !pending) return fail('rejected', 'No pending plan is awaiting approval');
-				if (args.revision !== undefined && typeof args.revision !== 'string') return fail('bad-request', 'args.revision must be a string');
+				if (args.revision !== undefined && typeof args.revision !== 'string')
+					return fail('bad-request', 'args.revision must be a string');
 				const review = this.hooks.planReview();
 				if (!review?.canApprove) return fail('rejected', 'No plan review with compact approval is available');
 				if (args.revision !== undefined) {
 					const planPath = this.hooks.planPath();
 					const current = planPath ? await readFile(planPath, 'utf8').catch(() => undefined) : undefined;
 					if (planPath === undefined || current === undefined) return fail('no-plan', 'No pending plan file');
-					if (args.revision !== planRevision(current)) return fail('stale', 'The plan changed since this revision; read it again');
+					if (args.revision !== planRevision(current))
+						return fail('stale', 'The plan changed since this revision; read it again');
 				}
 				// 'compact' approves and keeps the session, so the mission:pending entry survives and the mission starts on the
 				// before_agent_start 'Plan approved.' path. 'execute' would clear the session and lose the pending mission — never use it here.
@@ -768,15 +1190,18 @@ export class HolotableBridge {
 				return { v: 1, ok: true, revision: this.hooks.source().pending?.updatedAt ?? '' };
 			} else if (op === 'plan-refine') {
 				if (mission || !pending) return fail('rejected', 'No pending plan is awaiting approval');
-				if (typeof args.message !== 'string' || args.message.length < 1 || args.message.length > 8000) return fail('bad-request', 'plan-refine requires args.message of 1..8000 characters');
+				if (typeof args.message !== 'string' || args.message.length < 1 || args.message.length > 8000)
+					return fail('bad-request', 'plan-refine requires args.message of 1..8000 characters');
 				const review = this.hooks.planReview();
 				if (review) {
-					if (!review.resolve('refine', { feedback: args.message })) return fail('rejected', 'The plan review closed before it could be refined');
+					if (!review.resolve('refine', { feedback: args.message }))
+						return fail('rejected', 'The plan review closed before it could be refined');
 				} else this.hooks.sendUserMessage(args.message);
 			} else {
 				const extra: Record<string, unknown> = {};
 				if (op === 'retry-model') {
-					if (typeof args.model !== 'string' || !args.model.trim() || args.model.length > 1000) return fail('bad-request', 'retry-model requires a concrete args.model');
+					if (typeof args.model !== 'string' || !args.model.trim() || args.model.length > 1000)
+						return fail('bad-request', 'retry-model requires a concrete args.model');
 					extra.model = args.model;
 				}
 				if (typeof args.beadId === 'string') extra.beadId = args.beadId;

@@ -55,7 +55,11 @@ export function relInCheckout(target: string, boundary: string, base = boundary)
 	if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(path)) {
 		// A URI is not evidence of being outside the checkout: file:// can point right into it.
 		if (!path.startsWith('file://')) return undefined;
-		try { path = fileURLToPath(path); } catch { return undefined; }
+		try {
+			path = fileURLToPath(path);
+		} catch {
+			return undefined;
+		}
 	}
 	path = path.replace(/\\/g, '/');
 	const rel = normalizeRel(relative(boundary, isAbsolute(path) ? path : join(base, path)));
@@ -90,7 +94,10 @@ function writeVerdict(target: string, guard: GuardScope): GuardVerdict {
 	if (inScope(rel, guard.scopes)) return deny(`${rel} is inside a bound implementation scope`, rel);
 	if (metadataPath(rel, guard)) return deny('writes inside .git or the bead database are not allowed', rel);
 	if (rel === '.artifacts' || rel.startsWith('.artifacts/')) return ALLOW;
-	return deny(`coordinator may not create or edit repo files (${rel}); workers own implementation paths, and planning output goes to .artifacts/ or external files`, rel);
+	return deny(
+		`coordinator may not create or edit repo files (${rel}); workers own implementation paths, and planning output goes to .artifacts/ or external files`,
+		rel,
+	);
 }
 
 /** Paths a write-like call will touch: explicit path fields, plus [PATH#TAG] headers inside edit patches. */
@@ -110,7 +117,8 @@ function targetPaths(input: Record<string, unknown>): string[] {
 
 /** tool_call hook entry point: inspects edit/write targets and bash commands; other tools pass. */
 export function checkToolCall(toolName: string, input: unknown, guard: GuardScope): GuardVerdict {
-	if(!isRecord(input))return toolName==='edit'||toolName==='write'?deny('Cannot inspect write targets'):ALLOW;
+	if (!isRecord(input))
+		return toolName === 'edit' || toolName === 'write' ? deny('Cannot inspect write targets') : ALLOW;
 	if (toolName === 'bash') {
 		return typeof input.command === 'string' ? checkCommand(input.command) : ALLOW;
 	}
@@ -126,33 +134,91 @@ export function checkToolCall(toolName: string, input: unknown, guard: GuardScop
 // bash: bounded shell scan, fail-closed on git mutations
 // ---------------------------------------------------------------------------
 
-interface Word { kind: 'word'; text: string; target?: boolean }
-interface Sep { kind: 'sep'; text: string }
+interface Word {
+	kind: 'word';
+	text: string;
+	target?: boolean;
+}
+interface Sep {
+	kind: 'sep';
+	text: string;
+}
 type Token = Word | Sep;
 
-const KEYWORDS: Record<string, true> = { if: true, then: true, elif: true, else: true, fi: true, while: true, until: true, for: true, in: true, do: true, done: true, case: true, esac: true, '{': true, '}': true, '!': true, time: true, select: true };
+const KEYWORDS: Record<string, true> = {
+	if: true,
+	then: true,
+	elif: true,
+	else: true,
+	fi: true,
+	while: true,
+	until: true,
+	for: true,
+	in: true,
+	do: true,
+	done: true,
+	case: true,
+	esac: true,
+	'{': true,
+	'}': true,
+	'!': true,
+	time: true,
+	select: true,
+};
 const ASSIGN = /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?=/;
-const WRAPPERS: Record<string, true> = { sudo: true, doas: true, timeout: true, nice: true, xargs: true, chroot: true, env: true, command: true, builtin: true, nohup: true, setsid: true, exec: true, stdbuf: true, ionice: true, taskset: true, watch: true };
+const WRAPPERS: Record<string, true> = {
+	sudo: true,
+	doas: true,
+	timeout: true,
+	nice: true,
+	xargs: true,
+	chroot: true,
+	env: true,
+	command: true,
+	builtin: true,
+	nohup: true,
+	setsid: true,
+	exec: true,
+	stdbuf: true,
+	ionice: true,
+	taskset: true,
+	watch: true,
+};
 /** Wrappers whose first plain argument is still theirs (a duration or root dir), not the wrapped command. */
 const WRAPPER_EXTRA: Record<string, true> = { timeout: true, chroot: true };
 /** Wrapper flags that consume the following word, so the word after is not mistaken for the command. */
 const WRAPPER_VALUE_FLAGS: Record<string, readonly string[]> = {
-	sudo: ['-u', '-g', '-h', '-p', '-C', '-T', '-D', '-R', '-U'], doas: ['-u'],
-	timeout: ['-s', '-k', '--signal', '--kill-after'], nice: ['-n', '--adjustment'],
+	sudo: ['-u', '-g', '-h', '-p', '-C', '-T', '-D', '-R', '-U'],
+	doas: ['-u'],
+	timeout: ['-s', '-k', '--signal', '--kill-after'],
+	nice: ['-n', '--adjustment'],
 	xargs: ['-I', '-n', '-P', '-d', '-a', '-E', '-e', '-L', '-l', '-s', '-o'],
 	env: ['-u', '-C', '--unset', '--chdir', '-S', '--split-string'],
 };
 const SHELLS: Record<string, true> = { bash: true, sh: true, zsh: true, dash: true, ksh: true, fish: true };
-const GIT_VALUE_OPTS: Record<string, true> = { '-C': true, '-c': true, '--git-dir': true, '--work-tree': true, '--namespace': true, '--exec-path': true };
+const GIT_VALUE_OPTS: Record<string, true> = {
+	'-C': true,
+	'-c': true,
+	'--git-dir': true,
+	'--work-tree': true,
+	'--namespace': true,
+	'--exec-path': true,
+};
 
-interface Lexed { tokens: Token[]; nested: string[] }
+interface Lexed {
+	tokens: Token[];
+	nested: string[];
+}
 
 /** Reads a balanced `$(` … `)` region; returns its inner text and end index, or undefined when unclosed. */
 function commandSub(text: string, start: number): { inner: string; end: number } | undefined {
 	let depth = 1;
 	for (let i = start + 2; i < text.length; i++) {
 		const c = text[i]!;
-		if (c === '\\') { i++; continue; }
+		if (c === '\\') {
+			i++;
+			continue;
+		}
 		if (c === "'" || c === '"') {
 			const end = text.indexOf(c, i + 1);
 			if (end === -1) return undefined;
@@ -182,7 +248,10 @@ function collectExpansions(text: string, nested: string[]): void {
 	}
 }
 
-interface Heredoc { delim: string; quoted: boolean }
+interface Heredoc {
+	delim: string;
+	quoted: boolean;
+}
 
 /**
  * Minimal shell lexer: words vs separators, quotes stripped, redirect targets tagged, heredoc bodies
@@ -224,21 +293,48 @@ function lex(command: string): Lexed {
 
 	while (i < n) {
 		const c = command[i]!;
-		if (blank.test(c)) { flush(); i++; continue; }
-		if (c === '\n') { flush(); tokens.push({ kind: 'sep', text: '\n' }); i++; skipHeredocBodies(); continue; }
-		if (c === '#') { const end = command.indexOf('\n', i); i = end === -1 ? n : end; continue; }
+		if (blank.test(c)) {
+			flush();
+			i++;
+			continue;
+		}
+		if (c === '\n') {
+			flush();
+			tokens.push({ kind: 'sep', text: '\n' });
+			i++;
+			skipHeredocBodies();
+			continue;
+		}
+		if (c === '#') {
+			const end = command.indexOf('\n', i);
+			i = end === -1 ? n : end;
+			continue;
+		}
 		if (c === "'") {
 			const end = command.indexOf("'", i + 1);
-			if (end === -1) { buf += command.slice(i + 1); i = n; } else { buf += command.slice(i + 1, end); i = end + 1; }
+			if (end === -1) {
+				buf += command.slice(i + 1);
+				i = n;
+			} else {
+				buf += command.slice(i + 1, end);
+				i = end + 1;
+			}
 			continue;
 		}
 		if (c === '"') {
 			i++;
 			while (i < n && command[i] !== '"') {
-				if (command[i] === '\\' && i + 1 < n) { buf += command[i + 1]!; i += 2; continue; }
+				if (command[i] === '\\' && i + 1 < n) {
+					buf += command[i + 1]!;
+					i += 2;
+					continue;
+				}
 				if (command[i] === '`' || (command[i] === '$' && command[i + 1] === '(')) {
 					const end = command[i] === '`' ? command.indexOf('`', i + 1) : commandSub(command, i)?.end;
-					if (end === undefined || end === -1) { i = n; break; }
+					if (end === undefined || end === -1) {
+						i = n;
+						break;
+					}
 					nested.push(command.slice(command[i] === '`' ? i + 1 : i + 2, end));
 					buf += ' ';
 					i = end + 1;
@@ -251,14 +347,20 @@ function lex(command: string): Lexed {
 			continue;
 		}
 		if (c === '\\') {
-			if (command[i + 1] === '\n') { i += 2; continue; }
+			if (command[i + 1] === '\n') {
+				i += 2;
+				continue;
+			}
 			if (i + 1 < n) buf += command[i + 1]!;
 			i += 2;
 			continue;
 		}
 		if (c === '`' || (c === '$' && command[i + 1] === '(')) {
 			const end = c === '`' ? command.indexOf('`', i + 1) : commandSub(command, i)?.end;
-			if (end === undefined || end === -1) { buf += command.slice(i); break; }
+			if (end === undefined || end === -1) {
+				buf += command.slice(i);
+				break;
+			}
 			nested.push(command.slice(i + (c === '`' ? 1 : 2), end));
 			buf += ' ';
 			i = end + 1;
@@ -276,7 +378,8 @@ function lex(command: string): Lexed {
 			if (/^\d+$/.test(buf)) buf = '';
 			flush();
 			const three = command.slice(i, i + 3);
-			const len = three === '<<<' ? 3 : two === '<<' || two === '>>' || two === '>&' || two === '<&' || two === '>|' ? 2 : 1;
+			const len =
+				three === '<<<' ? 3 : two === '<<' || two === '>>' || two === '>&' || two === '<&' || two === '>|' ? 2 : 1;
 			if (two === '<<' && three !== '<<<') {
 				let j = i + 2;
 				if (command[j] === '-') j++;
@@ -287,7 +390,17 @@ function lex(command: string): Lexed {
 					const end = command.indexOf(command[j]!, j + 1);
 					delim = end === -1 ? '' : command.slice(j + 1, end);
 				} else {
-					while (j < n && !blank.test(command[j]!) && command[j] !== '\n' && command[j] !== ';' && command[j] !== '&' && command[j] !== '|') { delim += command[j]!; j++; }
+					while (
+						j < n &&
+						!blank.test(command[j]!) &&
+						command[j] !== '\n' &&
+						command[j] !== ';' &&
+						command[j] !== '&' &&
+						command[j] !== '|'
+					) {
+						delim += command[j]!;
+						j++;
+					}
 				}
 				if (delim) heredocs.push({ delim, quoted });
 			}
@@ -309,7 +422,9 @@ function wholeTree(pathspec: string): boolean {
 	// ':/src' is scoped (repo-rooted src); only bare ':/' or ':' means the whole tree.
 	if (pathspec === ':/' || pathspec === ':') return true;
 	const p = normalizeRel(pathspec);
-	return p === '.' || p === '' || p === '*' || p === '..' || p.startsWith('../') || p === ':(top)' || p.startsWith(':(top,');
+	return (
+		p === '.' || p === '' || p === '*' || p === '..' || p.startsWith('../') || p === ':(top)' || p.startsWith(':(top,')
+	);
 }
 
 /** Stops whole-tree staging/commit, checkout-rewriting git and branch-history rewrites; returns the violation or undefined. */
@@ -317,8 +432,14 @@ function gitVerdict(argv: readonly string[]): string | undefined {
 	let i = 0;
 	while (i < argv.length) {
 		const arg = argv[i]!;
-		if (GIT_VALUE_OPTS[arg] === true) { i += 2; continue; }
-		if (arg.startsWith('-')) { i++; continue; }
+		if (GIT_VALUE_OPTS[arg] === true) {
+			i += 2;
+			continue;
+		}
+		if (arg.startsWith('-')) {
+			i++;
+			continue;
+		}
 		break;
 	}
 	const sub = argv[i];
@@ -326,19 +447,36 @@ function gitVerdict(argv: readonly string[]): string | undefined {
 	const rest = argv.slice(i + 1);
 
 	if (sub === 'add' || sub === 'stage') {
-		let blanket = false, dry = false;
+		let blanket = false,
+			dry = false;
 		const paths: string[] = [];
 		let after = false;
 		for (const arg of rest) {
-			if (after) { paths.push(arg); continue; }
-			if (arg === '--') { after = true; continue; }
-			if (arg.startsWith('--')) { if (arg === '--all' || arg === '--update') blanket = true; else if (arg === '--dry-run') dry = true; continue; }
-			if (arg.startsWith('-') && arg.length > 1) { if (arg.includes('A') || arg.includes('u')) blanket = true; if (arg.includes('n')) dry = true; continue; }
+			if (after) {
+				paths.push(arg);
+				continue;
+			}
+			if (arg === '--') {
+				after = true;
+				continue;
+			}
+			if (arg.startsWith('--')) {
+				if (arg === '--all' || arg === '--update') blanket = true;
+				else if (arg === '--dry-run') dry = true;
+				continue;
+			}
+			if (arg.startsWith('-') && arg.length > 1) {
+				if (arg.includes('A') || arg.includes('u')) blanket = true;
+				if (arg.includes('n')) dry = true;
+				continue;
+			}
 			paths.push(arg);
 		}
 		if (dry) return undefined;
-		if (paths.some(wholeTree)) return 'git add stages the whole checkout; workers stage their own paths, so stage explicit paths only';
-		if (blanket && !paths.length) return `git ${sub} -A/--all/-u stages every change including other workers'; stage explicit paths`;
+		if (paths.some(wholeTree))
+			return 'git add stages the whole checkout; workers stage their own paths, so stage explicit paths only';
+		if (blanket && !paths.length)
+			return `git ${sub} -A/--all/-u stages every change including other workers'; stage explicit paths`;
 		return undefined;
 	}
 	if (sub === 'commit') {
@@ -346,11 +484,23 @@ function gitVerdict(argv: readonly string[]): string | undefined {
 		const paths: string[] = [];
 		let after = false;
 		for (const arg of rest) {
-			if (after) { paths.push(arg); continue; }
-			if (arg === '--') { after = true; continue; }
-			if (arg === '--all') { all = true; continue; }
+			if (after) {
+				paths.push(arg);
+				continue;
+			}
+			if (arg === '--') {
+				after = true;
+				continue;
+			}
+			if (arg === '--all') {
+				all = true;
+				continue;
+			}
 			if (arg.startsWith('--')) continue;
-			if (arg.startsWith('-') && arg.length > 1) { if (arg.includes('a')) all = true; continue; }
+			if (arg.startsWith('-') && arg.length > 1) {
+				if (arg.includes('a')) all = true;
+				continue;
+			}
 			paths.push(arg);
 		}
 		if (paths.some(wholeTree)) return 'git commit with a whole-tree pathspec bypasses scoped staging';
@@ -360,30 +510,66 @@ function gitVerdict(argv: readonly string[]): string | undefined {
 	if (sub === 'checkout' || sub === 'switch' || sub === 'restore')
 		return `git ${sub} rewrites checkout files mid-mission; the coordinator stays on the bound branch`;
 	if (sub === 'clean')
-		return rest.some(arg => arg === '--dry-run' || (arg.startsWith('-') && !arg.startsWith('--') && arg.includes('n'))) ? undefined : 'git clean deletes untracked files that belong to workers';
+		return rest.some(arg => arg === '--dry-run' || (arg.startsWith('-') && !arg.startsWith('--') && arg.includes('n')))
+			? undefined
+			: 'git clean deletes untracked files that belong to workers';
 	if (sub === 'reset') {
-		if (rest.includes('--soft')) return 'git reset --soft moves the branch under the mission; integrate the base with mission_control merge_base';
-		return rest.some(arg => arg === '--hard' || arg === '--merge' || arg === '--keep') ? `git reset ${rest.find(arg => arg.startsWith('--'))} discards checkout changes` : undefined;
+		if (rest.includes('--soft'))
+			return 'git reset --soft moves the branch under the mission; integrate the base with mission_control merge_base';
+		return rest.some(arg => arg === '--hard' || arg === '--merge' || arg === '--keep')
+			? `git reset ${rest.find(arg => arg.startsWith('--'))} discards checkout changes`
+			: undefined;
 	}
 	if (sub === 'stash') {
 		const action = rest.find(arg => !arg.startsWith('-')) ?? 'push';
-		return ['list', 'show', 'create', 'store'].includes(action) ? undefined : `git stash ${action} moves checkout files; leave the workers' tree alone`;
+		return ['list', 'show', 'create', 'store'].includes(action)
+			? undefined
+			: `git stash ${action} moves checkout files; leave the workers' tree alone`;
 	}
 	if (sub === 'merge' || sub === 'rebase' || sub === 'pull')
 		return `git ${sub} mutates the mission checkout; integrate the base with mission_control merge_base`;
-	if (sub === 'cherry-pick' || sub === 'revert' || sub === 'am' || sub === 'apply' || sub === 'rm' || sub === 'mv' || sub === 'worktree' || sub === 'bisect')
+	if (
+		sub === 'cherry-pick' ||
+		sub === 'revert' ||
+		sub === 'am' ||
+		sub === 'apply' ||
+		sub === 'rm' ||
+		sub === 'mv' ||
+		sub === 'worktree' ||
+		sub === 'bisect'
+	)
 		return `git ${sub} mutates the mission checkout; use mission_control and scoped staging`;
 	// A tree rebuilt with plumbing onto a newer base silently reverts every base change since: never allowed.
-	if (sub === 'commit-tree' || sub === 'update-ref' || sub === 'replace' || sub === 'filter-branch' || sub === 'filter-repo')
+	if (
+		sub === 'commit-tree' ||
+		sub === 'update-ref' ||
+		sub === 'replace' ||
+		sub === 'filter-branch' ||
+		sub === 'filter-repo'
+	)
 		return `git ${sub} rewrites branch history behind the mission; integrate the base with mission_control merge_base`;
 	if (sub === 'read-tree')
-		return rest.some(arg => arg === '-n' || arg === '--dry-run') ? undefined : 'git read-tree replaces the index behind the mission; integrate the base with mission_control merge_base';
+		return rest.some(arg => arg === '-n' || arg === '--dry-run')
+			? undefined
+			: 'git read-tree replaces the index behind the mission; integrate the base with mission_control merge_base';
 	if (sub === 'symbolic-ref' && rest.filter(arg => !arg.startsWith('-')).length > 1)
 		return 'git symbolic-ref repoints the mission branch';
-	if (sub === 'push' && rest.some(arg => arg === '--force' || arg.startsWith('--force-with-lease') || arg === '--force-if-includes' || arg.startsWith('+') || (/^-[A-Za-z]+$/.test(arg) && arg.includes('f'))))
+	if (
+		sub === 'push' &&
+		rest.some(
+			arg =>
+				arg === '--force' ||
+				arg.startsWith('--force-with-lease') ||
+				arg === '--force-if-includes' ||
+				arg.startsWith('+') ||
+				(/^-[A-Za-z]+$/.test(arg) && arg.includes('f')),
+		)
+	)
 		return 'git push --force rewrites the delivered branch; push new commits only';
 	if (sub === 'submodule')
-		return rest.find(arg => !arg.startsWith('-')) === 'update' ? 'git submodule update rewrites checkout files' : undefined;
+		return rest.find(arg => !arg.startsWith('-')) === 'update'
+			? 'git submodule update rewrites checkout files'
+			: undefined;
 	return undefined;
 }
 
@@ -392,14 +578,20 @@ function stripPrefix(argv: readonly string[]): readonly string[] {
 	let args = argv;
 	for (let guard = 0; guard < 6 && args.length; guard++) {
 		const [first, ...rest] = args;
-		if (ASSIGN.test(first!) && !first!.startsWith('-')) { args = rest; continue; }
+		if (ASSIGN.test(first!) && !first!.startsWith('-')) {
+			args = rest;
+			continue;
+		}
 		const cmd = basename(first!);
 		if (WRAPPERS[cmd] !== true) break;
 		const valueFlags = WRAPPER_VALUE_FLAGS[cmd] ?? [];
 		let dropped = rest;
 		while (dropped.length) {
 			const t = dropped[0]!;
-			if (cmd === 'env' && ASSIGN.test(t) && !t.startsWith('-')) { dropped = dropped.slice(1); continue; }
+			if (cmd === 'env' && ASSIGN.test(t) && !t.startsWith('-')) {
+				dropped = dropped.slice(1);
+				continue;
+			}
 			if (!t.startsWith('-')) break;
 			dropped = dropped.slice(valueFlags.includes(t) ? 2 : 1);
 		}
@@ -425,8 +617,10 @@ function argvVerdict(argv: readonly string[], depth: number): string | undefined
 		return undefined;
 	}
 	if (name === 'git') return gitVerdict(stripped.slice(1));
-	if (name === 'rustfmt' || name === 'cargo-fmt') return 'rustfmt writes implementation files; run cargo fmt --all -- --check, and assign format fixes to a scoped worker';
-	if ((name === 'cargo' || name === 'cargo-auto') && stripped[1] === 'fmt' && !stripped.includes('--check')) return 'cargo fmt writes implementation files; run cargo fmt --all -- --check, and assign format fixes to a scoped worker';
+	if (name === 'rustfmt' || name === 'cargo-fmt')
+		return 'rustfmt writes implementation files; run cargo fmt --all -- --check, and assign format fixes to a scoped worker';
+	if ((name === 'cargo' || name === 'cargo-auto') && stripped[1] === 'fmt' && !stripped.includes('--check'))
+		return 'cargo fmt writes implementation files; run cargo fmt --all -- --check, and assign format fixes to a scoped worker';
 	return undefined;
 }
 
@@ -479,40 +673,59 @@ function fingerprint(abs: string): string {
 		const st = lstatSync(abs);
 		const mode = (st.mode & 0o777).toString(8);
 		if (st.isDirectory()) return `dir:${mode}`;
-		const hash = createHash('sha1').update(st.isSymbolicLink() ? readlinkSync(abs) : readFileSync(abs)).digest('hex');
+		const hash = createHash('sha1')
+			.update(st.isSymbolicLink() ? readlinkSync(abs) : readFileSync(abs))
+			.digest('hex');
 		return `${st.isSymbolicLink() ? 'link' : 'file'}:${mode}:${hash}`;
-	} catch(error) {
-		if(isRecord(error)&&error.code==='ENOENT')return 'absent';
+	} catch (error) {
+		if (isRecord(error) && error.code === 'ENOENT') return 'absent';
 		throw error;
 	}
 }
 
 /** Git's non-ignored file set excludes verification output; explicit literal scopes remain watched. */
-export async function fingerprintScopes(run: Run, cwd: string, scopes: readonly string[], beadsDir?: string): Promise<Record<string, string>> {
-	const paths=new Set<string>();const globs:string[]=[];
-	const artifactsScoped=scopes.some(raw=>normalizeRel(raw).split('/')[0]==='.artifacts');
-	const beadsRel=beadsDir?relInCheckout(beadsDir,cwd):undefined;
-	const excluded=(rel:string)=>rel==='.git'||rel.startsWith('.git/')||
-		(!artifactsScoped&&(rel==='.artifacts'||rel.startsWith('.artifacts/')))||
-		(!!beadsRel&&(rel===beadsRel||rel.startsWith(`${beadsRel}/`)));
-	for(const raw of scopes){
-		const scope=normalizeRel(raw);if(!scope)continue;
-		if(scope==='.'||/[*?[]/.test(scope)){globs.push(scope==='.'?'**':scope);continue;}
-		let directory=false;
-		try{directory=lstatSync(join(cwd,scope)).isDirectory();}
-		catch(error){if(!isRecord(error)||error.code!=='ENOENT')throw error;}
-		if(directory)globs.push(`${scope}/**`);
-		else if(!excluded(scope))paths.add(scope);
-	}
-	const listed=await run('git',['ls-files','-c','-o','--exclude-standard','-z'],cwd);
-	if(listed.code===0){
-		for(const file of listed.stdout.split('\0'))if(file&&!excluded(file)&&inScope(file,scopes))paths.add(file);
-	}else if(/not a git repository/i.test(listed.stderr)){
-		for(const pattern of globs)for(const file of new Bun.Glob(pattern).scanSync({cwd,onlyFiles:true,dot:true})){
-			const rel=normalizeRel(file);if(!excluded(rel))paths.add(rel);
+export async function fingerprintScopes(
+	run: Run,
+	cwd: string,
+	scopes: readonly string[],
+	beadsDir?: string,
+): Promise<Record<string, string>> {
+	const paths = new Set<string>();
+	const globs: string[] = [];
+	const artifactsScoped = scopes.some(raw => normalizeRel(raw).split('/')[0] === '.artifacts');
+	const beadsRel = beadsDir ? relInCheckout(beadsDir, cwd) : undefined;
+	const excluded = (rel: string) =>
+		rel === '.git' ||
+		rel.startsWith('.git/') ||
+		(!artifactsScoped && (rel === '.artifacts' || rel.startsWith('.artifacts/'))) ||
+		(!!beadsRel && (rel === beadsRel || rel.startsWith(`${beadsRel}/`)));
+	for (const raw of scopes) {
+		const scope = normalizeRel(raw);
+		if (!scope) continue;
+		if (scope === '.' || /[*?[]/.test(scope)) {
+			globs.push(scope === '.' ? '**' : scope);
+			continue;
 		}
-	}else throw new Error(listed.stderr||'Cannot enumerate implementation files');
-	return Object.fromEntries([...paths].map(rel=>[rel,fingerprint(join(cwd,rel))]));
+		let directory = false;
+		try {
+			directory = lstatSync(join(cwd, scope)).isDirectory();
+		} catch (error) {
+			if (!isRecord(error) || error.code !== 'ENOENT') throw error;
+		}
+		if (directory) globs.push(`${scope}/**`);
+		else if (!excluded(scope)) paths.add(scope);
+	}
+	const listed = await run('git', ['ls-files', '-c', '-o', '--exclude-standard', '-z'], cwd);
+	if (listed.code === 0) {
+		for (const file of listed.stdout.split('\0')) if (file && !excluded(file) && inScope(file, scopes)) paths.add(file);
+	} else if (/not a git repository/i.test(listed.stderr)) {
+		for (const pattern of globs)
+			for (const file of new Bun.Glob(pattern).scanSync({ cwd, onlyFiles: true, dot: true })) {
+				const rel = normalizeRel(file);
+				if (!excluded(rel)) paths.add(rel);
+			}
+	} else throw new Error(listed.stderr || 'Cannot enumerate implementation files');
+	return Object.fromEntries([...paths].map(rel => [rel, fingerprint(join(cwd, rel))]));
 }
 
 /** Paths whose content/mode fingerprint changed, appeared, or vanished between two scans. */

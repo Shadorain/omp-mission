@@ -3,9 +3,18 @@ import type { ExtensionUIContext, ExtensionUIDialogOptions } from '@oh-my-pi/pi-
 
 // OMP 18.11.3 changed `ui.approve()` from a boolean to this answer (18.12 added grants); the pinned
 // devDependency still declares the boolean, so the newer shapes are spelled out here.
-interface ApprovalGrant { scope: 'folder' | 'target'; label: string; alwaysLabel: string }
+interface ApprovalGrant {
+	scope: 'folder' | 'target';
+	label: string;
+	alwaysLabel: string;
+}
 type ApprovalAnswer = 'once' | 'session' | 'deny' | { grant: ApprovalGrant['scope']; always: boolean };
-interface ApprovalPrompt { full: string; compact: string; session?: string; grants?: readonly ApprovalGrant[] }
+interface ApprovalPrompt {
+	full: string;
+	compact: string;
+	session?: string;
+	grants?: readonly ApprovalGrant[];
+}
 type Approve = (prompt: ApprovalPrompt, options?: ExtensionUIDialogOptions) => Promise<ApprovalAnswer>;
 
 /** The longest prompt published to the board; a write approval's full prompt carries the whole file. */
@@ -86,7 +95,13 @@ export function installApprovalBridge(ui: ExtensionUIContext, onChange: () => vo
 /** The prompt's choices as OMP's select fallback labels them: grants this session, grants always, approve once, the session answer, Deny. */
 function approvalOptions(prompt: ApprovalPrompt): string[] {
 	const grants = prompt.grants ?? [];
-	return [...grants.map(grant => grant.label), ...grants.map(grant => grant.alwaysLabel), onceLabel(prompt), ...(prompt.session ? [prompt.session] : []), 'Deny'];
+	return [
+		...grants.map(grant => grant.label),
+		...grants.map(grant => grant.alwaysLabel),
+		onceLabel(prompt),
+		...(prompt.session ? [prompt.session] : []),
+		'Deny',
+	];
 }
 
 function onceLabel(prompt: ApprovalPrompt): string {

@@ -1,4 +1,8 @@
-import type { ExtensionAskDialogQuestion, ExtensionAskDialogResult, ExtensionUIContext } from '@oh-my-pi/pi-coding-agent';
+import type {
+	ExtensionAskDialogQuestion,
+	ExtensionAskDialogResult,
+	ExtensionUIContext,
+} from '@oh-my-pi/pi-coding-agent';
 
 /** One answer from the board: an option index, several (multi-select), or free text ("Other"). */
 export type BoardAnswer = { option: number } | { options: number[] } | { text: string };
@@ -59,8 +63,12 @@ export function installAskBridge(ui: ExtensionUIContext, onChange: () => void): 
 }
 
 /** The dialog's submit result for these answers, or why they do not fit its questions. */
-export function buildResult(questions: readonly ExtensionAskDialogQuestion[], answers: readonly BoardAnswer[]): ExtensionAskDialogResult | string {
-	if (answers.length !== questions.length) return `Answer all ${questions.length} question${questions.length === 1 ? '' : 's'}`;
+export function buildResult(
+	questions: readonly ExtensionAskDialogQuestion[],
+	answers: readonly BoardAnswer[],
+): ExtensionAskDialogResult | string {
+	if (answers.length !== questions.length)
+		return `Answer all ${questions.length} question${questions.length === 1 ? '' : 's'}`;
 	const results = [];
 	for (const [index, question] of questions.entries()) {
 		const answer = answers[index]!;
@@ -74,7 +82,8 @@ export function buildResult(questions: readonly ExtensionAskDialogQuestion[], an
 		} else if ('options' in answer) {
 			if (!question.multi) return `Question ${index + 1} takes one option`;
 			const chosen = answer.options.map(pick);
-			if (!chosen.length || chosen.some(label => label === undefined)) return `Question ${index + 1} has no such options`;
+			if (!chosen.length || chosen.some(label => label === undefined))
+				return `Question ${index + 1} has no such options`;
 			results.push({ ...base, selectedOptions: [...new Set(chosen as string[])] });
 		} else {
 			const label = pick(answer.option);
@@ -93,7 +102,8 @@ export function parseBoardAnswers(raw: unknown): BoardAnswer[] | undefined {
 		if (typeof value !== 'object' || value === null) return undefined;
 		const v = value as Record<string, unknown>;
 		if (typeof v.text === 'string') out.push({ text: v.text });
-		else if (Array.isArray(v.options) && v.options.every(n => typeof n === 'number')) out.push({ options: v.options as number[] });
+		else if (Array.isArray(v.options) && v.options.every(n => typeof n === 'number'))
+			out.push({ options: v.options as number[] });
 		else if (typeof v.option === 'number') out.push({ option: v.option });
 		else return undefined;
 	}

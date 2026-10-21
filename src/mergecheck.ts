@@ -6,7 +6,8 @@ async function baseRef(m: Mission, run: Run): Promise<string | undefined> {
 	const base = m.workspace.base;
 	if (!base) return undefined;
 	for (const candidate of [`origin/${base}`, base]) {
-		if ((await run('git', ['rev-parse', '--verify', '--quiet', `${candidate}^{commit}`], m.workspace.cwd)).code === 0) return candidate;
+		if ((await run('git', ['rev-parse', '--verify', '--quiet', `${candidate}^{commit}`], m.workspace.cwd)).code === 0)
+			return candidate;
 	}
 	return undefined;
 }
@@ -25,7 +26,11 @@ export async function foreignPaths(m: Mission, run: Run): Promise<string[] | nul
 	if (!ref) return null;
 	const fork = await run('git', ['merge-base', 'HEAD', ref], m.workspace.cwd);
 	if (fork.code || !fork.stdout.trim()) return null;
-	const diff = await run('git', ['diff', '--name-only', '-z', '--no-renames', fork.stdout.trim(), 'HEAD'], m.workspace.cwd);
+	const diff = await run(
+		'git',
+		['diff', '--name-only', '-z', '--no-renames', fork.stdout.trim(), 'HEAD'],
+		m.workspace.cwd,
+	);
 	if (diff.code) return null;
 	return diff.stdout.split('\0').filter(path => path && !inScope(path, scopes));
 }
@@ -41,16 +46,29 @@ export function foreignDetail(m: Mission, paths: readonly string[]): string {
  * `git merge`, so this is the only sanctioned way to integrate a base that moved on. A conflicted merge
  * is left in progress with markers in place for a scoped repair leaf to resolve.
  */
-export async function mergeBaseInto(m: Mission, run: Run): Promise<{ ref: string; merged: boolean; conflicts: string[] }> {
+export async function mergeBaseInto(
+	m: Mission,
+	run: Run,
+): Promise<{ ref: string; merged: boolean; conflicts: string[] }> {
 	if (m.workspace.base) await run('git', ['fetch', '--quiet', 'origin', m.workspace.base], m.workspace.cwd);
 	const ref = await baseRef(m, run);
 	if (!ref) throw new Error('Bound base branch unresolved; bind the workspace base first');
 	const before = (await run('git', ['rev-parse', 'HEAD'], m.workspace.cwd)).stdout.trim();
-	const merged = await run('git', ['merge', '--no-ff', '--no-edit', '-m', `Merge ${ref} into the mission branch`, ref], m.workspace.cwd);
-	if (merged.code === 0) return { ref, merged: (await run('git', ['rev-parse', 'HEAD'], m.workspace.cwd)).stdout.trim() !== before, conflicts: [] };
+	const merged = await run(
+		'git',
+		['merge', '--no-ff', '--no-edit', '-m', `Merge ${ref} into the mission branch`, ref],
+		m.workspace.cwd,
+	);
+	if (merged.code === 0)
+		return {
+			ref,
+			merged: (await run('git', ['rev-parse', 'HEAD'], m.workspace.cwd)).stdout.trim() !== before,
+			conflicts: [],
+		};
 	const unmerged = await run('git', ['diff', '--name-only', '-z', '--diff-filter=U'], m.workspace.cwd);
 	const conflicts = unmerged.stdout.split('\0').filter(Boolean);
-	if (!conflicts.length) throw new Error(`git merge ${ref} refused: ${(merged.stderr || merged.stdout).trim().slice(0, 500)}`);
+	if (!conflicts.length)
+		throw new Error(`git merge ${ref} refused: ${(merged.stderr || merged.stdout).trim().slice(0, 500)}`);
 	return { ref, merged: false, conflicts };
 }
 
