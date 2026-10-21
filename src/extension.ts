@@ -109,7 +109,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
  async function settleSubagent(beadId:string,outcome:{ok:true;summary:string}|{ok:false;error:string}){const m=mission;if(!m)return;const w=m.workers.findLast(x=>x.beadId===beadId&&x.state!=='closed');if(!w)return;if(outcome.ok){w.state='closed';w.error=undefined;}else w.error=outcome.error;try{if(ownership&&!resumeHold)await persist(m);}catch{/* ownership lost: the next resume reconciles from bd */}if(!outcome.ok&&ctx)ctx.ui.notify(`Worker ${beadId}: ${outcome.error}`,'warning');await refresh(true);}
  const workerAgents=new SubagentRunner({run,agentDir,config:()=>config,context:()=>ctx,onSettled:(beadId,outcome)=>{void settleSubagent(beadId,outcome);}});
  const driver=createWorkerDriver(run,{subagent:workerAgents,canMutate:()=>!!ctx&&!!ownership&&!resumeHold&&!ownershipError&&!nativePlan(ctx)&&!!mission&&!reviewTriageAction(mission),persist:async value=>{if(value!==mission)throw new Error('Session changed during worker operation');if(ownership&&!resumeHold)await persist(value);},prompt:(mission,worker,task)=>config.frontend==='subagent'?subagentPrompt(mission,worker,task):workerPrompt(mission,worker,config.frontend,task),agentDir,model:()=>roleModelString(config.workerRole),frontend:()=>config.frontend,customCommand:()=>config.customCommand});
- function policy(context:ExtensionContext){return {resumeHold,owned:!!ownership&&!ownershipError,nativePlan:nativePlan(context),fresh:!!snapshot&&!snapshot.error&&Date.now()-snapshot.fetchedAt<35000,maxWorkers:config.maxWorkers};}
+ function policy(context?:ExtensionContext){return {resumeHold,owned:!!ownership&&!ownershipError,nativePlan:!!context&&nativePlan(context),fresh:!!context&&!!snapshot&&!snapshot.error&&Date.now()-snapshot.fetchedAt<35000,maxWorkers:config.maxWorkers};}
  // A hint is attached once per distinct text. The action detail is always sent, so recovery does not depend on it.
  let guided='';
  function measurements(m:Mission,since=new Date().toISOString()){
@@ -124,7 +124,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
   source:()=>({mission,pending}),
   resumeHold:()=>resumeHold,
   snapshot:()=>snapshot,
-  policy:()=>ctx?policy(ctx):{resumeHold,owned:!!ownership&&!ownershipError,nativePlan:false,fresh:false,maxWorkers:config.maxWorkers},
+  policy:()=>policy(ctx),
   step:()=>ctx?currentStep(ctx):undefined,
   owned:()=>!!ownership&&!ownershipError,
   selected:()=>selected,

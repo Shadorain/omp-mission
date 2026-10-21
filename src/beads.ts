@@ -1,3 +1,4 @@
+import { isRecord } from './guards.ts';
 import type { AuditEvent, Bead, Run, Snapshot } from './types.ts';
 
 export interface BeadReader {
@@ -32,7 +33,7 @@ async function invoke(run: Run, cwd: string, args: string[], env?: Record<string
   catch { throw new Error(`bd ${args.slice(1).join(' ')} returned invalid JSON`); }
 }
 
-function rows(value: unknown, label: string): Record<string, unknown>[] {
+function rows(value: unknown, label: string, truncated?: string): Record<string, unknown>[] {
   if (Array.isArray(value)) {
     if (!value.every(isRecord)) throw new Error(`${label} contains an invalid row`);
     return value as Record<string, unknown>[];
@@ -42,6 +43,7 @@ function rows(value: unknown, label: string): Record<string, unknown>[] {
     if (Array.isArray(value[key])) {
       const entries = value[key] as unknown[];
       if (!entries.every(isRecord)) throw new Error(`${label} contains an invalid row`);
+      if (truncated && value.truncated === true) throw new Error(truncated);
       return entries as Record<string, unknown>[];
     }
   }
@@ -49,9 +51,6 @@ function rows(value: unknown, label: string): Record<string, unknown>[] {
   throw new Error(`${label} response has no row list`);
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 function text(row: Record<string, unknown>, ...keys: string[]): string | undefined {
   for (const key of keys) {
     const v = row[key];
@@ -79,8 +78,7 @@ export async function readGraph(run: Run, cwd: string, epicId: string, env?: Rec
       if (visited.has(parentId)) return;
       visited.add(parentId); active.add(parentId);
       const response = await invoke(run, cwd, ['--readonly', 'list', '--parent', parentId, '--all', '--limit', '0', '--json'], env);
-      const children = rows(response, `bd list --parent ${parentId}`);
-      if (isRecord(response) && response.truncated === true) throw new Error(`bead graph truncated below ${parentId}`);
+      const children = rows(response, `bd list --parent ${parentId}`, `bead graph truncated below ${parentId}`);
       for (const child of children) {
         const id = idOf(child);
         if (!id) throw new Error(`bead graph row below ${parentId} has no ID`);
@@ -99,8 +97,7 @@ export async function readGraph(run: Run, cwd: string, epicId: string, env?: Rec
     };
     await walk(epicId);
     const readyResponse = await invoke(run, cwd, ['--readonly', 'ready', '--parent', epicId, '--limit', '0', '--json'], env);
-    const readyRows = rows(readyResponse, 'bd ready');
-    if (isRecord(readyResponse) && readyResponse.truncated === true) throw new Error('ready bead response is truncated');
+    const readyRows = rows(readyResponse, 'bd ready', 'ready bead response is truncated');
     const readyIds = new Set(readyRows.map(idOf).filter((id): id is string => !!id));
     const beads: Bead[] = [];
     const descendants = new Map<string, string[]>();
@@ -147,8 +144,7 @@ export async function readGraph(run: Run, cwd: string, epicId: string, env?: Rec
 
 export async function readHistory(run: Run, cwd: string, beadId: string, env?: Record<string, string>): Promise<AuditEvent[]> {
   const response = await invoke(run, cwd, ['--readonly', 'history', beadId, '--events', '--limit', '20', '--json'], env);
-  const events = rows(response, `bd history ${beadId}`);
-  if (isRecord(response) && response.truncated === true) throw new Error(`history for ${beadId} is truncated`);
+  const events = rows(response, `bd history ${beadId}`, `history for ${beadId} is truncated`);
   return events.map(event => {
     const action = text(event, 'event_type', 'event', 'action', 'type') ?? '';
     const explicit = text(event, 'summary', 'description', 'message');
