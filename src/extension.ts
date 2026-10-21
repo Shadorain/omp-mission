@@ -28,6 +28,7 @@ import { noteSubagentSpawn, noteSubagentToolEnd, noteSubagentToolStart, noteSuba
 import { checkToolCall, fingerprintScopes, implementationScopes, isImplementationPath, mutatedPaths, type GuardScope } from './coordinator-guard';
 import { askQuestions, autostartMessage, envBase, envCheckout, envDelivery, envGraph, gateTokenId, HolotableBridge, planRevision, type AskQuestion, type CoordinatorActivity } from './holotable';
 import { installAskBridge, type AskBridge } from './ask-bridge';
+import { approvalAnswersSupported, installApprovalBridge, type ApprovalBridge } from './approval-bridge';
 import { foreignDetail, foreignPaths, mergeBaseInto, mergeConflictPaths } from './mergecheck';
 
 const controls = ['show','clear','continue','mode','approve','review','check','history','focus','resend','release','dispatch','reap','actions','config'];
@@ -53,8 +54,9 @@ export default async function missionExtension(pi: ExtensionAPI) {
  const noteCoordinator=(state:CoordinatorActivity['state'])=>{if(coordinator?.state!==state)coordinator={state,since:new Date().toISOString()};};
  let planReview:PlanReviewRequestedEvent|undefined;
  const pendingQuestions=new Map<string,{text:string;questions:AskQuestion[]}>();
- const question=()=>[...pendingQuestions.values()].map(q=>q.text).join(' · ')||undefined;
- let askBridge:AskBridge|undefined;
+ let askBridge:AskBridge|undefined;let approvalBridge:ApprovalBridge|undefined;
+ // An open tool approval blocks the pane like a question: a steering message would deny it, so other ops wait too.
+ const question=()=>{const approval=approvalBridge?.open();return [...[...pendingQuestions.values()].map(q=>q.text),...(approval?[approval.summary]:[])].join(' · ')||undefined;};
  // The oldest open ask is the one on screen. It is published, with id and choices, only while its dialog is open and
  // matches it, so the board can settle it through the bridge instead of typing into the pane.
  const ask=()=>{
@@ -149,6 +151,8 @@ export default async function missionExtension(pi: ExtensionAPI) {
   question,
   ask,
   answerAsk:(answers)=>askBridge?askBridge.answer(answers):'This pane cannot be answered from outside',
+  approval:()=>approvalBridge?.open(),
+  permit:(id,choice)=>approvalBridge?approvalBridge.permit(id,choice):'This pane cannot be answered from outside',
   gateId:()=>mission?.gate?gateTokenId(mission.gate.token):undefined,
   decide:(context,verb,arg)=>decision(context,verb,arg),
   request:(context,op,extra)=>request(context,op,extra),
@@ -829,17 +833,18 @@ async function finishMission(context:ExtensionContext){
  void refreshCompletionSources();
  for(const [name,chord] of Object.entries(config.keys)){if(name==='expand'||!chord)continue;pi.registerShortcut(chord as KeyId,{description:`Mission ${name}`,handler:async context=>{if(!eligible(context)||!projection())return;try{if(name==='fullscreen')await inspect(context);else await decision(context,'mode');}catch(error){context.ui.notify(error instanceof Error?error.message:String(error),'error');}}});}
  pi.on('input',(event,context)=>{if(!eligible(context)||event.text.trim().split(/\s+/)[0]!=='/mission')return;const args=event.text.trim().slice('/mission'.length);const verb=args.trim().split(/\s+/)[0];if(controls.includes(verb??'')||mission)return;try{if(!parseMissionInput(args).force&&!nativePlan(context))return {text:`/plan ${event.text}`};}catch{ return; }});
- // The ask tool opens its dialog before tool_execution_start handlers run, so the bridge must already wrap the UI.
- const bridgeAsks=(context:ExtensionContext)=>{askBridge=installAskBridge(context.ui,()=>{void render();});};
+ // The ask tool opens its dialog before tool_execution_start handlers run, so the bridges must already wrap the UI.
+ // Older OMP takes a boolean from ui.approve(), so its approvals stay pane-only.
+ const bridgeDialogs=(context:ExtensionContext)=>{askBridge=installAskBridge(context.ui,()=>{void render();});if(approvalAnswersSupported(pi.pi?.VERSION))approvalBridge=installApprovalBridge(context.ui,()=>{void render();});};
  pi.on('session_start',async(_event,context)=>{
-  bridgeAsks(context);
+  bridgeDialogs(context);
   await restore(context);
   const autostart=autostartMessage();
   if(!autostart||mission||pending)return;
   let tries=0;
   const attempt=async()=>{if(mission||pending||ctx!==context)return;if(!nativePlan(context)&&++tries<50){context.setTimeout(()=>void attempt(),100);return;}await command(autostart,context);};
   await attempt();
- });pi.on('session_switch',async(_event,context)=>{bridgeAsks(context);await restore(context);});pi.on('session_branch',async(_event,context)=>restore(context));pi.on('session_shutdown',async()=>detach());
+ });pi.on('session_switch',async(_event,context)=>{bridgeDialogs(context);await restore(context);});pi.on('session_branch',async(_event,context)=>restore(context));pi.on('session_shutdown',async()=>detach());
  pi.on('auto_compaction_end',async(_event,context)=>{ctx=context;await render();});
  // Approving the plan is the approval to start. Start (and bind a checkout that already belongs to the ticket)
  // before the first execution turn, and hand the model its next step in the same turn.

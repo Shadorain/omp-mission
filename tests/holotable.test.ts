@@ -99,11 +99,13 @@ async function session(options: { plan?: boolean; child?: boolean; autostart?: s
 			notify: (message: string) => { notices.push(message); }, setWidget: () => {},
 			// Like the pane's dialog: it settles only when answered locally or aborted.
 			askDialog: (_questions: unknown, options?: { signal?: AbortSignal }) => new Promise(resolve => options?.signal?.addEventListener('abort', () => resolve(undefined))),
+			approve: (_prompt: unknown, options?: { signal?: AbortSignal }) => new Promise(resolve => options?.signal?.addEventListener('abort', () => resolve('deny'))),
 		},
 		isIdle: () => true, hasPendingMessages: () => false,
 		setInterval: (callback: () => Promise<void>) => { poll = callback; return 1; }, clearTimer: () => {}, setTimeout: () => 1,
 	} as unknown as ExtensionContext;
 	const api = {
+		pi: { VERSION: '18.12.5' },
 		registerTool: () => {}, registerShortcut: () => {},
 		registerCommand: (_name: string, spec: { handler: typeof command }) => { command = spec.handler; },
 		on: (name: string, handler: Handler) => events.set(name, handler), events: { on: () => {} },
@@ -259,6 +261,34 @@ test('the board answers an open ask through the socket while every other op stil
   expect((await ctl(socket, { v: 1, op: 'answer', operator: true, args: { id: 'q1', answers: [{ option: 9 }] } })).error.code).toBe('rejected');
   expect(await ctl(socket, { v: 1, op: 'answer', operator: true, args: { id: 'q1', answers: [{ option: 0 }] } })).toMatchObject({ ok: true });
   expect(await shown).toMatchObject({ kind: 'submit', results: [{ id: 'hub', selectedOptions: ['Here'] }] });
+ } finally { await run.event('session_shutdown', {}); }
+});
+
+test('the board answers an open tool approval through the socket while every other op waits on it', async () => {
+ const run = await session({ plan: true, child: true, autostart: 'CHR-123' });
+ try {
+  const pending = run.pending()!;
+  // OMP's tool wrapper reads ui.approve from the same UI object at call time.
+  const approve = (run.context.ui as unknown as { approve(prompt: unknown): Promise<unknown> }).approve;
+  const shown = approve({ full: 'Allow tool: bash\nCommand: rm -rf build', compact: 'Allow tool: bash\nCommand: rm -rf build', session: 'Approve bash for this session' });
+  for (let i = 0; i < 100 && !(await statusOf(run, pending)).approval; i++) await Bun.sleep(5);
+  const open = await statusOf(run, pending);
+  expect(open.hold).toBe('question');
+  expect(open.next).toBe('Answer in mission: Allow tool: bash Command: rm -rf build');
+  expect(open.approval).toMatchObject({ tool: 'bash', options: ['Approve', 'Approve bash for this session', 'Deny'] });
+  expect(open.actions).toEqual(['permit']);
+  const socket = open.ctl!.socket;
+  const id = open.approval!.id;
+  expect((await ctl(socket, { v: 1, op: 'plan-approve', operator: true })).error.code).toBe('question-waiting');
+  expect((await ctl(socket, { v: 1, op: 'permit', operator: true, args: { id: 'old', answer: 'Approve' } })).error.code).toBe('stale');
+  expect((await ctl(socket, { v: 1, op: 'permit', operator: true, args: { id } })).error.code).toBe('bad-request');
+  expect((await ctl(socket, { v: 1, op: 'permit', operator: true, args: { id, answer: 'Always' } })).error.code).toBe('rejected');
+  expect(await ctl(socket, { v: 1, op: 'permit', operator: true, args: { id, answer: 'Approve bash for this session' } })).toMatchObject({ ok: true });
+  expect(await shown).toBe('session');
+  for (let i = 0; i < 100 && (await statusOf(run, pending)).approval; i++) await Bun.sleep(5);
+  const closed = await statusOf(run, pending);
+  expect(closed.approval).toBeNull();
+  expect(closed.hold).toBe('plan-approval');
  } finally { await run.event('session_shutdown', {}); }
 });
 

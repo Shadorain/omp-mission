@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import type { ExtensionContext, PlanReviewChoice } from '@oh-my-pi/pi-coding-agent';
 import { parseBoardAnswers, type BoardAnswer } from './ask-bridge';
+import type { OpenApproval } from './approval-bridge';
 import { deliverUrl, displayPhase, effectiveGraph, modelRetryTargets, openFinding, operatorCommands, providerCapacity, quotaBlocked, repairBudgetReason, reviewTriageAction, reviewRetryAt } from './controller';
 import { isRecord } from './guards';
 import { displaySourceId } from './sources';
@@ -14,7 +15,7 @@ import { phases, type Evidence, type Frontend, type Mission, type MissionCheck, 
 
 // The holotable fleet contract (omp-holotable/docs/contract.md). Kept local: the repos do not import across.
 export const OPERATOR_OPS = ['approve', 'continue', 'mode', 'review', 'dispatch', 'check', 'resend', 'release', 'reap', 'clear', 'plan-approve', 'retry-model'] as const;
-const SOCKET_OPS: Record<string, true> = { ping: true, answer: true, approve: true, continue: true, mode: true, review: true, dispatch: true, check: true, resend: true, release: true, reap: true, clear: true, plan: true, 'plan-edit': true, 'plan-refine': true, 'plan-approve': true, 'retry-model': true };
+const SOCKET_OPS: Record<string, true> = { ping: true, answer: true, permit: true, approve: true, continue: true, mode: true, review: true, dispatch: true, check: true, resend: true, release: true, reap: true, clear: true, plan: true, 'plan-edit': true, 'plan-refine': true, 'plan-approve': true, 'retry-model': true };
 // 1 MiB: a plan-edit request carries up to 256 KiB of text plus JSON escaping overhead.
 const MAX_LINE = 1024 * 1024;
 const MAX_PLAN = 256 * 1024;
@@ -91,6 +92,8 @@ export interface ContactStatus {
 	ask?: { id: string; questions: AskQuestion[] } | null;
 	/** Null until the pane's first coordinator turn starts or ends. */
 	coordinator?: CoordinatorActivity | null;
+	/** The pane's open tool-approval prompt while hold is 'question': an id for this prompt, what it would allow, and its choices. */
+	approval?: OpenApproval | null;
 	updatedAt: string;
 	/** Identity of the publishing process; owned=false marks a read-only inspection pane. */
 	session?: { id: string; pid: number; processStart: string | null; terminal: string | null; owned: boolean };
@@ -328,6 +331,7 @@ export interface StatusInput {
 	planReview?: boolean;
 	question?: string;
 	ask?: { id: string; questions: AskQuestion[] };
+	approval?: OpenApproval;
 	/** Publish identity: the board tests process liveness directly, independent of socket or freshness. */
 	session?: { id: string; owned: boolean };
 }
@@ -349,8 +353,8 @@ export async function buildContactStatus(input: StatusInput): Promise<ContactSta
 		: m.gate ? 'gate'
 		: m.blocker || graphDown ? 'blocked'
 		: 'none';
-	// `ask` is published only while the pane's dialog is open and answerable from outside (ask-bridge.ts).
-	const actions = question ? (input.ask ? ['answer'] : []) : input.pending
+	// `ask` and `approval` are published only while the pane's prompt is open and answerable from outside (ask-bridge.ts, approval-bridge.ts).
+	const actions = question ? [...(input.ask ? ['answer'] : []), ...(input.approval ? ['permit'] : [])] : input.pending
 		// plan-approve answers OMP's interactive plan review, never a question or a parked planning turn.
 		? (!m.blocker && input.planReview ? ['plan-approve'] : [])
 		: [...new Set(
@@ -409,6 +413,7 @@ export async function buildContactStatus(input: StatusInput): Promise<ContactSta
 		ctl: input.ctl,
 		ask: question && input.ask ? input.ask : null,
 		coordinator: input.coordinator ?? null,
+		approval: question && input.approval ? input.approval : null,
 		usage: input.usage,
   measurements,
   usageEvidence:input.usageEvidence??null,
@@ -461,6 +466,10 @@ export interface HolotableHooks {
 	ask?(): { id: string; questions: AskQuestion[] } | undefined;
 	/** Settle the open ask dialog with the board's answers; returns why it cannot, or undefined. */
 	answerAsk?(answers: BoardAnswer[]): string | undefined;
+	/** The open tool approval the board may answer: published only while its prompt is on screen. */
+	approval?(): OpenApproval | undefined;
+	/** Answer the open approval `id` with one of its option labels; returns why it cannot, or undefined. */
+	permit?(id: string, choice: string): string | undefined;
 	gateId(): string | undefined;
 	decide(context: ExtensionContext, verb: string, arg?: string): Promise<void>;
 	request(context: ExtensionContext, op: string, extra?: Record<string, unknown>): Promise<void>;
@@ -547,6 +556,7 @@ export class HolotableBridge {
 			planReview: this.hooks.planReview()?.canApprove === true,
 			question: this.hooks.question(),
 			ask: this.hooks.ask?.(),
+			approval: this.hooks.approval?.(),
 		});
 		const serialized = `${JSON.stringify(status, null, 2)}\n`;
 		const file = statusFilePath(this.agentDir, current);
@@ -698,6 +708,13 @@ export class HolotableBridge {
 			const answers = parseBoardAnswers(args.answers);
 			if (!answers) return fail('bad-request', 'answer requires args.answers: [{option} | {options} | {text}]');
 			const refused = this.hooks.answerAsk ? this.hooks.answerAsk(answers) : 'This pane cannot be answered from outside';
+			return refused ? fail('rejected', refused) : { v: 1, ok: true, revision: revision ?? '' };
+		}
+		if (request.op === 'permit') {
+			const approval = this.hooks.approval?.();
+			if (!approval || args.id !== approval.id) return fail('stale', 'That approval is no longer open in the pane');
+			if (typeof args.answer !== 'string') return fail('bad-request', 'permit requires args.answer: one of the approval\'s options');
+			const refused = this.hooks.permit ? this.hooks.permit(approval.id, args.answer) : 'This pane cannot be answered from outside';
 			return refused ? fail('rejected', refused) : { v: 1, ok: true, revision: revision ?? '' };
 		}
 		if (this.hooks.question()) return fail('question-waiting', 'Answer the pending question in the mission pane before controlling the mission');
