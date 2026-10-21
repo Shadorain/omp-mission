@@ -4,7 +4,7 @@
 
 |File|Owns|
 |---|---|
-|`src/extension.ts`|Wiring: events, command, tools, widget, shortcuts. `control()` is the single mutation entry.|
+|`src/extension.ts`|Wiring: events, command, tools, widget, shortcuts. `control()` is the single mutation entry: it runs the shared checks, then the operation's handler from `sessionOps` or `missionOps`.|
 |`src/controller.ts`|Pure policy: `nextAction`, `operatorStep` (the command a person should run now, shown in the widget, menu and completions), gates, mode, mutation enforcement. No I/O.|
 |`src/store.ts`|Mission persistence, validation, controller ownership lock.|
 |`src/workers.ts`, `src/hosts.ts`|Worker driver and per-frontend spawn/send/focus/reap. See @docs/workers.md.|
@@ -84,7 +84,7 @@ Approving the plan is the approval to start. A `before_agent_start` hook sees th
 - Model: `mission_control` tool, native approval, brief result.
 - Operator: `/mission <verb>` calls `control()` directly. Typing the command is the approval.
 
-Both go through the same enforcement. Add an operation once, in `control()`.
+Both go through the same enforcement. Add an operation once: to `controlSchema`, plus a handler in `missionOps` (operations on the active mission; `control()` enforces mutation policy, ownership and review triage first, and persists after) or `sessionOps` (operations that start, resume or clear the mission, or act on a completed one, and check it themselves).
 
 `src/sources.ts` shares Linear identifier parsing across source inference, checkout guards, and checkout reuse. Each slash-separated component establishes its project from the first non-reserved identifier. Subsequent lowercase identifiers for different projects are title text; uppercase identifiers and same-project identifiers remain candidates, preserving ambiguity and conflict checks.
 

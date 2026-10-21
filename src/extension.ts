@@ -600,233 +600,281 @@ async function finishMission(context:ExtensionContext){
   model:z.string().min(1).max(1000).optional(),
   decisions:z.array(z.object({findingId:z.string().min(1).max(1000),disposition:z.enum(['repair','reject','defer','escalate']),detail:z.string().trim().min(1).max(9000),previousFindingId:z.string().min(1).max(1000).optional()})).min(1).max(1000).optional()
  });
- async function control(rawParams:unknown,context:ExtensionContext,_signal?:AbortSignal,internal:{reuseOnly?:boolean;operator?:boolean}={}){
+ type ControlParams=z.infer<typeof controlSchema>;type ControlOp=ControlParams['operation'];
+ // run_review sets reviewStarted, so control() records a review that started and then failed on the mission.
+ interface ControlCall{params:ControlParams;context:ExtensionContext;internal:{reuseOnly?:boolean;operator?:boolean};epoch:number;reviewStarted:boolean}
+ // These resolve the mission themselves: they start, resume or clear one, or act on a completed one.
+ type SessionOp='clear'|'start'|'continue'|'retry-model'|'check'|'record_check';
+ const sessionOps:Record<SessionOp,(call:ControlCall)=>Promise<void>>={
+  clear:async({context})=>{
+   const dropped=pending;
+   if(!mission&&!pending)throw new Error('No active mission');
+   if(mission){
+    const saved=path?await loadMission(path):mission;
+    if(saved.phase!=='complete')throw new Error('Cannot clear an unfinished mission; finish it before starting another run');
+    if(path)ignoredPaths.add(path);
+   }
+   pi.appendEntry('mission:pointer',{path:null,ignoredPaths:[...ignoredPaths]});
+   await detach(context);if(dropped)await holotable.discard(dropped).catch(()=>undefined);startPolling(context);await refreshCompletionSources();
+  },
+  start:async()=>{if(mission)throw new Error('Mission already started');if(!pending)throw new Error('Resolve /mission source first');mission=pending;pending=undefined;path=missionPath(agentDir,mission);await acquire();resumeHold=false;providerHold=undefined;mission.phase='isolate';mission.evidence.plan={outcome:'passed',detail:'Operator approved plan or explicit Force start',at:new Date().toISOString()};await persist(mission);pi.appendEntry('mission:pointer',{path,ignoredPaths:[...ignoredPaths]});await writeSourceFile(mission);},
+  continue:async({params,internal})=>{
+   if(mission?.evidence.verify?.outcome==='failed'&&!internal.operator)throw new Error('Verification is held; the operator must run /mission continue after resolving the blocker');
+   if(!mission)throw new Error('No saved mission');
+   await acquire();const mode=params.mode??inspectionIntent.mode;if(mode)setMode(mission,mode);
+   if(mission.repairBudget===undefined){
+    const closingRepair=mission.evidence.repair?.outcome==='active'||mission.round>(mission.reviews.at(-1)?.round??mission.round);
+    mission.repairBudget=closingRepair?REPAIR_CYCLES-1:REPAIR_CYCLES;
+   }
+   if(inspectionIntent.reviewRequested){mission.reviewRequested=true;if(mission.evidence.review?.outcome==='failed')delete mission.evidence.review;}
+   if(mission.evidence.verify?.outcome==='failed')mission.evidence.verify={...mission.evidence.verify,outcome:'pending'};
+   if(params.keep!==undefined)mission.keep=params.keep;resumeHold=false;if(isProviderBlocker(mission.blocker))delete mission.blocker;providerHold=undefined;await persist(mission);inspectionIntent={};pi.appendEntry('mission:pointer',{path,ignoredPaths:[...ignoredPaths]});
+   await refresh(false);
+  },
+  'retry-model':async({params,context,internal})=>{
+   if(!internal.operator)throw new Error('Model recovery requires an explicit operator choice');
+   if(!mission)throw new Error('No active mission');
+   await refresh(false);
+   const targets=modelRetryTargets(mission,snapshot,policy(context));
+   if(!targets)throw new Error('No retryable failed work, or a gate, ownership, verification, or resume hold prevents recovery');
+   await ownership!.assertOwned();
+   const model=context.modelRegistry.getAvailable().find(model=>`${model.provider}/${model.id}`===params.model);
+   if(!model)throw new Error(`Selected recovery model is unavailable: ${params.model}`);
+   if(targets.workers.some(id=>workerAgents.isLive(id)))throw new Error('A failed worker is still running; wait for it to stop');
+   if(!context.isIdle()||!await pi.setModel(model))throw new Error('Coordinator is busy or the selected model has no credentials');
+   const selector=`${model.provider}/${model.id}`;
+   mission.modelOverrides={worker:selector,review:selector};
+   if(targets.coordinator){delete mission.blocker;providerHold=undefined;}
+   if(targets.review){
+    if(mission.reviewProgress)mission.reviewProgress.retryModel=selector;
+    delete mission.evidence.review;mission.reviewRequested=true;
+   }
+   await persist(mission);
+   const failures:string[]=[];
+   for(const id of targets.workers){
+    try{await driver.resend(mission,id,snapshot!.leaves.find(bead=>bead.id===id)!);}
+    catch(error){failures.push(`${id}: ${String(error)}`);}
+   }
+   if(failures.length)throw new Error(`Recovery model saved; some workers could not resume: ${failures.join('; ')}`);
+  },
+  check:async({context,internal})=>{
+   // Board "Check PR": an operator click only. The pane inspects the delivered PR and reports back with record_check.
+   if(!internal.operator)throw new Error('Checking a delivered PR requires an operator');
+   if(!mission||mission.phase!=='complete')throw new Error('Only a completed mission with a delivered PR can be checked');
+   const url=deliverUrl(mission);if(!url)throw new Error('Mission recorded no pull request to check');
+   await acquire();
+   if(!context.isIdle())throw new Error('Coordinator is busy; check again once it is idle');
+   mission.check={at:new Date().toISOString(),state:'fixing',detail:'Operator requested a PR check',conflicts:[],threads:{open:0,total:0}};
+   await persist(mission);
+   pi.sendUserMessage(checkPrompt(mission,url),{attribution:'agent'});
+  },
+  record_check:async({params})=>{
+   if(!mission||mission.phase!=='complete')throw new Error('No completed mission to record a check for');
+   if(!params.checkState||!params.detail?.trim())throw new Error('checkState and detail are required');
+   const threads=params.threads??{open:0,total:0};
+   if(threads.open>threads.total)throw new Error('threads.open cannot exceed threads.total');
+   mission.check={at:new Date().toISOString(),state:params.checkState,detail:params.detail.trim().slice(0,2000),conflicts:params.conflicts??[],threads};
+   await persist(mission);
+  },
+ };
+ const isSessionOp=(op:ControlOp):op is SessionOp=>Object.hasOwn(sessionOps,op);
+ // bind_graph and bind_repairs accept only scopes on the epic's implementation leaves; a changed binding voids later evidence.
+ async function scopedGraph(m:Mission,params:ControlParams){
+  requireBeadsGraph(m);const epic=params.epicId??m.epicId;if(!epic||!params.scopes||!m.workspace.beadsDir)throw new Error('Bound workspace, epic and complete file scopes required');const graph=await readGraph(run,m.workspace.cwd,epic,{BEADS_DIR:m.workspace.beadsDir});if(graph.error)throw new Error(graph.error);for(const [id,files] of Object.entries(params.scopes)){if(!graph.leaves.some(b=>b.id===id))throw new Error(`Not a descendant implementation leaf: ${id}`);for(const file of files){if(isAbsolute(file)||file.split('/').includes('..')||file==='.'||!file.trim())throw new Error(`Invalid file scope: ${file}`);}}
+  return {epic,graph,scopes:params.scopes};
+ }
+ function bindScopes(m:Mission,{epic,graph,scopes}:{epic:string;graph:Snapshot;scopes:Record<string,string[]>},repair:boolean){
+  const changed=repair||m.epicId!==epic||graph.leaves.some(bead=>bead.category!=='closed')||Object.entries(scopes).some(([id,files])=>{const previous=m.scopes[id];return !previous||previous.length!==files.length||files.some(file=>!previous.includes(file));});
+  if(changed){delete m.evidence.verify;delete m.evidence.deliver;delete m.evidence.review;delete m.evidence.complete;delete m.reviewProgress;}
+  m.epicId=epic;Object.assign(m.scopes,scopes);snapshot=graph;m.phase=repair?'repair':'execute';m.evidence.graph={outcome:'passed',detail:`Epic ${epic}; scoped leaves ${Object.keys(m.scopes).join(', ')}`,at:new Date().toISOString()};
+ }
+ // Worker operations act only on a bead in the graph they just refreshed.
+ function freshBead(beadId:string|undefined,missing:string){
+  if(!beadId)throw new Error(missing);
+  const bead=snapshot?.beads.find(b=>b.id===beadId);if(!bead||snapshot?.error)throw new Error('Fresh mission bead required');
+  return bead;
+ }
+ // Operations on the active mission: control() enforces mutation policy, ownership and review triage first, and persists after.
+ const missionOps:Record<Exclude<ControlOp,SessionOp>,(m:Mission,call:ControlCall)=>Promise<void>>={
+  bind_workspace:async(m,{params,internal})=>{
+   let {cwd,beadsDir,delivery,base}=params;let note='';
+   if(!cwd){const isolated=await isolateCheckout(run,{source:m.source,start:m.workspace.cwd,base,delivery,create:!internal.reuseOnly});cwd=isolated.cwd;base??=isolated.base;delivery??=isolated.delivery;note=`${isolated.created?'created':'reusing'} ${cwd}`;}
+   else if(!delivery&&m.source.kind==='freeform')delivery='local';
+   beadsDir??=await discoverBeadsDir(run,cwd);
+   const workspace=await inspectWorkspace(cwd,run,{explicitBase:base,delivery,githubRepo:m.source.repo});if(workspace.key!==m.workspace.key)throw new Error('Workspace repository identity differs');if(workspace.commonDir&&!workspace.base)throw new Error('Repository base unresolved');const bd=await run('bd',['--readonly','where','--json'],workspace.cwd,{BEADS_DIR:beadsDir});if(bd.code)throw new Error(bd.stderr||'Bead database unreachable');const where=JSON.parse(bd.stdout);if(await realpath(where.path)!==await realpath(beadsDir))throw new Error('BEADS_DIR does not match canonical database');workspace.beadsDir=await realpath(beadsDir);m.workspace=workspace;m.phase='graph';m.evidence.isolate={outcome:'passed',detail:params.detail??(note||workspace.cwd),at:new Date().toISOString()};
+  },
+  bind_graph:async(m,{params})=>{
+   const bound=await scopedGraph(m,params);
+   if(m.phase==='repair'&&m.evidence.repair?.outcome==='active')throw new Error('Bind accepted review repairs with bind_repairs and exact finding links');
+   if(bound.graph.leaves.some(b=>!bound.scopes[b.id]))throw new Error('Every implementation leaf requires scope');
+   bindScopes(m,bound,false);
+  },
+  bind_repairs:async(m,{params})=>{
+   const bound=await scopedGraph(m,params);
+   if(m.phase!=='repair'||m.evidence.repair?.outcome!=='active')throw new Error('Accept findings before binding repairs');
+   if(!params.repairLinks)throw new Error('Finding links required');
+   const findingIds=m.reviews.at(-1)!.findings.filter(openFinding).map(f=>f.id);
+   for(const id of Object.keys(bound.scopes)){const links=params.repairLinks[id];if(!links?.length||links.some(link=>!findingIds.includes(link)))throw new Error(`Invalid finding links: ${id}`);}
+   if(findingIds.some(id=>!Object.values(params.repairLinks!).some(links=>links.includes(id))))throw new Error('Every actionable finding needs a repair bead');
+   consumeRepairBudget(m);Object.assign(m.repairLinks,params.repairLinks);m.round++;delete m.evidence.verify;delete m.evidence.deliver;delete m.gate;
+   bindScopes(m,bound,true);
+  },
+  dispatch:async(m,{context})=>{
+   requireBeadsGraph(m);await refresh(false);const action=nextAction(m,snapshot,policy(context));if(action.gate){m.gate=action.gate;await persist(m);throw new Error(`Approval required: ${action.detail}`);}if(action.kind!=='dispatch'||!action.ids||!snapshot)throw new Error(action.detail);
+   enforceGate(m,waveGate(m,action.ids,snapshot));
+   await sharePlan(m,context);
+   await driver.dispatch(m,action.ids.map(id=>({beadId:id,cwd:m.workspace.cwd,files:m.scopes[id]!,task:beadTask(snapshot?.beads.find(b=>b.id===id))})));
+   consumeGate(m);m.phase=m.repairLinks[action.ids[0]!]?'repair':'execute';
+  },
+  record_verification:async(m,{params})=>{
+   if (effectiveGraph(m) !== 'local') {
+    await refresh(false);
+    if (!snapshot || snapshot.error || !snapshot.leaves.length || snapshot.leaves.some(bead => bead.category !== 'closed')) {
+     throw new Error('Fresh closed implementation leaves required');
+    }
+   }
+   if (!params.detail || params.passed === undefined) throw new Error('Actual command/result detail and passed required');
+   const captured = await captureRevision(m, run);
+   const previous = m.reviews.at(-1);
+   if (params.passed && previous && previous.findings.some(openFinding) && m.round > previous.round && previous.revision === captured.revision) {
+    throw new Error('Repair output unchanged; verification cannot resolve findings');
+   }
+   const evidence: Evidence = {
+    outcome: params.passed ? 'passed' : 'failed',
+    detail: params.detail,
+    revision: captured.revision,
+    ...(params.passed?{tree:captured.tree}:{}),
+    at: new Date().toISOString(),
+   };
+   m.evidence.verify = evidence;
+   const measured=measurements(m,evidence.at);
+   if(params.passed)measured.recordedPassed++;
+   else{measured.recordedFailed++;if(measured.lastVerification?.outcome==='failed'&&measured.lastVerification.revision===captured.revision)measured.repeatedFailedRevision++;}
+   measured.lastVerification={revision:captured.revision,outcome:params.passed?'passed':'failed'};
+   if (m.evidence.repair && m.evidence.repair.outcome !== 'skipped' && previous && m.round > previous.round) {
+    m.evidence.repair = { ...evidence };
+   }
+   delete m.evidence.deliver;
+   m.phase = params.passed ? 'deliver' : 'verify';
+  },
+  record_delivery:async(m,{params})=>{
+   if(m.evidence.verify?.outcome!=='passed'||!params.detail)throw new Error('Passed verification and actual delivery evidence required');
+   const captured=await captureRevision(m,run);
+   alignVerifiedRevision(m,captured);
+   if(m.workspace.delivery==='pr'){
+    if(!/^https:\/\/[^\s]+\/pull\/\d+$/.test(params.url??''))throw new Error('Actual PR URL required');
+    await assertPrBase(m,params.url);
+   }
+   // A branch carrying files no bead owns is not this mission's work; catching it here saves a review round.
+   const foreign=await foreignPaths(m,run);
+   if(foreign&&foreign.length)reopenVerification(m,foreignDetail(m,foreign));
+   else{m.evidence.deliver={outcome:'passed',detail:params.url?`${params.url}\n${params.detail}`:params.detail,revision:captured.revision,at:new Date().toISOString()};m.phase='review';}
+  },
+  merge_base:async(m)=>{
+   if(!m.workspace.commonDir||!m.workspace.base)throw new Error('Bound Git workspace and base required');
+   if(m.workers.some(worker=>worker.state!=='closed'))throw new Error('Wait until every worker has closed before merging the base');
+   const result=await mergeBaseInto(m,run);
+   if(result.conflicts.length)reopenVerification(m,`Merging ${result.ref} stopped on conflicts in ${result.conflicts.join(', ')}. Bind a leaf scoped to exactly these paths that resolves the conflict markers keeping both sides' intent, dispatch it, conclude the merge with git commit --no-edit, then verify again.`);
+   else if(result.merged){delete m.evidence.verify;delete m.evidence.deliver;m.phase='verify';}
+  },
+  run_review:async(m,call)=>{
+   const {context}=call;
+   await refresh(false);const action=nextAction(m,snapshot,policy(context));
+   if(!(action.kind==='review'||action.kind==='hold'&&action.gate?.kind==='review')||!m.reviewRequested||m.evidence.verify?.outcome!=='passed'||m.evidence.deliver?.outcome!=='passed')throw new Error(action.detail);
+   if(m.workspace.delivery==='pr')await assertPrBase(m);
+   const revision=alignVerifiedRevision(m,await captureRevision(m,run));
+   const prior=m.evidence.review;const failedBefore=prior?.outcome==='failed'&&prior.revision===m.evidence.verify?.revision?prior.attempts??1:0;
+   enforceGate(m,revisionGate(m,'review',revision));m.phase='review';m.evidence.review={outcome:'active',detail:'Independent reviewer running',revision,at:new Date().toISOString(),...(failedBefore?{attempts:failedBefore}:{})};await persist(m);call.reviewStarted=true;reviewRows=[];await render();
+   const reviewFiles=await contextFilesFor(config.reviewContext,m.workspace.cwd,agentDir);const targets=config.frontend==='subagent'&&m.graph==='beads'&&snapshot?snapshot.leaves.filter(b=>m.scopes[b.id]?.length).map(b=>({id:b.id,title:b.title,text:beadTask(b)??b.title,files:m.scopes[b.id]!})):[];const result=targets.length>1?await reviewer.runPerBead(m,context,run,config.modelRole,reviewFiles,targets,config.reviewConcurrency):await reviewer.run(m,context,run,config.modelRole,reviewFiles);if(call.epoch!==generation)throw new Error('Session changed during review');
+   consumeGate(m);
+   m.reviews.push(result);
+   deferAdvisory(m,result);
+   m.evidence.review = {outcome:'passed',detail:result.summary,revision:result.revision,at:result.at};
+   if (!result.findings.some(openFinding)) {
+    await tryComplete(m,{detail:'Verification, delivery and independent review complete',revision:result.revision,at:result.at});
+   }
+  },
+  triage_findings:async(m,{params,context})=>{
+   const review=m.reviews.at(-1);
+   if(!review||(await captureRevision(m,run)).revision!==review.revision)throw new Error('Review revision changed; reverify/rereview before triage');
+   triageFindings(m,params.decisions??[]);
+   await refresh(false);
+   if(nextAction(m,snapshot,policy(context)).kind==='complete')await tryComplete(m,{detail:'No blocking independent findings remain after evidence-based triage',revision:review.revision,at:new Date().toISOString()});
+  },
+  accept_repairs:async(m)=>{
+   const review = m.reviews.at(-1);
+   if (!review || review.invalidated || !review.findings.some(openFinding)) throw new Error('No actionable findings');
+   if(review.findings.some(finding=>openFinding(finding)&&finding.triage?.disposition!=='repair'))throw new Error('Validate and triage every finding before accepting repairs');
+   if ((await captureRevision(m, run)).revision !== review.revision) throw new Error('Review revision changed; reverify/rereview');
+   enforceGate(m, revisionGate(m, 'repairs', review.revision));
+   const local = effectiveGraph(m) === 'local';
+   if(m.evidence.repair?.outcome!=='active')measurements(m).acceptedRepairs++;
+   if (local) {
+    consumeRepairBudget(m);
+    m.round = Math.max(m.round, review.round + 1);
+    delete m.evidence.verify;
+    delete m.evidence.deliver;
+   }
+   m.phase = 'repair';
+   m.evidence.repair = {
+    outcome: 'active',
+    detail: local ? 'Repair in this pane authorized' : 'Repair bead creation authorized; bind exact finding links/scopes',
+    revision: review.revision,
+    at: new Date().toISOString(),
+   };
+   consumeGate(m);
+  },
+  reject_finding:async(m,{params,context})=>{
+   const review = m.reviews.at(-1);
+   const finding = review?.findings.find(finding => finding.id === params.findingId);
+   if (!review || !finding || !params.detail?.trim()) throw new Error('Finding and visible non-actionable explanation required');
+   if ((await captureRevision(m, run)).revision !== review.revision) throw new Error('Finding belongs to a changed revision');
+   finding.rejection = params.detail;
+   finding.triage={disposition:'reject',detail:params.detail};
+   const evidence: Evidence = {outcome:'passed',detail:'All independent findings explicitly rejected with recorded reasons',revision:review.revision,at:new Date().toISOString()};
+   if (!review.findings.some(openFinding) && m.evidence.repair?.outcome === 'active') {
+    m.evidence.repair = {...evidence, outcome:'skipped'};
+   }
+   await refresh(false);
+   if (nextAction(m, snapshot, policy(context)).kind === 'complete') {
+    await tryComplete(m,evidence);
+   }
+  },
+  resend:async(m,{params,context})=>{
+   requireBeadsGraph(m);await refresh(false);
+   // The board's Resend carries no bead: the controller's pending resend step names it, as the status `next` line shows.
+   let beadId=params.beadId;
+   if(!beadId){const step=nextAction(m,snapshot,policy(context));if(step.kind==='resend')beadId=step.ids?.[0];}
+   const bead=freshBead(beadId,'beadId required: no worker is waiting for a resend');
+   await driver.resend(m,bead.id,bead,params.detail,params.files);
+  },
+  release:async(m,{params})=>{
+   requireBeadsGraph(m);await refresh(false);
+   const bead=freshBead(params.beadId,'beadId required');
+   await driver.release(m,bead.id,bead);await refresh(false);
+  },
+  reap:async(m,{params})=>{
+   requireBeadsGraph(m);await refresh(false);
+   const bead=freshBead(params.beadId,'beadId required');
+   await driver.reap(m,bead.id,bead);
+  },
+ };
+ async function control(rawParams:unknown,context:ExtensionContext,signal?:AbortSignal,internal:ControlCall['internal']={}){
   const params=controlSchema.parse(rawParams);
-  if(!eligible(context)||(nativePlan(context)&&params.operation!=='clear'))throw new Error('Mission mutations are forbidden for children or native plan mode');if(operation)throw new Error('Mission operation already running');operation=true;operationSignal=_signal;ctx=context;const epoch=generation;let reviewStarted=false;
-  const cancelReview=()=>{void reviewer.dispose();};_signal?.addEventListener('abort',cancelReview,{once:true});
+  if(!eligible(context)||(nativePlan(context)&&params.operation!=='clear'))throw new Error('Mission mutations are forbidden for children or native plan mode');if(operation)throw new Error('Mission operation already running');operation=true;operationSignal=signal;ctx=context;const epoch=generation;const call:ControlCall={params,context,internal,epoch,reviewStarted:false};
+  const cancelReview=()=>{void reviewer.dispose();};signal?.addEventListener('abort',cancelReview,{once:true});
   try{
-   if(params.operation==='clear'){
-    const dropped=pending;
-    if(!mission&&!pending)throw new Error('No active mission');
-    if(mission){
-     const saved=path?await loadMission(path):mission;
-     if(saved.phase!=='complete')throw new Error('Cannot clear an unfinished mission; finish it before starting another run');
-     if(path)ignoredPaths.add(path);
-    }
-    pi.appendEntry('mission:pointer',{path:null,ignoredPaths:[...ignoredPaths]});
-    await detach(context);if(dropped)await holotable.discard(dropped).catch(()=>undefined);startPolling(context);await refreshCompletionSources();await render();return status(context,true);
-   }
-   if(params.operation==='start'){if(mission)throw new Error('Mission already started');if(!pending)throw new Error('Resolve /mission source first');mission=pending;pending=undefined;path=missionPath(agentDir,mission);await acquire();resumeHold=false;providerHold=undefined;mission.phase='isolate';mission.evidence.plan={outcome:'passed',detail:'Operator approved plan or explicit Force start',at:new Date().toISOString()};await persist(mission);pi.appendEntry('mission:pointer',{path,ignoredPaths:[...ignoredPaths]});await writeSourceFile(mission);}
-   else if(params.operation==='continue'){
-    if(mission?.evidence.verify?.outcome==='failed'&&!internal.operator)throw new Error('Verification is held; the operator must run /mission continue after resolving the blocker');
-    if(!mission)throw new Error('No saved mission');
-    await acquire();const mode=params.mode??inspectionIntent.mode;if(mode)setMode(mission,mode);
-    if(mission.repairBudget===undefined){
-     const closingRepair=mission.evidence.repair?.outcome==='active'||mission.round>(mission.reviews.at(-1)?.round??mission.round);
-     mission.repairBudget=closingRepair?REPAIR_CYCLES-1:REPAIR_CYCLES;
-    }
-    if(inspectionIntent.reviewRequested){mission.reviewRequested=true;if(mission.evidence.review?.outcome==='failed')delete mission.evidence.review;}
-    if(mission.evidence.verify?.outcome==='failed')mission.evidence.verify={...mission.evidence.verify,outcome:'pending'};
-    if(params.keep!==undefined)mission.keep=params.keep;resumeHold=false;if(isProviderBlocker(mission.blocker))delete mission.blocker;providerHold=undefined;await persist(mission);inspectionIntent={};pi.appendEntry('mission:pointer',{path,ignoredPaths:[...ignoredPaths]});
-    await refresh(false);
-   }
-   else if(params.operation==='retry-model'){
-    if(!internal.operator)throw new Error('Model recovery requires an explicit operator choice');
-    if(!mission)throw new Error('No active mission');
-    await refresh(false);
-    const targets=modelRetryTargets(mission,snapshot,policy(context));
-    if(!targets)throw new Error('No retryable failed work, or a gate, ownership, verification, or resume hold prevents recovery');
-    await ownership!.assertOwned();
-    const model=context.modelRegistry.getAvailable().find(model=>`${model.provider}/${model.id}`===params.model);
-    if(!model)throw new Error(`Selected recovery model is unavailable: ${params.model}`);
-    if(targets.workers.some(id=>workerAgents.isLive(id)))throw new Error('A failed worker is still running; wait for it to stop');
-    if(!context.isIdle()||!await pi.setModel(model))throw new Error('Coordinator is busy or the selected model has no credentials');
-    const selector=`${model.provider}/${model.id}`;
-    mission.modelOverrides={worker:selector,review:selector};
-    if(targets.coordinator){delete mission.blocker;providerHold=undefined;}
-    if(targets.review){
-     if(mission.reviewProgress)mission.reviewProgress.retryModel=selector;
-     delete mission.evidence.review;mission.reviewRequested=true;
-    }
-    await persist(mission);
-    const failures:string[]=[];
-    for(const id of targets.workers){
-     try{await driver.resend(mission,id,snapshot!.leaves.find(bead=>bead.id===id)!);}
-     catch(error){failures.push(`${id}: ${String(error)}`);}
-    }
-    if(failures.length)throw new Error(`Recovery model saved; some workers could not resume: ${failures.join('; ')}`);
-   }
-   else if(params.operation==='check'){
-    // Board "Check PR": an operator click only. The pane inspects the delivered PR and reports back with record_check.
-    if(!internal.operator)throw new Error('Checking a delivered PR requires an operator');
-    if(!mission||mission.phase!=='complete')throw new Error('Only a completed mission with a delivered PR can be checked');
-    const url=deliverUrl(mission);if(!url)throw new Error('Mission recorded no pull request to check');
-    await acquire();
-    if(!context.isIdle())throw new Error('Coordinator is busy; check again once it is idle');
-    mission.check={at:new Date().toISOString(),state:'fixing',detail:'Operator requested a PR check',conflicts:[],threads:{open:0,total:0}};
-    await persist(mission);
-    pi.sendUserMessage(checkPrompt(mission,url),{attribution:'agent'});
-   }
-   else if(params.operation==='record_check'){
-    if(!mission||mission.phase!=='complete')throw new Error('No completed mission to record a check for');
-    if(!params.checkState||!params.detail?.trim())throw new Error('checkState and detail are required');
-    const threads=params.threads??{open:0,total:0};
-    if(threads.open>threads.total)throw new Error('threads.open cannot exceed threads.total');
-    mission.check={at:new Date().toISOString(),state:params.checkState,detail:params.detail.trim().slice(0,2000),conflicts:params.conflicts??[],threads};
-    await persist(mission);
-   }
+   const op=params.operation;
+   if(isSessionOp(op))await sessionOps[op](call);
    else{
     if(!mission)throw new Error('No active mission');enforceMutation(mission,policy(context));await ownership!.assertOwned();
-    const triage=reviewTriageAction(mission);if(triage&&!['triage_findings','reject_finding','release','reap'].includes(params.operation))throw new Error(triage.detail);
-    if(params.operation==='bind_workspace'){
-     let {cwd,beadsDir,delivery,base}=params;let note='';
-     if(!cwd){const isolated=await isolateCheckout(run,{source:mission.source,start:mission.workspace.cwd,base,delivery,create:!internal.reuseOnly});cwd=isolated.cwd;base??=isolated.base;delivery??=isolated.delivery;note=`${isolated.created?'created':'reusing'} ${cwd}`;}
-     else if(!delivery&&mission.source.kind==='freeform')delivery='local';
-     beadsDir??=await discoverBeadsDir(run,cwd);
-     const workspace=await inspectWorkspace(cwd,run,{explicitBase:base,delivery,githubRepo:mission.source.repo});if(workspace.key!==mission.workspace.key)throw new Error('Workspace repository identity differs');if(workspace.commonDir&&!workspace.base)throw new Error('Repository base unresolved');const bd=await run('bd',['--readonly','where','--json'],workspace.cwd,{BEADS_DIR:beadsDir});if(bd.code)throw new Error(bd.stderr||'Bead database unreachable');const where=JSON.parse(bd.stdout);if(await realpath(where.path)!==await realpath(beadsDir))throw new Error('BEADS_DIR does not match canonical database');workspace.beadsDir=await realpath(beadsDir);mission.workspace=workspace;mission.phase='graph';mission.evidence.isolate={outcome:'passed',detail:params.detail??(note||workspace.cwd),at:new Date().toISOString()};
-    }else if(params.operation==='bind_graph'||params.operation==='bind_repairs'){
-     requireBeadsGraph(mission);const epic=params.epicId??mission.epicId;if(!epic||!params.scopes||!mission.workspace.beadsDir)throw new Error('Bound workspace, epic and complete file scopes required');const graph=await readGraph(run,mission.workspace.cwd,epic,{BEADS_DIR:mission.workspace.beadsDir});if(graph.error)throw new Error(graph.error);for(const [id,files] of Object.entries(params.scopes)){if(!graph.leaves.some(b=>b.id===id))throw new Error(`Not a descendant implementation leaf: ${id}`);for(const file of files){if(isAbsolute(file)||file.split('/').includes('..')||file==='.'||!file.trim())throw new Error(`Invalid file scope: ${file}`);}}
-     if(params.operation==='bind_graph'&&mission.phase==='repair'&&mission.evidence.repair?.outcome==='active')throw new Error('Bind accepted review repairs with bind_repairs and exact finding links');
-     if(params.operation==='bind_graph'&&graph.leaves.some(b=>!params.scopes![b.id]))throw new Error('Every implementation leaf requires scope');
-     if(params.operation==='bind_repairs'){
-      if(mission.phase!=='repair'||mission.evidence.repair?.outcome!=='active')throw new Error('Accept findings before binding repairs');
-      if(!params.repairLinks)throw new Error('Finding links required');
-      const findingIds=mission.reviews.at(-1)!.findings.filter(openFinding).map(f=>f.id);
-      for(const id of Object.keys(params.scopes)){const links=params.repairLinks[id];if(!links?.length||links.some(link=>!findingIds.includes(link)))throw new Error(`Invalid finding links: ${id}`);}
-      if(findingIds.some(id=>!Object.values(params.repairLinks!).some(links=>links.includes(id))))throw new Error('Every actionable finding needs a repair bead');
-      consumeRepairBudget(mission);Object.assign(mission.repairLinks,params.repairLinks);mission.round++;delete mission.evidence.verify;delete mission.evidence.deliver;delete mission.gate;
-     }
-     const changed=params.operation==='bind_repairs'||mission.epicId!==epic||graph.leaves.some(bead=>bead.category!=='closed')||Object.entries(params.scopes).some(([id,files])=>{const previous=mission!.scopes[id];return !previous||previous.length!==files.length||files.some(file=>!previous.includes(file));});
-     if(changed){delete mission.evidence.verify;delete mission.evidence.deliver;delete mission.evidence.review;delete mission.evidence.complete;delete mission.reviewProgress;}
-     mission.epicId=epic;Object.assign(mission.scopes,params.scopes);snapshot=graph;mission.phase=params.operation==='bind_repairs'?'repair':'execute';mission.evidence.graph={outcome:'passed',detail:`Epic ${epic}; scoped leaves ${Object.keys(mission.scopes).join(', ')}`,at:new Date().toISOString()};
-    }else if(params.operation==='dispatch'){
-     requireBeadsGraph(mission);await refresh(false);const action=nextAction(mission,snapshot,policy(context));if(action.gate){mission.gate=action.gate;await persist(mission);throw new Error(`Approval required: ${action.detail}`);}if(action.kind!=='dispatch'||!action.ids||!snapshot)throw new Error(action.detail);
-     enforceGate(mission,waveGate(mission,action.ids,snapshot));
-     await sharePlan(mission,context);
-     await driver.dispatch(mission,action.ids.map(id=>({beadId:id,cwd:mission!.workspace.cwd,files:mission!.scopes[id]!,task:beadTask(snapshot?.beads.find(b=>b.id===id))})));
-     consumeGate(mission);mission.phase=mission.repairLinks[action.ids[0]!]?'repair':'execute';
-    }else if(params.operation==='record_verification'){
-     if (effectiveGraph(mission) !== 'local') {
-      await refresh(false);
-      if (!snapshot || snapshot.error || !snapshot.leaves.length || snapshot.leaves.some(bead => bead.category !== 'closed')) {
-       throw new Error('Fresh closed implementation leaves required');
-      }
-     }
-     if (!params.detail || params.passed === undefined) throw new Error('Actual command/result detail and passed required');
-     const captured = await captureRevision(mission, run);
-     const previous = mission.reviews.at(-1);
-     if (params.passed && previous && previous.findings.some(openFinding) && mission.round > previous.round && previous.revision === captured.revision) {
-      throw new Error('Repair output unchanged; verification cannot resolve findings');
-     }
-     const evidence: Evidence = {
-      outcome: params.passed ? 'passed' : 'failed',
-      detail: params.detail,
-      revision: captured.revision,
-      ...(params.passed?{tree:captured.tree}:{}),
-      at: new Date().toISOString(),
-     };
-     mission.evidence.verify = evidence;
-     const measured=measurements(mission,evidence.at);
-     if(params.passed)measured.recordedPassed++;
-     else{measured.recordedFailed++;if(measured.lastVerification?.outcome==='failed'&&measured.lastVerification.revision===captured.revision)measured.repeatedFailedRevision++;}
-     measured.lastVerification={revision:captured.revision,outcome:params.passed?'passed':'failed'};
-     if (mission.evidence.repair && mission.evidence.repair.outcome !== 'skipped' && previous && mission.round > previous.round) {
-      mission.evidence.repair = { ...evidence };
-     }
-     delete mission.evidence.deliver;
-     mission.phase = params.passed ? 'deliver' : 'verify';
-    }else if(params.operation==='record_delivery'){
-     if(mission.evidence.verify?.outcome!=='passed'||!params.detail)throw new Error('Passed verification and actual delivery evidence required');
-     const captured=await captureRevision(mission,run);
-     alignVerifiedRevision(mission,captured);
-     if(mission.workspace.delivery==='pr'){
-      if(!/^https:\/\/[^\s]+\/pull\/\d+$/.test(params.url??''))throw new Error('Actual PR URL required');
-      await assertPrBase(mission,params.url);
-     }
-     // A branch carrying files no bead owns is not this mission's work; catching it here saves a review round.
-     const foreign=await foreignPaths(mission,run);
-     if(foreign&&foreign.length)reopenVerification(mission,foreignDetail(mission,foreign));
-     else{mission.evidence.deliver={outcome:'passed',detail:params.url?`${params.url}\n${params.detail}`:params.detail,revision:captured.revision,at:new Date().toISOString()};mission.phase='review';}
-    }else if(params.operation==='merge_base'){
-     if(!mission.workspace.commonDir||!mission.workspace.base)throw new Error('Bound Git workspace and base required');
-     if(mission.workers.some(worker=>worker.state!=='closed'))throw new Error('Wait until every worker has closed before merging the base');
-     const result=await mergeBaseInto(mission,run);
-     if(result.conflicts.length)reopenVerification(mission,`Merging ${result.ref} stopped on conflicts in ${result.conflicts.join(', ')}. Bind a leaf scoped to exactly these paths that resolves the conflict markers keeping both sides' intent, dispatch it, conclude the merge with git commit --no-edit, then verify again.`);
-     else if(result.merged){delete mission.evidence.verify;delete mission.evidence.deliver;mission.phase='verify';}
-    }else if(params.operation==='run_review'){
-     await refresh(false);const action=nextAction(mission,snapshot,policy(context));
-     if(!(action.kind==='review'||action.kind==='hold'&&action.gate?.kind==='review')||!mission.reviewRequested||mission.evidence.verify?.outcome!=='passed'||mission.evidence.deliver?.outcome!=='passed')throw new Error(action.detail);
-     if(mission.workspace.delivery==='pr')await assertPrBase(mission);
-     const revision=alignVerifiedRevision(mission,await captureRevision(mission,run));
-     const prior=mission.evidence.review;const failedBefore=prior?.outcome==='failed'&&prior.revision===mission.evidence.verify?.revision?prior.attempts??1:0;
-     enforceGate(mission,revisionGate(mission,'review',revision));mission.phase='review';mission.evidence.review={outcome:'active',detail:'Independent reviewer running',revision,at:new Date().toISOString(),...(failedBefore?{attempts:failedBefore}:{})};await persist(mission);reviewStarted=true;reviewRows=[];await render();
-     const reviewFiles=await contextFilesFor(config.reviewContext,mission.workspace.cwd,agentDir);const targets=config.frontend==='subagent'&&mission.graph==='beads'&&snapshot?snapshot.leaves.filter(b=>mission!.scopes[b.id]?.length).map(b=>({id:b.id,title:b.title,text:beadTask(b)??b.title,files:mission!.scopes[b.id]!})):[];const result=targets.length>1?await reviewer.runPerBead(mission,context,run,config.modelRole,reviewFiles,targets,config.reviewConcurrency):await reviewer.run(mission,context,run,config.modelRole,reviewFiles);if(epoch!==generation)throw new Error('Session changed during review');
-     consumeGate(mission);
-     mission.reviews.push(result);
-     deferAdvisory(mission,result);
-     mission.evidence.review = {outcome:'passed',detail:result.summary,revision:result.revision,at:result.at};
-     if (!result.findings.some(openFinding)) {
-      await tryComplete(mission,{detail:'Verification, delivery and independent review complete',revision:result.revision,at:result.at});
-     }
-    }else if(params.operation==='triage_findings'){
-     const review=mission.reviews.at(-1);
-     if(!review||(await captureRevision(mission,run)).revision!==review.revision)throw new Error('Review revision changed; reverify/rereview before triage');
-     triageFindings(mission,params.decisions??[]);
-     await refresh(false);
-     if(nextAction(mission,snapshot,policy(context)).kind==='complete')await tryComplete(mission,{detail:'No blocking independent findings remain after evidence-based triage',revision:review.revision,at:new Date().toISOString()});
-    }else if(params.operation==='accept_repairs'){
-     const review = mission.reviews.at(-1);
-     if (!review || review.invalidated || !review.findings.some(openFinding)) throw new Error('No actionable findings');
-     if(review.findings.some(finding=>openFinding(finding)&&finding.triage?.disposition!=='repair'))throw new Error('Validate and triage every finding before accepting repairs');
-     if ((await captureRevision(mission, run)).revision !== review.revision) throw new Error('Review revision changed; reverify/rereview');
-     enforceGate(mission, revisionGate(mission, 'repairs', review.revision));
-     const local = effectiveGraph(mission) === 'local';
-     if(mission.evidence.repair?.outcome!=='active')measurements(mission).acceptedRepairs++;
-     if (local) {
-      consumeRepairBudget(mission);
-      mission.round = Math.max(mission.round, review.round + 1);
-      delete mission.evidence.verify;
-      delete mission.evidence.deliver;
-     }
-     mission.phase = 'repair';
-     mission.evidence.repair = {
-      outcome: 'active',
-      detail: local ? 'Repair in this pane authorized' : 'Repair bead creation authorized; bind exact finding links/scopes',
-      revision: review.revision,
-      at: new Date().toISOString(),
-     };
-     consumeGate(mission);
-    }else if(params.operation==='reject_finding'){
-     const review = mission.reviews.at(-1);
-     const finding = review?.findings.find(finding => finding.id === params.findingId);
-     if (!review || !finding || !params.detail?.trim()) throw new Error('Finding and visible non-actionable explanation required');
-     if ((await captureRevision(mission, run)).revision !== review.revision) throw new Error('Finding belongs to a changed revision');
-     finding.rejection = params.detail;
-     finding.triage={disposition:'reject',detail:params.detail};
-     const evidence: Evidence = {outcome:'passed',detail:'All independent findings explicitly rejected with recorded reasons',revision:review.revision,at:new Date().toISOString()};
-     if (!review.findings.some(openFinding) && mission.evidence.repair?.outcome === 'active') {
-      mission.evidence.repair = {...evidence, outcome:'skipped'};
-     }
-     await refresh(false);
-     if (nextAction(mission, snapshot, policy(context)).kind === 'complete') {
-      await tryComplete(mission,evidence);
-     }
-    }else if(params.operation==='resend'||params.operation==='release'||params.operation==='reap'){
-     requireBeadsGraph(mission);await refresh(false);
-     // The board's Resend carries no bead: the controller's pending resend step names it, as the status `next` line shows.
-     let beadId=params.beadId;
-     if(!beadId&&params.operation==='resend'){const step=nextAction(mission,snapshot,policy(context));if(step.kind==='resend')beadId=step.ids?.[0];}
-     if(!beadId)throw new Error(params.operation==='resend'?'beadId required: no worker is waiting for a resend':'beadId required');
-     const bead=snapshot?.beads.find(b=>b.id===beadId);if(!bead||snapshot?.error)throw new Error('Fresh mission bead required');
-     if(params.operation==='resend')await driver.resend(mission,beadId,bead,params.detail,params.files);
-     else if(params.operation==='release'){await driver.release(mission,beadId,bead);await refresh(false);}
-     else await driver.reap(mission,beadId,bead);
-    }
+    const triage=reviewTriageAction(mission);if(triage&&!['triage_findings','reject_finding','release','reap'].includes(op))throw new Error(triage.detail);
+    await missionOps[op](mission,call);
     if(epoch!==generation)throw new Error('Session changed during operation');await persist(mission);
    }
    await render();return status(context,true);
-  }catch(error){if(epoch===generation&&mission&&ownership&&reviewStarted){mission.evidence.review={outcome:'failed',detail:String(error),revision:mission.evidence.verify?.revision,at:new Date().toISOString(),attempts:(mission.evidence.review?.attempts??0)+1};measurements(mission).reviewFailures++;await persist(mission);}await render();throw error;}
-  finally{_signal?.removeEventListener('abort',cancelReview);operation=false;operationSignal=undefined;if(epoch===generation){lastWake='';await render();await wakeCoordinator();}}
+  }catch(error){if(epoch===generation&&mission&&ownership&&call.reviewStarted){mission.evidence.review={outcome:'failed',detail:String(error),revision:mission.evidence.verify?.revision,at:new Date().toISOString(),attempts:(mission.evidence.review?.attempts??0)+1};measurements(mission).reviewFailures++;await persist(mission);}await render();throw error;}
+  finally{signal?.removeEventListener('abort',cancelReview);operation=false;operationSignal=undefined;if(epoch===generation){lastWake='';await render();await wakeCoordinator();}}
  }
  pi.registerTool({name:'mission_control',defaultInactive:true,loadMode:'essential',label:'Mission control',description:'Drive approved mission phases/workers/review. Every operation preserves native approvals, Pause gates, resume hold and ownership.',approval:'exec',parameters:controlSchema,execute:async(_id,rawParams,signal,_update,context)=>({content:[{type:'text',text:JSON.stringify(await control(rawParams,context,signal))}],details:{}})});
  pi.registerCommand('mission',{description:'Plan and coordinate work from a ticket or task through verification and review.',getArgumentCompletions:prefix=>{syncCompletions();return missionArgumentCompletions(prefix,completionState);},handler:command});
