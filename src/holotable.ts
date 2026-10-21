@@ -55,6 +55,8 @@ function missionProblem(m: Mission, graphError?: string): MissionProblem | null 
 export interface ReviewStatus {
  startedAt:string; deadlineAt:string; active:number; completed:number; total:number; models:string[];
 }
+/** The coordinator agent in this pane: mid-turn (or about to continue on its own), or idle until someone sends it a message. */
+export interface CoordinatorActivity { state:'working'|'idle'; since:string }
 export interface ContactStatus {
 	schema: 1;
 	id: string;
@@ -87,6 +89,8 @@ export interface ContactStatus {
 	ctl: { socket: string; generation: number } | null;
 	/** The pane's open `ask` while hold is 'question': its tool call id and each question's choices, so the board can answer it. */
 	ask?: { id: string; questions: AskQuestion[] } | null;
+	/** Null until the pane's first coordinator turn starts or ends. */
+	coordinator?: CoordinatorActivity | null;
 	updatedAt: string;
 	/** Identity of the publishing process; owned=false marks a read-only inspection pane. */
 	session?: { id: string; pid: number; processStart: string | null; terminal: string | null; owned: boolean };
@@ -319,6 +323,7 @@ export interface StatusInput {
  measurementConfig?:MeasurementConfig;
  review?:ReviewStatus|null;
  model?:string|null;
+ coordinator?:CoordinatorActivity;
 	planPath?: string;
 	planReview?: boolean;
 	question?: string;
@@ -403,6 +408,7 @@ export async function buildContactStatus(input: StatusInput): Promise<ContactSta
 		session: input.session ? { ...input.session, pid: process.pid, processStart: processStartTicks(process.pid), terminal: process.env.ORCA_TERMINAL_HANDLE ?? null } : undefined,
 		ctl: input.ctl,
 		ask: question && input.ask ? input.ask : null,
+		coordinator: input.coordinator ?? null,
 		usage: input.usage,
   measurements,
   usageEvidence:input.usageEvidence??null,
@@ -449,6 +455,7 @@ export interface HolotableHooks {
 	operation(): boolean;
  measurementConfig?():MeasurementConfig;
  review?():ReviewStatus|null;
+ coordinator?():CoordinatorActivity|undefined;
 	question(): string | undefined;
 	/** The open ask the board may answer: published only while its dialog is on screen. */
 	ask?(): { id: string; questions: AskQuestion[] } | undefined;
@@ -534,6 +541,7 @@ export class HolotableBridge {
    usageEvidence:measured.evidence,
    measurementConfig:this.hooks.measurementConfig?.(),
    review:this.hooks.review?.(),
+   coordinator:this.hooks.coordinator?.(),
    model:(()=>{const model=this.hooks.context()?.model;return model?`${model.provider}/${model.id}`:null;})(),
 			planPath: this.hooks.planPath(),
 			planReview: this.hooks.planReview()?.canApprove === true,

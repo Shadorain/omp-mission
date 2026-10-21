@@ -26,7 +26,7 @@ import { SubagentRunner, subagentPrompt } from './subagent';
 import { copyPlanFile, sourceFilePath, writeSourceFile } from './hosts';
 import { noteSubagentSpawn, noteSubagentToolEnd, noteSubagentToolStart, noteSubagentTurnEnd } from './subagents';
 import { checkToolCall, fingerprintScopes, implementationScopes, isImplementationPath, mutatedPaths, type GuardScope } from './coordinator-guard';
-import { askQuestions, autostartMessage, envBase, envCheckout, envDelivery, envGraph, gateTokenId, HolotableBridge, planRevision, type AskQuestion } from './holotable';
+import { askQuestions, autostartMessage, envBase, envCheckout, envDelivery, envGraph, gateTokenId, HolotableBridge, planRevision, type AskQuestion, type CoordinatorActivity } from './holotable';
 import { installAskBridge, type AskBridge } from './ask-bridge';
 import { foreignDetail, foreignPaths, mergeBaseInto, mergeConflictPaths } from './mergecheck';
 
@@ -49,6 +49,8 @@ export default async function missionExtension(pi: ExtensionAPI) {
  let lifetime=new AbortController();let operationSignal:AbortSignal|undefined;
  let inspectionIntent:{mode?:Mode;reviewRequested?:boolean}={};
  let reviewRows:SubagentRow[]=[];
+ let coordinator:CoordinatorActivity|undefined;
+ const noteCoordinator=(state:CoordinatorActivity['state'])=>{if(coordinator?.state!==state)coordinator={state,since:new Date().toISOString()};};
  let planReview:PlanReviewRequestedEvent|undefined;
  const pendingQuestions=new Map<string,{text:string;questions:AskQuestion[]}>();
  const question=()=>[...pendingQuestions.values()].map(q=>q.text).join(' · ')||undefined;
@@ -142,6 +144,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
     models:[...new Set(running.map(item=>item.model))],
    };
   },
+  coordinator:()=>coordinator,
   sessionInfo:()=>({id:(()=>{const manager=ctx?.sessionManager;const id=typeof manager?.getSessionId==='function'?manager.getSessionId():null;return typeof id==='string'&&id?id:`pid-${process.pid}`;})(),owned:mission?!!ownership&&!ownershipError:true}),
   question,
   ask,
@@ -928,7 +931,9 @@ async function finishMission(context:ExtensionContext){
   }
   await render();
  }
- pi.on('agent_end',async(event)=>{subagents=noteSubagentTurnEnd(subagents);if(!event.willContinue){pendingQuestions.clear();await noteProviderStop(event.messages);}else await render();});
+ pi.on('agent_start',async(_event,context)=>{if(!eligible(context))return;noteCoordinator('working');await publishStatus();});
+ // willContinue: OMP already scheduled the next turn (retry, compaction, awaited async work since 18.12); older OMP omits it, and the next agent_start corrects a premature idle.
+ pi.on('agent_end',async(event,context)=>{if(eligible(context))noteCoordinator(event.willContinue||context.hasPendingMessages()?'working':'idle');subagents=noteSubagentTurnEnd(subagents);if(!event.willContinue){pendingQuestions.clear();await noteProviderStop(event.messages);}else await render();});
  pi.on('turn_start',async()=>{const parked=(mission??pending)?.blocker;const ours=isProviderBlocker(parked);if(ours){if(mission&&isProviderBlocker(mission.blocker))delete mission.blocker;if(pending&&isProviderBlocker(pending.blocker)){delete pending.blocker;pi.appendEntry('mission:pending',pending);}}providerHold=undefined;if(ours&&mission&&ownership&&!resumeHold){try{await persist(mission);}catch{/* the in-memory park is already cleared */}}await render();});
  pi.events.on('mission:query',(request:unknown)=>{
   if(!isRecord(request)||typeof request.cwd!=='string'||typeof request.reply!=='function'||!ctx||!eligible(ctx)||!mission||request.cwd!==ctx.cwd)return;

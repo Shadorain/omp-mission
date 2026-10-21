@@ -279,6 +279,30 @@ test('planning rate limits replace plan approval and clear when a new turn start
  } finally { await run.event('session_shutdown', {}); }
 });
 
+test('the status reports the coordinator mid-turn until its turn ends with nothing scheduled', async () => {
+ // A coordinator that ends its turn asking a plain-text question sits idle in its pane: the board must see that.
+ const mission = baseMission('/tmp');
+ const run = await session({ mission, child: true });
+ try {
+  expect((await statusOf(run, mission)).coordinator).toBeNull();
+  await run.event('agent_start', {});
+  const working = (await statusOf(run, mission)).coordinator!;
+  expect(working.state).toBe('working');
+  await run.event('agent_end', { willContinue: true, messages: [] });
+  expect((await statusOf(run, mission)).coordinator).toEqual(working);
+  let queued = true;
+  Object.assign(run.context, { hasPendingMessages: () => queued });
+  await run.event('agent_end', { willContinue: false, messages: [] });
+  expect((await statusOf(run, mission)).coordinator).toEqual(working);
+  queued = false;
+  setSystemTime(new Date(Date.parse(working.since) + 60_000));
+  await run.event('agent_end', { willContinue: false, messages: [] });
+  expect((await statusOf(run, mission)).coordinator).toEqual({ state: 'idle', since: new Date(Date.parse(working.since) + 60_000).toISOString() });
+  await run.event('agent_start', {});
+  expect((await statusOf(run, mission)).coordinator?.state).toBe('working');
+ } finally { setSystemTime(); await run.event('session_shutdown', {}); }
+});
+
 test('the status builder maps each hold state and the C5 field list', async () => {
 	const cwd = '/tmp';
 	const input = (mission: Mission, over: Partial<Parameters<typeof buildContactStatus>[0]> = {}) => buildContactStatus({
