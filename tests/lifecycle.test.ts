@@ -9,8 +9,8 @@ import { captureRevision } from '../src/review';
 import { loadMission, missionPath, saveMission, workspaceKey } from '../src/store';
 import type { FindingDecision, Graph, Mission, Run } from '../src/types';
 
-type Operation = 'start' | 'clear' | 'continue' | 'bind_graph' | 'triage_findings' | 'accept_repairs' | 'record_verification' | 'record_delivery' | 'run_review' | 'reject_finding';
-type Params = { operation: Operation; decisions?: FindingDecision[]; passed?: boolean; detail?: string; findingId?: string; url?: string; epicId?: string; scopes?: Record<string,string[]> };
+type Operation = 'start' | 'clear' | 'continue' | 'bind_graph' | 'bind_repairs' | 'triage_findings' | 'accept_repairs' | 'record_verification' | 'record_delivery' | 'record_check' | 'run_review' | 'reject_finding' | 'merge_base' | 'resend' | 'release' | 'reap';
+type Params = { operation: Operation; decisions?: FindingDecision[]; passed?: boolean; detail?: string; findingId?: string; url?: string; epicId?: string; scopes?: Record<string,string[]>; repairLinks?: Record<string,string[]>; beadId?: string; files?: string[]; checkState?: string; threads?: { open: number; total: number } };
 type Execute = (id: string, params: Params, signal: undefined, update: undefined, context: ExtensionContext) => Promise<unknown>;
 type EventHandler = (event: unknown, context: ExtensionContext) => Promise<unknown>;
 const noRun: Run = async () => { throw new Error('Unexpected command'); };
@@ -596,5 +596,86 @@ test('legacy repair awaiting its closing review counts toward the resumed budget
   saved.evidence.repair={outcome:'passed',revision:saved.reviews.at(-1)!.revision,detail:'Repair wave verified; closing review pending',at:'now'};
   await saveMission(mission.path,saved);await mission.restore();await mission.command('continue');
   expect((await mission.state()).repairBudget).toBe(1);
+ }finally{await mission.dispose();}
+});
+
+test('bind_repairs requires accepted findings and links every actionable finding to a scoped repair bead',async()=>{
+ const mission=await fixture('beads',true,{resumed:true});
+ try{
+  await mission.command('continue');
+  await expect(mission.execute({operation:'bind_repairs',epicId:'epic',scopes:{leaf:['task.txt']},repairLinks:{leaf:['f']}})).rejects.toThrow('Accept findings before binding repairs');
+  const saved=await mission.state();
+  const {revision}=await captureRevision(saved,noRun);
+  const finding=(id:string)=>({id,severity:'high' as const,path:'task.txt',line:1,title:`Defect ${id}`,body:'Fix task.txt',triage:{disposition:'repair' as const,detail:'task.txt:1 confirmed against the task acceptance'}});
+  saved.phase='repair';saved.repairBudget=2;
+  saved.reviews=[{round:1,revision,summary:'Defects',model:'test',at:'now',findings:[finding('f'),finding('g')]}];
+  saved.evidence={verify:{outcome:'passed',revision,detail:'Verified',at:'now'},deliver:{outcome:'passed',revision,detail:'Delivered',at:'now'},review:{outcome:'passed',revision,detail:'Defects',at:'now'},repair:{outcome:'active',revision,detail:'Repair bead creation authorized',at:'now'}};
+  await saveMission(mission.path,saved);await mission.restore();await mission.command('continue');
+  const bind=(repairLinks?:Record<string,string[]>)=>mission.execute({operation:'bind_repairs',epicId:'epic',scopes:{leaf:['task.txt']},...(repairLinks?{repairLinks}:{})});
+  await expect(mission.execute({operation:'bind_graph',epicId:'epic',scopes:{leaf:['task.txt']}})).rejects.toThrow('Bind accepted review repairs with bind_repairs and exact finding links');
+  await expect(bind()).rejects.toThrow('Finding links required');
+  await expect(bind({leaf:['missing']})).rejects.toThrow('Invalid finding links: leaf');
+  await expect(bind({leaf:['f']})).rejects.toThrow('Every actionable finding needs a repair bead');
+  expect((await mission.state())).toMatchObject({round:1,repairBudget:2,repairLinks:{}});
+  await bind({leaf:['f','g']});
+  const bound=await mission.state();
+  expect(bound).toMatchObject({phase:'repair',round:2,repairBudget:1,repairLinks:{leaf:['f','g']},scopes:{leaf:['task.txt']}});
+  expect(bound.evidence.verify).toBeUndefined();
+  expect(bound.evidence.deliver).toBeUndefined();
+  expect(bound.evidence.review).toBeUndefined();
+  expect(bound.evidence.graph).toMatchObject({outcome:'passed',detail:'Epic epic; scoped leaves leaf'});
+  expect(bound.evidence.repair?.outcome).toBe('active');
+ }finally{await mission.dispose();}
+});
+
+test('resend, release and reap hand the worker driver the fresh bead they name, or the one a pending resend step names',async()=>{
+ const local=await fixture('local');
+ try{await expect(local.execute({operation:'resend',beadId:'leaf'})).rejects.toThrow('Local graph has no bead epic or wave');}
+ finally{await local.dispose();}
+ const mission=await fixture('beads');
+ try{
+  await expect(mission.execute({operation:'resend'})).rejects.toThrow('beadId required: no worker is waiting for a resend');
+  await expect(mission.execute({operation:'release'})).rejects.toThrow(/^beadId required$/);
+  await expect(mission.execute({operation:'reap',beadId:'ghost'})).rejects.toThrow('Fresh mission bead required');
+  // The driver's own refusals prove each op reached it with the named bead and the resend's extra files.
+  await expect(mission.execute({operation:'resend',beadId:'leaf',files:['extra.txt']})).rejects.toThrow('files widens a subagent worker');
+  await expect(mission.execute({operation:'resend',beadId:'leaf'})).rejects.toThrow('resend requires the exact currently ready mission bead');
+  await expect(mission.execute({operation:'release',beadId:'leaf'})).rejects.toThrow('release applies to a running or stopped subagent worker');
+  await expect(mission.execute({operation:'reap',beadId:'leaf'})).rejects.toThrow('no recorded worker terminal to reap');
+  const saved=await mission.state();
+  saved.workers=[{beadId:'leaf',attempt:'a1',cwd:mission.cwd,files:['task.txt'],state:'awaiting-claim',assignment:'Do the leaf',launchedAt:'2020-01-01T00:00:00.000Z'}];
+  await saveMission(mission.path,saved);mission.ready();await mission.restore();await mission.command('continue');
+  await expect(mission.execute({operation:'resend'})).rejects.toThrow('no awaiting-claim worker to resend');
+ }finally{await mission.dispose();}
+});
+
+test('record_check stores a completed mission\'s PR check and rejects incomplete reports',async()=>{
+ const active=await fixture('local');
+ try{await expect(active.execute({operation:'record_check',checkState:'clean',detail:'All green'})).rejects.toThrow('No completed mission to record a check for');}
+ finally{await active.dispose();}
+ const mission=await fixture('local',true,{complete:true});
+ try{
+  await expect(mission.execute({operation:'record_check',checkState:'clean'})).rejects.toThrow('checkState and detail are required');
+  await expect(mission.execute({operation:'record_check',checkState:'threads',detail:'Open',threads:{open:3,total:2}})).rejects.toThrow('threads.open cannot exceed threads.total');
+  await mission.execute({operation:'record_check',checkState:'threads',detail:'  Two review threads open  ',threads:{open:2,total:5}});
+  expect((await mission.state()).check).toMatchObject({state:'threads',detail:'Two review threads open',conflicts:[],threads:{open:2,total:5}});
+  await mission.execute({operation:'record_check',checkState:'clean',detail:'Ready'});
+  expect((await mission.state()).check).toMatchObject({state:'clean',detail:'Ready',conflicts:[],threads:{open:0,total:0}});
+ }finally{await mission.dispose();}
+});
+
+test('merge_base needs a bound Git base and closed workers before it merges',async()=>{
+ const unbound=await fixture('local');
+ try{await expect(unbound.execute({operation:'merge_base'})).rejects.toThrow('Bound Git workspace and base required');}
+ finally{await unbound.dispose();}
+ const mission=await fixture('local',true,{clean:true,mergeConflict:true});
+ try{
+  // Completion reopened verification on the conflict; the operator releases that hold, then the fixture's git refuses the merge itself, which proves the operation reached it.
+  await mission.command('continue');
+  await expect(mission.execute({operation:'merge_base'})).rejects.toThrow('git merge origin/main refused');
+  const saved=await mission.state();
+  saved.workers=[{beadId:'leaf',attempt:'a1',cwd:mission.cwd,files:['task.txt'],state:'running',assignment:'Do the leaf'}];
+  await saveMission(mission.path,saved);await mission.restore();await mission.command('continue');
+  await expect(mission.execute({operation:'merge_base'})).rejects.toThrow('Wait until every worker has closed before merging the base');
  }finally{await mission.dispose();}
 });
