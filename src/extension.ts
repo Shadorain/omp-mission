@@ -289,11 +289,13 @@ export default async function missionExtension(pi: ExtensionAPI) {
   return resolveLocalUrlToPath(`local://${planSlug(pending.source)}-plan.md`,context.localProtocolOptions);
  }
  async function refresh(wake:boolean){
-  if(refreshing||!mission||!mission.epicId||!ctx)return;
+  if(refreshing||!mission||!ctx)return;
   refreshing=true;const epoch=generation;const current=mission;lastPoll=Date.now();
   try{
-   const next=await readGraph(run,current.workspace.cwd,current.epicId!,{BEADS_DIR:current.workspace.beadsDir??''},snapshot);
+   // A local-graph mission has no epic to read, but its timed retries still need this wake.
+   const next=current.epicId?await readGraph(run,current.workspace.cwd,current.epicId,{BEADS_DIR:current.workspace.beadsDir??''},snapshot):undefined;
    if(epoch!==generation||mission!==current)return;
+   if(next){
    snapshot=next;
    if(!next.error){
     for(const worker of current.workers){
@@ -307,6 +309,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
     const audit=selected&&!selected.startsWith('subagent:')&&next.beads.some(bead=>bead.id===selected)?selected:undefined;
     if(audit){try{history=await readHistory(run,current.workspace.cwd,audit,{BEADS_DIR:current.workspace.beadsDir??''});}catch{history=undefined;}}
     if(epoch!==generation)return;
+   }
    }
    await render();if(wake)await wakeCoordinator();
   }catch(error){if(epoch===generation){snapshot=snapshot?{...snapshot,error:String(error)}:{beads:[],leaves:[],ready:[],closed:0,active:0,blocked:0,fetchedAt:0,error:String(error)};await render();}}

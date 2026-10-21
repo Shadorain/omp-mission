@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, expect, setSystemTime, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { appendFile, lstat, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -196,6 +196,28 @@ test('untriaged findings wake the coordinator and do not appear as a blocked rev
   expect(status.actions).not.toContain('review');
   expect(run.sent.at(-1)).toContain('Next: triage');
  }finally{await run.event('session_shutdown',{});}
+});
+
+test('the poll wakes a local-graph mission the way it wakes a beads one', async () => {
+ // A timed review retry has no event to ride on: only the poll notices retryAt has passed. Local-graph
+ // missions (board conflict missions) have no epic, and the poll used to skip them entirely.
+ const mission = baseMission('/tmp', { phase: 'review', reviewRequested: true });
+ const { revision } = await captureRevision(mission, async () => { throw new Error('Unexpected command'); });
+ mission.evidence.verify = { outcome: 'passed', revision, detail: 'Verified output', at: 'now' };
+ mission.evidence.deliver = { ...mission.evidence.verify, detail: 'Delivered output' };
+ mission.reviews = [{ round: 1, revision, model: 'independent', at: 'now', summary: 'Defect', findings: [{ id: 'f', severity: 'high', path: 'task.ts', line: 1, title: 'Payment defect', body: 'A consumer workflow fails' }] }];
+ const run = await session({ mission, child: true });
+ try {
+  let pending = true;
+  Object.assign(run.context, { hasPendingMessages: () => pending });
+  expect((await ctl((await statusOf(run, mission)).ctl!.socket, { v: 1, op: 'continue', operator: true })).ok).toBe(true);
+  expect(run.sent).toEqual([]);
+  pending = false;
+  setSystemTime(new Date(Date.now() + 60_000));
+  await run.poll();
+  for (let i = 0; i < 50 && !run.sent.length; i++) await Bun.sleep(10);
+  expect(run.sent.join('\n')).toContain('Next: triage');
+ } finally { setSystemTime(); await run.event('session_shutdown', {}); }
 });
 
 test('pending questions replace plan approval until the matching tool finishes', async () => {
