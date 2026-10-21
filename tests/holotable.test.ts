@@ -388,6 +388,29 @@ test('usage reads bounded deltas, preserves split UTF8 and counts completed line
  expect(replaced.usage?.tokens.input).toBe(9);expect(replaced.evidence.resets).toBe(2);
 });
 
+test('missing recorded reviewer transcripts stay partial even when other review files survive',async()=>{
+ const root=await realpath(await mkdtemp(join(tmpdir(),'holotable-review-coverage-')));roots.push(root);
+ const mission=baseMission(root),dir=join(root,'missions',mission.workspace.key,'reviews',mission.id);
+ await mkdir(dir,{recursive:true});
+ const kept=join(dir,'kept.jsonl'),missing=join(dir,'missing.jsonl'),checkpoint=join(dir,'checkpoint.jsonl');
+ await writeFile(kept,`${JSON.stringify(usageEntry(10,1,.1))}\n`);
+ mission.reviews=[
+  {round:1,revision:'old',model:'test',summary:'Done',findings:[],at:mission.createdAt,invalidated:'changed',transcripts:{review:missing}},
+  {round:2,revision:'new',model:'test',summary:'Done',findings:[],at:mission.createdAt,transcripts:{review:kept}},
+ ];
+ mission.reviewProgress={round:3,revision:'next',model:'test',inputs:{},targets:{integration:{summary:'Done',findings:[],transcript:checkpoint}},failures:{},at:mission.createdAt};
+ const probe=new UsageProbe(root,()=>1000),coordinator=()=>({sessionFile:'/coordinator',entries:[]});
+ const partial=await probe.measure(mission,coordinator);
+ expect(partial.evidence).toMatchObject({missing:2,partial:true});
+ expect(partial.usage?.tokens.input).toBe(10);
+ await writeFile(missing,`${JSON.stringify(usageEntry(20,2,.2))}\n`);
+ await writeFile(checkpoint,`${JSON.stringify(usageEntry(30,3,.3))}\n`);
+ const recovered=await probe.measure(mission,coordinator,true);
+ expect(recovered.evidence).toMatchObject({missing:0,partial:false});
+ expect(recovered.usage?.tokens.input).toBe(60);
+ expect(recovered.evidence.sources.find(source=>source.role==='review')?.sessions).toBe(3);
+});
+
 test('usage rejects escaped worker paths, reports unsupported workers and malformed or unpriced usage',async()=>{
  const root=await realpath(await mkdtemp(join(tmpdir(),'holotable-usage-')));roots.push(root);
  const mission=baseMission(root),dir=join(root,'missions',mission.workspace.key,'workers');

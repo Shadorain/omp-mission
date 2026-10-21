@@ -228,8 +228,12 @@ export class UsageProbe {
   }
   let reviewNames:string[]=[];
   try{reviewNames=await readdir(reviewDir);}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')evidence.missing++;}
-  for(const name of reviewNames)if(name.endsWith('.jsonl'))await add(join(reviewDir,name),reviewDir,'review');
-  if(![...owned.values()].includes('review')&&mission.evidence.review&&['active','passed','failed'].includes(mission.evidence.review.outcome))evidence.missing++;
+  const reviewPaths=new Set(reviewNames.filter(name=>name.endsWith('.jsonl')).map(name=>join(reviewDir,name)));
+  // Saved rounds and reusable checkpoints remain spend evidence after review invalidation.
+  for(const round of mission.reviews)for(const path of Object.values(round.transcripts??{}))reviewPaths.add(path);
+  for(const target of Object.values(mission.reviewProgress?.targets??{}))if(target.transcript)reviewPaths.add(target.transcript);
+  for(const path of reviewPaths)await add(path,reviewDir,'review');
+  if(!reviewPaths.size&&(mission.reviews.length>0||mission.reviewProgress||mission.evidence.review&&['active','passed','failed'].includes(mission.evidence.review.outcome)))evidence.missing++;
   const paths=[...owned.keys()].sort(),seen=new Set<string>();
   const scratch=paths.length?(this.scratch??={chunk:Buffer.allocUnsafe(64*1024),line:Buffer.allocUnsafe(1024*1024)}):undefined;
   const budget={remaining:4*1024*1024};
