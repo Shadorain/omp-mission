@@ -7,9 +7,10 @@ OMP extension: runs a ticket or task through plan, isolate, graph, execute, veri
 ```bash
 bun test              # full suite
 bun run typecheck     # tsc --noEmit
+bun run format        # biome format --write (formatter only)
 ```
 
-Both MUST pass before a commit, except failures you can show are pre-existing: name them.
+Test and typecheck MUST pass before a commit, except failures you can show are pre-existing: name them. Run `bun run format` first.
 
 ## Map
 
@@ -27,7 +28,7 @@ Both MUST pass before a commit, except failures you can show are pre-existing: n
 - Keep tool results small: shape model-facing output in `src/status.ts`, never return saved mission JSON whole.
 - Pure policy lives in `src/controller.ts`. Side effects stay in `extension.ts`, `workers.ts`, `hosts.ts`.
 - Clean cutover: when a flow changes, migrate every caller and delete the old path. No shims.
-- Match the surrounding file's style. `extension.ts` is dense by convention.
+- Biome owns layout (`bun run format`); otherwise match the surrounding file's style.
 - A change to behavior updates `README.md` and the matching `docs/` file in the same commit.
 
 ## Verification

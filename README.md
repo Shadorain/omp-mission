@@ -225,6 +225,7 @@ cd omp-mission
 bun install
 bun test
 bun run typecheck
+bun run format     # Biome, formatter only: tabs, single quotes, 120 columns
 ```
 
 ## License
