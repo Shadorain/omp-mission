@@ -91,7 +91,11 @@ async function session(options: { plan?: boolean; child?: boolean; autostart?: s
 		modelRegistry: { getAvailable: () => options.models ?? [] },
   sessionManager:{getBranch:()=>branch,getEntries:()=>branch,getSessionName:()=>undefined,getSessionFile:()=>join(root,'coordinator.jsonl'),getSessionId:()=>sessionTag},
 		localProtocolOptions: { getArtifactsDir: () => join(root, 'artifacts'), getSessionId: () => 'test-session' },
-		ui: { notify: (message: string) => { notices.push(message); }, setWidget: () => {} },
+		ui: {
+			notify: (message: string) => { notices.push(message); }, setWidget: () => {},
+			// Like the pane's dialog: it settles only when answered locally or aborted.
+			askDialog: (_questions: unknown, options?: { signal?: AbortSignal }) => new Promise(resolve => options?.signal?.addEventListener('abort', () => resolve(undefined))),
+		},
 		isIdle: () => true, hasPendingMessages: () => false,
 		setInterval: (callback: () => Promise<void>) => { poll = callback; return 1; }, clearTimer: () => {}, setTimeout: () => 1,
 	} as unknown as ExtensionContext;
@@ -194,6 +198,27 @@ test('pending questions replace plan approval until the matching tool finishes',
   expect((await statusOf(run, pending)).hold).toBe('question');
   await run.event('tool_execution_end', { toolName: 'ask', toolCallId: 'question', result: {} });
   expect((await statusOf(run, pending)).hold).toBe('plan-approval');
+ } finally { await run.event('session_shutdown', {}); }
+});
+
+test('the board answers an open ask through the socket while every other op still waits on the question', async () => {
+ const run = await session({ plan: true, child: true, autostart: 'CHR-123' });
+ try {
+  const pending = run.pending()!;
+  const args = { questions: [{ id: 'hub', question: 'Where should the parent hub live?', options: [{ label: 'Here' }, { label: 'There' }], recommended: 1 }] };
+  await run.event('tool_execution_start', { toolName: 'ask', toolCallId: 'q1', args });
+  // The ask tool opens the dialog through the same UI object the extension wrapped.
+  const shown = run.context.ui.askDialog!(args.questions, {});
+  for (let i = 0; i < 100 && !(await statusOf(run, pending)).ask; i++) await Bun.sleep(5);
+  const open = await statusOf(run, pending);
+  expect(open.ask).toEqual({ id: 'q1', questions: [{ question: 'Where should the parent hub live?', options: ['Here', 'There'], recommended: 1, multi: false }] });
+  expect(open.actions).toEqual(['answer']);
+  const socket = open.ctl!.socket;
+  expect((await ctl(socket, { v: 1, op: 'plan-approve', operator: true })).error.code).toBe('question-waiting');
+  expect((await ctl(socket, { v: 1, op: 'answer', operator: true, args: { id: 'q0', answers: [{ option: 0 }] } })).error.code).toBe('stale');
+  expect((await ctl(socket, { v: 1, op: 'answer', operator: true, args: { id: 'q1', answers: [{ option: 9 }] } })).error.code).toBe('rejected');
+  expect(await ctl(socket, { v: 1, op: 'answer', operator: true, args: { id: 'q1', answers: [{ option: 0 }] } })).toMatchObject({ ok: true });
+  expect(await shown).toMatchObject({ kind: 'submit', results: [{ id: 'hub', selectedOptions: ['Here'] }] });
  } finally { await run.event('session_shutdown', {}); }
 });
 

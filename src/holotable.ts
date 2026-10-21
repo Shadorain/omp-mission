@@ -5,6 +5,7 @@ import { createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import type { ExtensionContext, PlanReviewChoice } from '@oh-my-pi/pi-coding-agent';
+import { parseBoardAnswers, type BoardAnswer } from './ask-bridge';
 import { deliverUrl, displayPhase, effectiveGraph, modelRetryTargets, openFinding, operatorCommands, providerCapacity, quotaBlocked, repairBudgetReason, reviewTriageAction, reviewRetryAt } from './controller';
 import { isRecord } from './guards';
 import { displaySourceId } from './sources';
@@ -13,7 +14,7 @@ import { phases, type Evidence, type Frontend, type Mission, type MissionCheck, 
 
 // The holotable fleet contract (omp-holotable/docs/contract.md). Kept local: the repos do not import across.
 export const OPERATOR_OPS = ['approve', 'continue', 'mode', 'review', 'dispatch', 'check', 'resend', 'release', 'reap', 'clear', 'plan-approve', 'retry-model'] as const;
-const SOCKET_OPS: Record<string, true> = { ping: true, approve: true, continue: true, mode: true, review: true, dispatch: true, check: true, resend: true, release: true, reap: true, clear: true, plan: true, 'plan-edit': true, 'plan-refine': true, 'plan-approve': true, 'retry-model': true };
+const SOCKET_OPS: Record<string, true> = { ping: true, answer: true, approve: true, continue: true, mode: true, review: true, dispatch: true, check: true, resend: true, release: true, reap: true, clear: true, plan: true, 'plan-edit': true, 'plan-refine': true, 'plan-approve': true, 'retry-model': true };
 // 1 MiB: a plan-edit request carries up to 256 KiB of text plus JSON escaping overhead.
 const MAX_LINE = 1024 * 1024;
 const MAX_PLAN = 256 * 1024;
@@ -343,7 +344,8 @@ export async function buildContactStatus(input: StatusInput): Promise<ContactSta
 		: m.gate ? 'gate'
 		: m.blocker || graphDown ? 'blocked'
 		: 'none';
-	const actions = question ? [] : input.pending
+	// `ask` is published only while the pane's dialog is open and answerable from outside (ask-bridge.ts).
+	const actions = question ? (input.ask ? ['answer'] : []) : input.pending
 		// plan-approve answers OMP's interactive plan review, never a question or a parked planning turn.
 		? (!m.blocker && input.planReview ? ['plan-approve'] : [])
 		: [...new Set(
@@ -448,7 +450,10 @@ export interface HolotableHooks {
  measurementConfig?():MeasurementConfig;
  review?():ReviewStatus|null;
 	question(): string | undefined;
+	/** The open ask the board may answer: published only while its dialog is on screen. */
 	ask?(): { id: string; questions: AskQuestion[] } | undefined;
+	/** Settle the open ask dialog with the board's answers; returns why it cannot, or undefined. */
+	answerAsk?(answers: BoardAnswer[]): string | undefined;
 	gateId(): string | undefined;
 	decide(context: ExtensionContext, verb: string, arg?: string): Promise<void>;
 	request(context: ExtensionContext, op: string, extra?: Record<string, unknown>): Promise<void>;
@@ -678,8 +683,16 @@ export class HolotableBridge {
 		if (request.operator !== true) return fail('bad-request', 'Operator operations require "operator":true');
 		const context = this.hooks.context();
 		if (!context) return fail('no-session', 'No main-session context is attached');
-		if (this.hooks.question()) return fail('question-waiting', 'Answer the pending question in the mission pane before controlling the mission');
 		const args = (request.args ?? {}) as Record<string, unknown>;
+		if (request.op === 'answer') {
+			const ask = this.hooks.ask?.();
+			if (!ask || args.id !== ask.id) return fail('stale', 'That question is no longer open in the pane');
+			const answers = parseBoardAnswers(args.answers);
+			if (!answers) return fail('bad-request', 'answer requires args.answers: [{option} | {options} | {text}]');
+			const refused = this.hooks.answerAsk ? this.hooks.answerAsk(answers) : 'This pane cannot be answered from outside';
+			return refused ? fail('rejected', refused) : { v: 1, ok: true, revision: revision ?? '' };
+		}
+		if (this.hooks.question()) return fail('question-waiting', 'Answer the pending question in the mission pane before controlling the mission');
 		const op = request.op;
 		try {
 			if (op === 'approve') {
