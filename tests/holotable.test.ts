@@ -16,7 +16,7 @@ import { captureRevision } from '../src/review';
 
 type Handler = (event: unknown, context: ExtensionContext) => Promise<any>;
 const roots: string[] = [];
-const envKeys = ['PI_CODING_AGENT_DIR', 'OMP_HOLOTABLE_CHILD', 'OMP_MISSION_AUTOSTART'] as const;
+const envKeys = ['PI_CODING_AGENT_DIR', 'OMP_HOLOTABLE_CHILD', 'OMP_MISSION_AUTOSTART', 'OMP_MISSION_DELIVERY', 'OMP_MISSION_BASE'] as const;
 const savedEnv = new Map<string, string | undefined>();
 function setEnv(key: (typeof envKeys)[number], value: string | undefined) {
 	if (!savedEnv.has(key)) savedEnv.set(key, process.env[key]);
@@ -62,11 +62,15 @@ function ctl(socket: string, request: unknown): Promise<Record<string, any>> {
 let sessionSeq = 0;
 
 // Real extension, real store; pi.exec/UI faked as in autostart.test.ts.
-async function session(options: { plan?: boolean; child?: boolean; autostart?: string; mission?: Mission; models?: Array<{provider:string;id:string}>; entries?: Array<Record<string, unknown>>; root?: string; beforeLoad?: (root: string) => Promise<void> | void } = {}) {
+async function session(options: { plan?: boolean; child?: boolean; autostart?: string; mission?: Mission; models?: Array<{provider:string;id:string}>; entries?: Array<Record<string, unknown>>; root?: string; beforeLoad?: (root: string) => Promise<void> | void; git?: boolean } = {}) {
 	const root = options.root ?? await realpath(await mkdtemp(join(tmpdir(), 'holotable-')));
 	if (!options.root) roots.push(root);
 	const cwd = join(root, 'workspace');
 	await mkdir(cwd, { recursive: true });
+	if (options.git) {
+		for (const args of [['init', '-q', '-b', 'main'], ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'base']])
+			await Bun.spawn(['git', ...args], { cwd, stdout: 'ignore', stderr: 'ignore' }).exited;
+	}
 	await writeFile(join(root, 'mission.json'), JSON.stringify({ version: 1, graph: 'beads', frontend: 'orca' }));
 	let path: string | undefined;
 	if (options.mission) {
@@ -108,7 +112,11 @@ async function session(options: { plan?: boolean; child?: boolean; autostart?: s
 		sendUserMessage: (message: string) => { sent.push(message); },
 		sendMessage: async () => {}, setSessionName: async () => {},
 		setModel: async (model: ExtensionContext['model']) => { Object.assign(context,{model}); return true; },
-		exec: async (name: string, args: string[]) => {
+		exec: async (name: string, args: string[], opts?: { cwd?: string }) => {
+			if (name === 'git' && options.git) {
+				const proc = Bun.spawn(['git', ...args], { cwd: opts?.cwd ?? cwd, stdout: 'pipe', stderr: 'pipe' });
+				return { code: await proc.exited, stdout: await new Response(proc.stdout).text(), stderr: await new Response(proc.stderr).text() };
+			}
 			if (name === 'git') return { code: 128, stdout: '', stderr: 'not a git repository' };
 			if (name === 'lin') return { code: 0, stdout: JSON.stringify({ issue: { identifier: 'CHR-123', title: 'Startup', description: '', comments: { nodes: [] } } }), stderr: '' };
 			const bd = name === 'env' ? args.indexOf('bd') : name === 'bd' ? 0 : -1;
@@ -130,6 +138,16 @@ async function session(options: { plan?: boolean; child?: boolean; autostart?: s
 		poll: () => poll?.(),
 	};
 }
+
+test('a board-launched local-graph mission plans with the delivery its launch named', async () => {
+ // A conflict mission runs in a git checkout on the local graph: nothing re-binds it, so the launch's
+ // delivery must hold from the start, or record_delivery later demands a PR it was told not to open.
+ const run = await session({ plan: true, child: true, git: true, autostart: '/mission -- Resolve the conflict markers', beforeLoad: () => { setEnv('OMP_MISSION_DELIVERY', 'local'); setEnv('OMP_MISSION_BASE', 'main'); } });
+ try {
+  for (let i = 0; i < 50 && !run.pending(); i++) await Bun.sleep(10);
+  expect(run.pending()?.workspace.delivery).toBe('local');
+ } finally { await run.event('session_shutdown', {}); }
+});
 
 function socketName(missionId: string): string {
 	return `${createHash('sha256').update(missionId).digest('hex').slice(0, 12)}-${process.pid}.sock`;
