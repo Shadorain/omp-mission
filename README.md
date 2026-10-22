@@ -2,7 +2,20 @@
 
 An [OMP](https://github.com/can1357/oh-my-pi) extension that runs one ticket as a supervised **mission**: plan, implement, verify, deliver, get an independent review, repair what the review confirms, and finish. You type `/mission CHR-142`; the OMP session becomes the mission's **coordinator**, works through the phases, and stops at the points where a person must decide. A row above the editor always shows the mission's state and the one command to run next. Missions survive restarts, and their state is saved on disk, so you can stop, resume and inspect them at any time.
 
+![The expanded mission row while two workers implement their beads](docs/screens/running.webp)
+
 ## How it works
+
+The phases are **Plan**, **Isolate**, **Graph**, **Execute**, **Verify**, **Deliver**, **Review**, **Repair** and **Complete**. On the `local` graph (the default) the coordinator implements the change in its own pane, so Isolate and Graph are skipped. On the `beads` graph it binds a checkout, splits the work into scoped beads, and dispatches workers to implement them in waves.
+
+Wherever the mission stops, the row says why and which command moves it on:
+
+![The mission row at a Pause gate before a wave, at a repair gate after review, and once complete](docs/screens/stops.webp)
+
+<details>
+<summary>Lifecycle diagram</summary>
+
+Diamonds are places where the mission waits for you.
 
 ```mermaid
 flowchart TD
@@ -23,7 +36,7 @@ flowchart TD
     triage -->|"escalated or budget spent"| blocked{"Blocked until /mission review"}
 ```
 
-The phases are **Plan**, **Isolate**, **Graph**, **Execute**, **Verify**, **Deliver**, **Review**, **Repair** and **Complete**. Diamonds are places where the mission waits for you. On the `local` graph (the default) the coordinator implements the change in its own pane, so Isolate and Graph are skipped. On the `beads` graph it binds a checkout, splits the work into scoped beads, and dispatches workers to implement them in waves.
+</details>
 
 Review comes from a separate session that did not write the code. The coordinator checks each finding against the requirements and the code before any repair starts. A completed pull-request mission can also be sent back with `/mission check` to merge the base, answer review threads and fix failing CI.
 
@@ -120,6 +133,12 @@ For a ticket, use its ID instead: `/mission CHR-142` (Linear) or `/mission owner
 
 Worker controls (`dispatch`, `focus`, `resend`, `release`, `reap`), flags (`--force`, `--pause`, `--keep`) and shortcuts are in [docs/reference.md](docs/reference.md).
 
+Bare `/mission` opens the action menu: only the commands valid now, with the next step preselected. Tab after `/mission ` lists the next step first and says when to use each command.
+
+![The /mission action menu at a Pause gate, with approve preselected](docs/screens/menu.webp)
+
+![Tab completion after /mission, with approve listed first as the next step](docs/screens/completion.webp)
+
 ## Configuration
 
 Settings live in `~/.omp/agent/mission.json`; `/mission config` shows them and sets most of them.
@@ -204,6 +223,7 @@ bun install
 bun test
 bun run typecheck
 bun run format     # Biome, formatter only: tabs, single quotes, 120 columns
+bun run screens    # recapture docs/screens/ from the real TUI (needs omp, bd and Chromium)
 ```
 
 Contributor rules are in [AGENTS.md](AGENTS.md).

@@ -68,11 +68,15 @@ Commands you type run directly, with no model turn: typing the command is the ap
 
 **Not sure what to run? Type `/mission`.** On an active mission it opens the action menu: only commands valid right now, the next step first (`▸`) and preselected. Completed missions put `show` first and preselect it; `clear` remains an explicit start-over choice.
 
+![The /mission action menu at a Pause gate, with approve preselected](screens/menu.webp)
+
 `continue` is not a next-step command. It takes control of a saved mission after an OMP restart or resume. Until you run it, `approve`, `review` and `dispatch` stay read-only. `review` and `mode` are queued and applied by `continue`.
 
 ### Autocomplete
 
 Tab completes the next argument and lists the next-step command first. Autocomplete keeps `show`, `config` and `history` visible. `continue`, `approve`, `review`, `mode` and `clear` appear only when relevant. Worker controls (`focus`, `resend`, `release`, `dispatch`, `reap`) stay out of the first-word suggestions, but the one the widget recommends is listed there and in the action menu without selecting a bead first. The others remain directly callable, and their arguments still complete when typed. Ticket IDs complete once you type a prefix. The bare `/mission` menu holds commands and flags only.
+
+![Tab completion after /mission, with approve listed first as the next step](screens/completion.webp)
 
 ### History
 
@@ -93,6 +97,10 @@ The row above the editor is the live state. The line under it shows the next act
 The compact row shows the ticket, phase, mode and actionable status. Session names and rows omit source prefixes such as `linear:`; custom session names are preserved. Source, frontend, graph, native plan state and the expand shortcut appear in the expanded row and inspector instead. The inspector hides the editor row while open.
 
 The header labels dependency-waiting beads as **waiting** with a neutral indicator. Only explicitly blocked beads use the error indicator; waiting for another worker is not a failed task. Phase labels follow recorded verification and delivery, so a review-ready mission shows **Review**, not **Execute**.
+
+`/mission show` (or `ctrl+shift+f`) opens the inspector. Tab cycles its views: the bead outline, the selected bead's history, and the evidence for each phase with the review's findings and their triage.
+
+![The inspector's outline view at a Pause gate, and its evidence view at a repair gate](screens/inspector.webp)
 
 ### Shortcuts
 
