@@ -17,9 +17,13 @@ Test and typecheck MUST pass before a commit, except failures you can show are p
 |Area|Read|
 |---|---|
 |Phases, gates, ownership, graphs, tool surface|@docs/architecture.md|
-|Worker launch, Orca/Herdr transport|@docs/workers.md|
+|Worker frontends, launch, Orca/Herdr transport|@docs/workers.md|
 |Running the extension for real, safely|@docs/runtime-smoke.md|
-|User-facing behavior, config keys|`README.md`|
+|Overview, install, quick start, safety model|`README.md`|
+|Commands, flags, config keys, env vars|@docs/reference.md|
+|Phase behavior, holds, recovery (user-facing)|@docs/lifecycle.md|
+|Review, triage, repair budget (user-facing)|@docs/review.md|
+|Status file, control socket, Holotable seam (user-facing)|@docs/holotable.md|
 
 ## Rules
 
