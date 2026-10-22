@@ -25,6 +25,7 @@ import { displaySourceId } from './sources';
 import { missionDirectory } from './store';
 import {
 	phases,
+	type Bead,
 	type Evidence,
 	type Frontend,
 	type Mission,
@@ -136,6 +137,109 @@ function missionProblem(m: Mission, graphError?: string): MissionProblem | null 
 		total: source === 'review' && m.reviewProgress ? Object.keys(m.reviewProgress.inputs).length : null,
 	};
 }
+
+/** The contract's cap on the serialized `report` group. */
+const REPORT_BYTES = 8 * 1024;
+const LEAF_STATE: Partial<Record<Bead['category'], 'done' | 'dropped'>> = { closed: 'done', deferred: 'dropped' };
+export interface MissionReport {
+	v: 1;
+	/** Newest evidence the report reflects, so republishing an unchanged mission does not move it. */
+	at: string;
+	revision: string | null;
+	summary: string | null;
+	work: { title: string; state: 'done' | 'open' | 'dropped' }[];
+	verification: { outcome: 'passed' | 'failed' | null; detail: string | null; revision: string | null };
+	review: {
+		rounds: number;
+		findings: number;
+		repaired: number;
+		rejected: number;
+		deferred: number;
+		escalated: number;
+	} | null;
+	followUps: { title: string; severity: string | null; source: 'deferred' | 'escalated' }[];
+	delivery: { outcome: string | null; url: string | null };
+	truncated?: true;
+}
+
+/**
+ * The mission's final report for the board card: delivery summary, graph leaves, verification, review
+ * triage and the findings left for later. Null until verification or delivery evidence exists.
+ * `work` is empty on the local graph (no leaves) and until a beads pane has read its graph.
+ */
+export function missionReport(m: Mission, snapshot: Snapshot | undefined): MissionReport | null {
+	const { deliver, verify } = m.evidence;
+	if (!deliver && !verify) return null;
+	let truncated = false;
+	const clip = (text: string, max: number) => {
+		if (text.length <= max) return text;
+		truncated = true;
+		return `${text.slice(0, max)}…`;
+	};
+	const url = deliverUrl(m);
+	// record_delivery stores `<url>\n<detail>` when it was given a PR URL.
+	const summary = (url ? deliver!.detail.split('\n').slice(1).join('\n') : (deliver?.detail ?? '')).trim();
+	const rounds = m.reviews.filter(round => !round.invalidated);
+	const counts = { repaired: 0, rejected: 0, deferred: 0, escalated: 0 };
+	let findings = 0;
+	const followUps: MissionReport['followUps'] = [];
+	const seen = new Set<string>();
+	for (const round of rounds)
+		for (const finding of round.findings) {
+			findings++;
+			const disposition = finding.rejection ? 'reject' : finding.triage?.disposition;
+			if (disposition === 'repair') counts.repaired++;
+			else if (disposition === 'reject') counts.rejected++;
+			else if (disposition === 'defer' || disposition === 'escalate') {
+				const source = disposition === 'defer' ? 'deferred' : 'escalated';
+				counts[source]++;
+				const key = `${finding.path}\0${finding.title.trim().toLowerCase().replace(/\s+/g, ' ')}`;
+				if (seen.has(key)) continue;
+				seen.add(key);
+				followUps.push({
+					title: clip(finding.title.replace(/\s+/g, ' ').trim(), 200),
+					severity: finding.severity,
+					source,
+				});
+			}
+		}
+	const leaves = snapshot?.leaves ?? [];
+	if (leaves.length > 40 || followUps.length > 20) truncated = true;
+	const report: MissionReport = {
+		v: 1,
+		at: [deliver?.at, verify?.at, ...rounds.map(round => round.at)].filter(Boolean).sort().at(-1)!,
+		revision: deliver?.revision ?? verify?.revision ?? null,
+		summary: summary ? clip(summary, 2000) : null,
+		work: leaves.slice(0, 40).map(bead => ({
+			title: clip(bead.title.replace(/\s+/g, ' ').trim(), 200),
+			state: LEAF_STATE[bead.category] ?? 'open',
+		})),
+		verification: {
+			outcome: verify?.outcome === 'passed' || verify?.outcome === 'failed' ? verify.outcome : null,
+			detail: verify?.detail.trim() ? clip(verify.detail.trim(), 1000) : null,
+			revision: verify?.revision ?? null,
+		},
+		review: rounds.length ? { rounds: rounds.length, findings, ...counts } : null,
+		followUps: followUps.slice(0, 20),
+		delivery: { outcome: deliver?.outcome ?? null, url },
+	};
+	if (truncated) report.truncated = true;
+	// Lists lose their tails first, then the long texts are halved; a few entries of each list outlive the prose.
+	while (Buffer.byteLength(JSON.stringify(report)) > REPORT_BYTES) {
+		const longer = report.work.length >= report.followUps.length ? report.work : report.followUps;
+		const { verification } = report;
+		if (longer.length > 5) longer.pop();
+		else if (report.summary && report.summary.length > 200)
+			report.summary = clip(report.summary, report.summary.length >> 1);
+		else if (verification.detail && verification.detail.length > 200)
+			verification.detail = clip(verification.detail, verification.detail.length >> 1);
+		else if (longer.length) longer.pop();
+		else if (report.delivery.url) report.delivery.url = null;
+		else break;
+		report.truncated = true;
+	}
+	return report;
+}
 export interface ReviewStatus {
 	startedAt: string;
 	deadlineAt: string;
@@ -185,6 +289,8 @@ export interface ContactStatus {
 	coordinator?: CoordinatorActivity | null;
 	/** The pane's open tool-approval prompt while hold is 'question': an id for this prompt, what it would allow, and its choices. */
 	approval?: OpenApproval | null;
+	/** The mission's final report; null until it has verification or delivery evidence. */
+	report?: MissionReport | null;
 	updatedAt: string;
 	/** Identity of the publishing process; owned=false marks a read-only inspection pane. */
 	session?: { id: string; pid: number; processStart: string | null; terminal: string | null; owned: boolean };
@@ -747,6 +853,7 @@ export async function buildContactStatus(input: StatusInput): Promise<ContactSta
 		revision: m.updatedAt,
 		mode: m.mode ?? null,
 		verify: m.evidence.verify?.outcome ?? null,
+		report: missionReport(m, input.snapshot),
 		problem: missionProblem(m, graphDown ? input.snapshot?.error : undefined),
 		review: input.review ?? null,
 		model: input.model ?? null,

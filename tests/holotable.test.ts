@@ -19,10 +19,11 @@ import {
 	planRevision,
 	sumAssistantUsage,
 	UsageProbe,
+	missionReport,
 	type ContactStatus,
 } from '../src/holotable';
 import { planSlug } from '../src/prompts';
-import type { Mission } from '../src/types';
+import type { Bead, Finding, Mission, Snapshot } from '../src/types';
 import { QUOTA_BLOCKER } from '../src/controller';
 import { captureRevision } from '../src/review';
 
@@ -1734,6 +1735,171 @@ test('a completed mission with a delivered PR advertises check and publishes its
 		threads: { open: 2, total: 3 },
 	};
 	expect((await input(prMission(cwd, { check }))).check).toEqual(check);
+});
+
+const leaf = (id: string, category: Bead['category'], title = `Leaf ${id}`): Bead => ({
+	id,
+	title,
+	status: category,
+	children: [],
+	ready: false,
+	category,
+});
+const leafSnapshot = (leaves: Bead[]): Snapshot => ({
+	beads: leaves,
+	leaves,
+	ready: [],
+	closed: leaves.filter(bead => bead.category === 'closed').length,
+	active: 0,
+	blocked: 0,
+	fetchedAt: 0,
+});
+const finding = (id: string, over: Partial<Finding> = {}): Finding => ({
+	id,
+	severity: 'medium',
+	path: `src/${id}.ts`,
+	line: 1,
+	title: `Finding ${id}`,
+	body: '',
+	...over,
+});
+
+test('the final report maps delivery, verification, review triage and leaves', () => {
+	const mission = prMission('/tmp', {
+		graph: 'beads',
+		evidence: {
+			verify: { outcome: 'passed', detail: 'bun test: 412 pass', revision: 'rev2', at: '2026-10-20T10:00:00.000Z' },
+			deliver: {
+				outcome: 'passed',
+				detail: `${PR_URL}\nAdds typed ids.\nVerified with bun test.`,
+				revision: 'rev2',
+				at: '2026-10-20T11:00:00.000Z',
+			},
+		},
+		reviews: [
+			{
+				round: 1,
+				revision: 'rev1',
+				model: 'm',
+				summary: '',
+				at: '2026-10-20T09:00:00.000Z',
+				findings: [
+					finding('a', { severity: 'high', triage: { disposition: 'repair', detail: 'real' } }),
+					finding('b', { rejection: 'speculative' }),
+					finding('c', { severity: 'low', triage: { disposition: 'defer', detail: 'advisory' } }),
+				],
+			},
+			{
+				round: 2,
+				revision: 'rev2',
+				model: 'm',
+				summary: '',
+				at: '2026-10-20T10:30:00.000Z',
+				findings: [
+					finding('d', { triage: { disposition: 'reject', detail: 'already fixed' } }),
+					finding('e', { severity: 'critical', triage: { disposition: 'escalate', detail: 'spec conflict' } }),
+					// The same deferred note reported again is one follow-up.
+					finding('c2', {
+						path: 'src/c.ts',
+						title: 'Finding  c',
+						severity: 'low',
+						triage: { disposition: 'defer', detail: 'again' },
+					}),
+				],
+			},
+			{
+				round: 3,
+				revision: 'old',
+				model: 'm',
+				summary: '',
+				at: '2026-10-21T00:00:00.000Z',
+				invalidated: 'files changed',
+				findings: [finding('x')],
+			},
+		],
+	});
+	const snapshot = leafSnapshot([leaf('l1', 'closed'), leaf('l2', 'active'), leaf('l3', 'deferred')]);
+	expect(missionReport(mission, snapshot)).toEqual({
+		v: 1,
+		at: '2026-10-20T11:00:00.000Z',
+		revision: 'rev2',
+		summary: 'Adds typed ids.\nVerified with bun test.',
+		work: [
+			{ title: 'Leaf l1', state: 'done' },
+			{ title: 'Leaf l2', state: 'open' },
+			{ title: 'Leaf l3', state: 'dropped' },
+		],
+		verification: { outcome: 'passed', detail: 'bun test: 412 pass', revision: 'rev2' },
+		review: { rounds: 2, findings: 6, repaired: 1, rejected: 2, deferred: 2, escalated: 1 },
+		followUps: [
+			{ title: 'Finding c', severity: 'low', source: 'deferred' },
+			{ title: 'Finding e', severity: 'critical', source: 'escalated' },
+		],
+		delivery: { outcome: 'passed', url: PR_URL },
+	});
+});
+
+test('an oversize report trims list tails and clips text to fit 8 KiB', () => {
+	const mission = prMission('/tmp', {
+		evidence: {
+			verify: { outcome: 'failed', detail: 'é'.repeat(5000), revision: 'rev', at: 'now' },
+			deliver: { outcome: 'passed', detail: `${PR_URL}\n${'ü'.repeat(5000)}`, revision: 'rev', at: 'now' },
+		},
+		reviews: [
+			{
+				round: 1,
+				revision: 'rev',
+				model: 'm',
+				summary: '',
+				at: 'now',
+				findings: Array.from({ length: 30 }, (_, i) =>
+					finding(`f${i}`, { title: 'ä'.repeat(300), triage: { disposition: 'defer', detail: 'later' } }),
+				),
+			},
+		],
+	});
+	const snapshot = leafSnapshot(Array.from({ length: 60 }, (_, i) => leaf(`l${i}`, 'closed', 'ö'.repeat(300))));
+	const report = missionReport(mission, snapshot)!;
+	expect(Buffer.byteLength(JSON.stringify(report))).toBeLessThanOrEqual(8 * 1024);
+	expect(report.truncated).toBe(true);
+	expect(report.work.length).toBeGreaterThan(0);
+	expect(report.followUps.length).toBeGreaterThan(0);
+	expect(report.review).toMatchObject({ findings: 30, deferred: 30 });
+	expect(report.delivery.url).toBe(PR_URL);
+});
+
+test('a mission without verification or delivery evidence publishes no report', async () => {
+	const mission = baseMission('/tmp', { reviews: [] });
+	expect(missionReport(mission, leafSnapshot([leaf('l1', 'closed')]))).toBeNull();
+	const status = await buildContactStatus({
+		mission,
+		pending: false,
+		resumeHold: false,
+		snapshot: undefined,
+		policy: idlePolicy,
+		step: undefined,
+		owned: true,
+		selected: undefined,
+		operation: false,
+		ctl: null,
+		usage: null,
+	});
+	expect(status.report).toBeNull();
+});
+
+test('the status file publishes the final report of a delivered mission', async () => {
+	const mission = prMission('/tmp');
+	const run = await session({ mission });
+	try {
+		expect((await statusOf(run, mission)).report).toMatchObject({
+			v: 1,
+			summary: 'delivered',
+			verification: { outcome: 'passed', detail: 'ok', revision: 'rev' },
+			delivery: { outcome: 'passed', url: PR_URL },
+		});
+	} finally {
+		await run.event('session_shutdown', {});
+	}
 });
 
 test('check over the socket marks the PR fixing, asks the pane, and record_check lands the outcome', async () => {

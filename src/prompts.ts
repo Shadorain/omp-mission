@@ -48,7 +48,8 @@ const HINTS: Partial<Record<Action['kind'], string>> = {
 	resend:
 		'Inspect the worker, then mission_control resend once. Stopped on edits outside its allowed paths that the leaf needs: pass files to widen its scope. Otherwise say in detail what to change. A second failure with the same cause is a blocker.',
 	verify: 'Run the repository gate and record_verification. passed=false stops the mission.',
-	deliver: 'Deliver against the bound base. Refs, never Closes/Fixes. record_delivery. Linear: lin only, never Done.',
+	deliver:
+		'Deliver against the bound base. Refs, never Closes/Fixes. record_delivery with detail as the reader-facing summary the board shows: what changed, why, and what was verified, in a few short lines; no logs or command output. Linear: lin only, never Done.',
 	review: 'The extension runs run_review. /mission review retries a failure. Do not self-review.',
 	triage:
 		'Read mission_status for the current findings. Validate each against the mission requirements, current code and prior repair evidence; this is adjudicating claims, not replacing independent review. Record mission_control triage_findings with decisions [{findingId, disposition: repair|reject|defer|escalate, detail, previousFindingId?}] for every pending finding exactly once. Cite file:line and reproduction/spec evidence in detail. Reject speculative, cosmetic, duplicate or already-fixed claims only with concrete reasons. Defer a medium finding that breaks no acceptance criterion and no main consumer path; it becomes an advisory PR note. Critical and high findings cannot be deferred; low ones are deferred automatically. Confirmed defects stay open. Link a recurring defect to its previous confirmed finding id even if its title changed. Escalate an unresolved requirement conflict or inability to establish a safe repair, not the raw round count. Do not create repair beads until triage is recorded.',
