@@ -18,6 +18,10 @@ The `none`, `orca`, `herdr` and `custom` frontends start a separate `omp` proces
 
 A worker never stalls a mission silently. If its terminal disappears while the bead is unclaimed, the dead record is replaced automatically and the next action becomes `dispatch`. A live worker that has not claimed its bead within 3 minutes surfaces as `resend`, answered by one `resend` after inspecting the tab. A resume hold blocks both until `/mission continue`.
 
+### Background (`none`)
+
+The `none` frontend runs `omp -p --wait-async`. OMP waits for async shell jobs owned by the worker and delivers their completion results and follow-up turns before the process exits, so a worker can finish work started asynchronously instead of losing it when its initial turn ends.
+
 ### Orca
 
 Workers receive the full multiline assignment through OMP's startup `@file` argument, not a composer paste. The assignment is short: bead, paths, rules. The ticket text is written once per mission to a shared file the worker reads only when the bead lacks context. `/mission focus <bead-id>` reads the persisted worker identity before switching tabs.

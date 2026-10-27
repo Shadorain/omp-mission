@@ -92,7 +92,7 @@ For a ticket, use its ID instead: `/mission CHR-142` (Linear) or `/mission owner
 | Graph | How the work is split. `local`: the coordinator works in its pane. `beads`: an epic of scoped beads run by workers. |
 | Bead | One task in the beads graph. Implementation beads (leaves) carry a **scope**: the files they may change. |
 | Worker | A session that implements one bead. |
-| Frontend | Where workers run: `none` (background `omp -p`), `orca`, `herdr`, `custom` or `subagent`. |
+| Frontend | Where workers run: `none` (background `omp -p` with `--wait-async` so async job results arrive before exit), `orca`, `herdr`, `custom` or `subagent`. |
 | Wave | A set of ready beads with non-overlapping scopes, started together. |
 | Mode | `auto`, `pause` or `force`; see [Modes](#modes). |
 | Gate | A Pause-mode stop before a wave, a review or a repair. `/mission approve` clears it. |

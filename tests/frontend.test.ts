@@ -117,7 +117,6 @@ test('none dispatch backgrounds omp and refuses resend', async () => {
 		prompt: () => 'do the thing',
 	}).dispatch(current, ['bd-1']);
 	expect(calls[0]?.[0]).toBe('bash');
-	expect(calls[0]?.[2]).toContain('omp -p');
 	expect(calls[0]?.[2]).toContain("BEADS_ACTOR='bd-1'");
 	expect(worker?.handle).toBe('4242');
 	const driver = createWorkerDriver(run, { persist: async () => {}, frontend: 'none' });

@@ -174,7 +174,7 @@ export async function spawnBackground(
 		`export BEADS_ACTOR=${shellQuote(worker.beadId)}`,
 		...(mission.workspace.beadsDir ? [`export BEADS_DIR=${shellQuote(mission.workspace.beadsDir)}`] : []),
 		...(agentDir ? [`export PI_CODING_AGENT_DIR=${shellQuote(agentDir)}`] : []),
-		`omp${model ? ` --model ${shellQuote(model)}` : ''} -p "$(cat ${shellQuote(promptFile)})" >${shellQuote(logFile)} 2>&1 & echo $!`,
+		`omp${model ? ` --model ${shellQuote(model)}` : ''} --wait-async -p "$(cat ${shellQuote(promptFile)})" >${shellQuote(logFile)} 2>&1 & echo $!`,
 	].join('; ');
 	const result = await run('bash', ['-c', script], worker.cwd);
 	fail(result, 'background omp');
