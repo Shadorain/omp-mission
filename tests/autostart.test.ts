@@ -150,7 +150,7 @@ test('ordinary turns and plan-mode turns never start a pending mission', async (
 	).toBeUndefined();
 	const planning = {
 		...run.context,
-		sessionManager: { getBranch: () => [{ type: 'mode_change', mode: 'plan' }], getSessionName: () => undefined },
+		sessionModes: { getState: () => ({ plan: { status: 'active' } }) },
 	} as unknown as ExtensionContext;
 	expect(await run.events.get('before_agent_start')!(approved, planning)).toBeUndefined();
 });

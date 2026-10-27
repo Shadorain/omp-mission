@@ -108,6 +108,10 @@ let sessionSeq = 0;
 async function session(
 	options: {
 		plan?: boolean;
+		modeRefusal?: 'busy' | 'conflict' | 'disabled' | 'invalid_request';
+		busyAttempts?: number;
+		disableNativeModes?: boolean;
+		deferStartup?: boolean;
 		child?: boolean;
 		autostart?: string;
 		mission?: Mission;
@@ -143,9 +147,45 @@ async function session(
 	let command: ((args: string, context: ExtensionContext) => Promise<void>) | undefined;
 	let active: string[] = [];
 	let poll: (() => Promise<void>) | undefined;
+	let planStatus: 'active' | 'inactive' | 'paused' = options.plan ? 'active' : 'inactive';
+	let modeAttempts = 0;
+	const modeAttemptWaiters: Array<{ count: number; resolve: () => void }> = [];
+	const waitForModeAttempts = (count: number) =>
+		modeAttempts >= count
+			? Promise.resolve()
+			: new Promise<void>(resolve => modeAttemptWaiters.push({ count, resolve }));
+	const modeState = () => ({
+		plan: { status: planStatus },
+		vibe: { status: 'inactive' as const },
+		goal: { status: 'inactive' as const },
+		loop: { status: 'inactive' as const },
+	});
+	const sessionModes = options.disableNativeModes
+		? undefined
+		: {
+				getState: modeState,
+				set: async () => {
+					modeAttempts++;
+					for (let index = modeAttemptWaiters.length - 1; index >= 0; index--) {
+						const waiter = modeAttemptWaiters[index]!;
+						if (modeAttempts >= waiter.count) {
+							modeAttemptWaiters.splice(index, 1);
+							waiter.resolve();
+						}
+					}
+					if (modeAttempts <= (options.busyAttempts ?? 0))
+						return { ok: false as const, code: 'busy' as const, message: 'fixture busy', state: modeState() };
+					if (options.modeRefusal)
+						return { ok: false as const, code: options.modeRefusal, message: 'fixture refusal', state: modeState() };
+					planStatus = 'active';
+					return { ok: true as const, changed: true, state: modeState() };
+				},
+			};
+	const timers = new Map<number, () => void | Promise<void>>();
+	let timerWake: (() => void) | undefined;
+	let nextTimer = 1;
 	const branch: Array<Record<string, unknown>> = [
 		...(path ? [{ type: 'custom', customType: 'mission:pointer', data: { path } }] : []),
-		...(options.plan ? [{ type: 'mode_change', mode: 'plan' }] : []),
 		...(options.entries ?? []),
 	];
 	const context = {
@@ -160,7 +200,8 @@ async function session(
 			getSessionFile: () => join(root, 'coordinator.jsonl'),
 			getSessionId: () => sessionTag,
 		},
-		localProtocolOptions: { getArtifactsDir: () => join(root, 'artifacts'), getSessionId: () => 'test-session' },
+		localProtocolOptions: { getArtifactsDir: () => join(root, 'artifacts'), getSessionId: () => sessionTag },
+		sessionModes,
 		ui: {
 			notify: (message: string) => {
 				notices.push(message);
@@ -178,11 +219,18 @@ async function session(
 			poll = callback;
 			return 1;
 		},
-		clearTimer: () => {},
-		setTimeout: () => 1,
+		clearTimer: (timer: number) => {
+			timers.delete(timer);
+		},
+		setTimeout: (callback: () => void | Promise<void>) => {
+			const id = ++nextTimer;
+			timers.set(id, callback);
+			timerWake?.();
+			return id;
+		},
 	} as unknown as ExtensionContext;
 	const api = {
-		pi: { VERSION: '18.12.5' },
+		pi: { VERSION: '18.13.2' },
 		registerTool: () => {},
 		registerShortcut: () => {},
 		registerCommand: (_name: string, spec: { handler: typeof command }) => {
@@ -236,6 +284,36 @@ async function session(
 	await options.beforeLoad?.(root);
 	await missionExtension(api);
 	await events.get('session_start')!({}, context);
+	const flush = async () => {
+		const callbacks: Promise<void>[] = [];
+		while (true) {
+			if (timers.size) {
+				const pendingTimers = [...timers.values()];
+				timers.clear();
+				callbacks.push(...pendingTimers.map(callback => Promise.resolve(callback())));
+				continue;
+			}
+			if (!callbacks.length) return;
+			let notifyTimer!: () => void;
+			const timerScheduled = new Promise<void>(resolve => (notifyTimer = resolve));
+			timerWake = notifyTimer;
+			let callbacksDone = false;
+			const done = Promise.all(callbacks).then(() => {
+				callbacksDone = true;
+			});
+			await Promise.race([done, timerScheduled]);
+			timerWake = undefined;
+			if (callbacksDone && !timers.size) return;
+		}
+	};
+	const tickTimer = () => {
+		const timer = timers.entries().next().value;
+		if (!timer) return;
+		const [id, callback] = timer;
+		timers.delete(id);
+		return callback();
+	};
+	if (!options.deferStartup) await flush();
 	return {
 		root,
 		cwd,
@@ -249,8 +327,17 @@ async function session(
 			branch.find(entry => entry.type === 'custom' && entry.customType === 'mission:pending')?.data as
 				| Mission
 				| undefined,
-		event: (name: string, event: unknown) => events.get(name)!(event, context),
+		event: (name: string, event: unknown, eventContext: ExtensionContext = context) =>
+			events.get(name)!(event, eventContext),
 		poll: () => poll?.(),
+		flush,
+		tickTimer,
+		modeAttempts: () => modeAttempts,
+		waitForModeAttempts,
+		modeState,
+		setPlanStatus: (status: 'active' | 'inactive' | 'paused') => {
+			planStatus = status;
+		},
 	};
 }
 
@@ -1162,16 +1249,67 @@ test('without OMP_HOLOTABLE_CHILD there is no control socket', async () => {
 	await run.event('session_shutdown', {});
 });
 
-test('OMP_MISSION_AUTOSTART creates the pending plan under plan mode; without it the launch is refused', async () => {
-	const planned = await session({ plan: true, autostart: '/mission -- board demo' });
+test('autostart enters native plan mode; structured refusal creates no mission', async () => {
+	const planned = await session({ autostart: '/mission -- board demo' });
+	expect(planned.modeState().plan.status).toBe('active');
 	expect(planned.pending()?.phase).toBe('plan');
-	const refused = await session({ autostart: '/mission -- board demo' });
+	expect(planned.sent.length).toBeGreaterThan(0);
+	const refused = await session({ autostart: '/mission -- board demo', modeRefusal: 'conflict' });
 	expect(refused.pending()).toBeUndefined();
-	// Outside plan mode the retry defers, and the same refusal fires from a direct call.
-	await refused.command('-- board demo');
-	expect(refused.notices.some(n => n.includes('/plan /mission'))).toBe(true);
+	expect(refused.sent).toHaveLength(0);
+	expect(refused.notices.some(n => n.includes('Cannot enter native plan mode (conflict): fixture refusal'))).toBe(true);
+	for (const code of ['busy', 'conflict', 'disabled', 'invalid_request'] as const) {
+		const direct = await session({ modeRefusal: code });
+		await direct.command('-- board demo');
+		expect(direct.pending()).toBeUndefined();
+		expect(direct.sent).toHaveLength(0);
+		expect(direct.notices.some(n => n.includes(`Cannot enter native plan mode (${code}): fixture refusal`))).toBe(true);
+		await direct.event('session_shutdown', {});
+	}
+	const absent = await session({ disableNativeModes: true });
+	await absent.command('-- board demo');
+	expect(absent.pending()).toBeUndefined();
+	expect(absent.sent).toHaveLength(0);
+	expect(absent.notices.some(n => n.includes('Native plan mode control requires OMP 18.13.2'))).toBe(true);
+	await absent.event('session_shutdown', {});
 	await planned.event('session_shutdown', {});
 	await refused.event('session_shutdown', {});
+});
+
+test('deferred autostart retries busy mode entry and cancels cleanly on shutdown', async () => {
+	const ready = await session({ autostart: '/mission -- retry demo', busyAttempts: 2 });
+	expect(ready.modeAttempts()).toBe(3);
+	expect(ready.pending()?.phase).toBe('plan');
+	await ready.event('session_shutdown', {});
+
+	const exhausted = await session({ autostart: '/mission -- retry demo', modeRefusal: 'busy' });
+	expect(exhausted.modeAttempts()).toBe(50);
+	expect(exhausted.pending()).toBeUndefined();
+	expect(exhausted.sent).toHaveLength(0);
+	expect(exhausted.notices.filter(notice => notice.includes('Cannot enter native plan mode (busy)'))).toHaveLength(1);
+	await exhausted.event('session_shutdown', {});
+
+	const switching = await session({ autostart: '/mission -- cancelled demo', busyAttempts: 2, deferStartup: true });
+	const startup = switching.tickTimer();
+	await switching.waitForModeAttempts(1);
+	expect(switching.modeAttempts()).toBe(1);
+	await switching.event('session_shutdown', {});
+	await startup;
+	await switching.flush();
+	expect(switching.pending()).toBeUndefined();
+	expect(switching.sent).toHaveLength(0);
+	expect(switching.modeAttempts()).toBe(1);
+});
+
+test('mode_changed renders current state from a fresh context without approving or starting the pending plan', async () => {
+	const run = await session({ autostart: '/mission -- board demo' });
+	const pending = run.pending();
+	const sent = [...run.sent];
+	run.setPlanStatus('inactive');
+	await run.event('mode_changed', {}, { ...run.context });
+	expect(run.pending()).toBe(pending);
+	expect(run.sent).toEqual(sent);
+	await run.event('session_shutdown', {});
 });
 
 test('a board child exposes ping and operator ops on a 0600 socket in a 0700 dir', async () => {

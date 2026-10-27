@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import type { ExtensionUIContext } from '@oh-my-pi/pi-coding-agent';
-import { approvalAnswersSupported, installApprovalBridge, MAX_APPROVAL_PROMPT } from '../src/approval-bridge';
+import { installApprovalBridge, MAX_APPROVAL_PROMPT } from '../src/approval-bridge';
 
 type Prompt = {
 	full: string;
@@ -108,15 +108,4 @@ test('a UI without approve keeps approvals pane-only', () => {
 	expect('approve' in ui).toBe(false);
 	expect(bridge.open()).toBeUndefined();
 	expect(bridge.permit('any', 'Approve')).toBe('That approval is no longer open in the pane');
-});
-
-test('only OMP whose approve() takes an answer is bridged', () => {
-	expect(['18.10.4', '18.11.2', '18.11.3', '18.12.5', '19.0.0', undefined].map(approvalAnswersSupported)).toEqual([
-		false,
-		false,
-		true,
-		true,
-		true,
-		false,
-	]);
 });

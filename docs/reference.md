@@ -39,7 +39,7 @@ Saved-ticket lookup matches repository **and worktree path**, not just repositor
 | `--keep` | Leave worker tabs up after their beads close. |
 | `--` | Everything after it is a freeform description. |
 
-Typing `/mission <ticket>` without `--force` outside plan mode is rewritten to `/plan /mission <ticket>`, so planning always starts in native plan mode.
+Typing `/mission <ticket>` enters native plan mode through OMP's session-mode API before creating a pending plan. This requires OMP 18.13.2 or newer in an interactive TUI; a busy, disabled or conflicting transition is reported without mission creation. No slash-command rewrite or automatic exit from another mode is used.
 
 ## Commands
 

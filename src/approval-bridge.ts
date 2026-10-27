@@ -1,21 +1,11 @@
 import { randomUUID } from 'node:crypto';
-import type { ExtensionUIContext, ExtensionUIDialogOptions } from '@oh-my-pi/pi-coding-agent';
+import type {
+	ExtensionApprovalAnswer,
+	ExtensionApprovalPrompt,
+	ExtensionUIContext,
+} from '@oh-my-pi/pi-coding-agent/extensibility/extensions';
 
-// OMP 18.11.3 changed `ui.approve()` from a boolean to this answer (18.12 added grants); the pinned
-// devDependency still declares the boolean, so the newer shapes are spelled out here.
-interface ApprovalGrant {
-	scope: 'folder' | 'target';
-	label: string;
-	alwaysLabel: string;
-}
-type ApprovalAnswer = 'once' | 'session' | 'deny' | { grant: ApprovalGrant['scope']; always: boolean };
-interface ApprovalPrompt {
-	full: string;
-	compact: string;
-	session?: string;
-	grants?: readonly ApprovalGrant[];
-}
-type Approve = (prompt: ApprovalPrompt, options?: ExtensionUIDialogOptions) => Promise<ApprovalAnswer>;
+type Approve = NonNullable<ExtensionUIContext['approve']>;
 
 /** The longest prompt published to the board; a write approval's full prompt carries the whole file. */
 export const MAX_APPROVAL_PROMPT = 4000;
@@ -39,14 +29,6 @@ export interface ApprovalBridge {
 	permit(id: string, choice: string): string | undefined;
 }
 
-/** True when this OMP's `ui.approve()` takes the answer the bridge returns (18.11.3 and later). */
-export function approvalAnswersSupported(version: string | undefined): boolean {
-	const [major = 0, minor = 0, patch = 0] = (version ?? '').split('.').map(part => Number.parseInt(part, 10) || 0);
-	if (major !== 18) return major > 18;
-	if (minor !== 11) return minor > 11;
-	return patch >= 3;
-}
-
 const WRAPPED = Symbol.for('omp-mission.approvalBridge');
 
 /**
@@ -57,10 +39,13 @@ const WRAPPED = Symbol.for('omp-mission.approvalBridge');
  * itself, which stays pane-only.
  */
 export function installApprovalBridge(ui: ExtensionUIContext, onChange: () => void): ApprovalBridge {
-	// The pinned types declare approve() → boolean; the OMP this is installed on (approvalAnswersSupported) takes ApprovalAnswer.
 	const target = ui as unknown as { [WRAPPED]?: ApprovalBridge; approve?: Approve };
-	if (target[WRAPPED]) return target[WRAPPED];
-	const open = new Map<string, { view: OpenApproval; prompt: ApprovalPrompt; resolve(answer: ApprovalAnswer): void }>();
+	const installed = target[WRAPPED];
+	if (installed) return installed;
+	const open = new Map<
+		string,
+		{ view: OpenApproval; prompt: ExtensionApprovalPrompt; resolve(answer: ExtensionApprovalAnswer): void }
+	>();
 	const original = target.approve;
 	const bridge: ApprovalBridge = {
 		open: () => open.values().next().value?.view,
@@ -76,11 +61,11 @@ export function installApprovalBridge(ui: ExtensionUIContext, onChange: () => vo
 	if (original) {
 		target.approve = (prompt, options) => {
 			const local = new AbortController();
-			const signal = options?.signal ? AbortSignal.any([options.signal, local.signal]) : local.signal;
-			const remote = Promise.withResolvers<ApprovalAnswer>();
+			const remote = Promise.withResolvers<ExtensionApprovalAnswer>();
 			const id = randomUUID();
 			open.set(id, { view: approvalView(id, prompt), prompt, resolve: remote.resolve });
 			onChange();
+			const signal = options?.signal ? AbortSignal.any([options.signal, local.signal]) : local.signal;
 			return Promise.race([original.call(ui, prompt, { ...options, signal }), remote.promise]).finally(() => {
 				open.delete(id);
 				local.abort();
@@ -93,7 +78,7 @@ export function installApprovalBridge(ui: ExtensionUIContext, onChange: () => vo
 }
 
 /** The prompt's choices as OMP's select fallback labels them: grants this session, grants always, approve once, the session answer, Deny. */
-function approvalOptions(prompt: ApprovalPrompt): string[] {
+function approvalOptions(prompt: ExtensionApprovalPrompt): string[] {
 	const grants = prompt.grants ?? [];
 	return [
 		...grants.map(grant => grant.label),
@@ -104,12 +89,12 @@ function approvalOptions(prompt: ApprovalPrompt): string[] {
 	];
 }
 
-function onceLabel(prompt: ApprovalPrompt): string {
+function onceLabel(prompt: ExtensionApprovalPrompt): string {
 	return prompt.grants?.length ? 'Approve Once' : 'Approve';
 }
 
 /** The answer a label from {@link approvalOptions} stands for; undefined for a label the prompt does not offer. */
-function approvalAnswer(prompt: ApprovalPrompt, choice: string): ApprovalAnswer | undefined {
+function approvalAnswer(prompt: ExtensionApprovalPrompt, choice: string): ExtensionApprovalAnswer | undefined {
 	if (choice === 'Deny') return 'deny';
 	if (choice === onceLabel(prompt)) return 'once';
 	if (prompt.session && choice === prompt.session) return 'session';
@@ -120,7 +105,7 @@ function approvalAnswer(prompt: ApprovalPrompt, choice: string): ApprovalAnswer 
 	return undefined;
 }
 
-function approvalView(id: string, prompt: ApprovalPrompt): OpenApproval {
+function approvalView(id: string, prompt: ExtensionApprovalPrompt): OpenApproval {
 	const tool = /^Allow tool: (\S+)/.exec(prompt.full)?.[1] ?? null;
 	const full = prompt.full.length > MAX_APPROVAL_PROMPT ? `${prompt.full.slice(0, MAX_APPROVAL_PROMPT)}…` : prompt.full;
 	return { id, tool, summary: prompt.compact, prompt: full, options: approvalOptions(prompt) };

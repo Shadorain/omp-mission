@@ -6,11 +6,11 @@ Phases run in order: **Plan**, **Isolate**, **Graph**, **Execute**, **Verify**, 
 
 ## Plan
 
-`/mission <ticket>` enters OMP's native plan mode, fetches the ticket and asks the coordinator for a plan. Startup shows the ticket title and a readable specification-file path, not a ticket or JSON dump; the full ticket stays available to the coordinator. Pending plans recover from session metadata. Plan mode forbids every mission mutation.
+`/mission <ticket>` enters OMP's native plan mode directly, then fetches the ticket and asks the coordinator for a plan. This requires OMP 18.13.2 or newer in an interactive TUI. A busy session may defer startup autostart briefly; a direct command reports a refusal such as busy, disabled or conflicting mode and creates no mission. The extension never rewrites `/mission` into slash-command text or exits another native mode to make room. Startup shows the ticket title and a readable specification-file path, not a ticket or JSON dump; the full ticket stays available to the coordinator. Pending plans recover from session metadata. Active plan mode forbids every mission mutation; paused plan mode is not an active mutation hold.
 
 Approve the plan with **Approve and compact context** or **Approve and keep context**. **Approve and clear context** starts a new session, which loses the pending mission, so nothing starts; run `/mission` again there. Approving the plan starts the mission automatically. Workers get the approved plan as a file (`omp-mission-workers/<mission-id>.plan.md`) and are told to read only their slice.
 
-On OMP 18.10.4 or newer, an idle pending plan opens OMP's native plan review once per written revision, without interrupting streaming or queued work, and a dismissed unchanged plan is not reopened. Approval from outside the pane (Holotable) answers that review with the compact choice; see [holotable.md](holotable.md#plan-review). Older runtimes keep in-pane approval and feedback prompts.
+An idle pending plan opens OMP's native plan review once per written revision, without interrupting streaming or queued work, and a dismissed unchanged plan is not reopened. Approval from outside the pane (Holotable) answers that review with the compact choice; see [holotable.md](holotable.md#plan-review).
 
 `--force` skips plan mode and starts executing immediately in Force mode.
 

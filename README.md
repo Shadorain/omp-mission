@@ -42,7 +42,7 @@ Review comes from a separate session that did not write the code. The coordinato
 
 ## Requirements
 
-- OMP 18.4.4 or later. Some features need newer releases: native plan review needs 18.10.4, answering tool approvals from Holotable needs 18.11.3.
+- OMP 18.13.2 or later; native plan-mode control and tool-approval answers use the current extension API.
 - Git, for anything beyond a local freeform task.
 - The `lin` CLI for Linear tickets, or [`gh`](https://cli.github.com/) for GitHub issues and pull-request delivery.
 - `bd` ([beads](https://github.com/steveyegge/beads)) for the `beads` graph.
@@ -75,7 +75,7 @@ Restart OMP after installing or updating. `/reload-plugins` does not reload exte
    /mission -- Add a --version flag to the CLI
    ```
 
-   OMP switches to native plan mode and the coordinator writes a plan.
+   A new non-forced mission enters OMP's native plan mode directly. If OMP is busy or another mode conflicts, resolve it and retry; the mission is not created until plan mode is active.
 3. Approve the plan with **Approve and compact context** or **Approve and keep context**. Do not use **Approve and clear context**: it starts a new session, which loses the pending mission.
 4. Watch the row above the editor. When it stops, type `/mission`: the action menu lists only the commands valid now, with the next step preselected.
 5. After delivery, run `/mission review` to request the independent review. The mission completes when a review leaves no open findings.

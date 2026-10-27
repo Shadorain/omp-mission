@@ -100,7 +100,7 @@ import {
 	type CoordinatorActivity,
 } from './holotable';
 import { installAskBridge, type AskBridge } from './ask-bridge';
-import { approvalAnswersSupported, installApprovalBridge, type ApprovalBridge } from './approval-bridge';
+import { installApprovalBridge, type ApprovalBridge } from './approval-bridge';
 import { foreignDetail, foreignPaths, mergeBaseInto, mergeConflictPaths } from './mergecheck';
 
 const controls = [
@@ -120,12 +120,8 @@ const controls = [
 	'actions',
 	'config',
 ];
-export function nativePlan(ctx: ExtensionContext): boolean {
-	let mode = 'none';
-	for (const entry of ctx.sessionManager.getBranch()) {
-		if ('mode' in entry && entry.type === 'mode_change' && typeof entry.mode === 'string') mode = entry.mode;
-	}
-	return mode === 'plan';
+function nativePlan(ctx: ExtensionContext): boolean {
+	return ctx.sessionModes?.getState().plan.status === 'active';
 }
 export default async function missionExtension(pi: ExtensionAPI) {
 	if (process.env.OMP_MISSION_WORKER === '1') return;
@@ -255,6 +251,9 @@ export default async function missionExtension(pi: ExtensionAPI) {
 		return { stdout: result.stdout, stderr: result.stderr, code: result.code ?? 1 };
 	};
 	const eligible = (context: ExtensionContext) => context.agent.kind === 'main';
+	function currentSession(context: ExtensionContext, epoch: number, signal: AbortSignal): boolean {
+		return !signal.aborted && generation === epoch && ctx?.sessionManager === context.sessionManager;
+	}
 	const coordinatorShells = new Map<
 		string,
 		{ mission: Mission; epoch: number; scope: GuardScope; before: Record<string, string>; workers: string }
@@ -1412,7 +1411,44 @@ export default async function missionExtension(pi: ExtensionAPI) {
 		const chosen = picked ? labels.get(picked) : undefined;
 		if (chosen) await command(chosen, context);
 	}
-	async function command(args: string, context: ExtensionContext) {
+	async function enterPlanning(context: ExtensionContext, startup: boolean): Promise<boolean> {
+		const epoch = generation;
+		const signal = lifetime.signal;
+		const current = () => currentSession(context, epoch, signal) && !mission && !pending;
+		if (!current()) return false;
+		const modes = context.sessionModes;
+		if (nativePlan(context)) return true;
+		if (!modes) throw new Error('Native plan mode control requires OMP 18.13.2 in an interactive TUI');
+		for (let attempt = 0; attempt < (startup ? 50 : 1); attempt++) {
+			if (!current()) return false;
+			const result = await modes.set({ mode: 'plan', action: 'enter' });
+			if (!current()) return false;
+			if (result.ok) {
+				if (modes.getState().plan.status === 'active') return true;
+				throw new Error('Native plan mode did not become active');
+			}
+			if (result.code !== 'busy' || !startup || attempt === 49)
+				throw new Error(`Cannot enter native plan mode (${result.code}): ${result.message}`);
+			const { promise, resolve } = Promise.withResolvers<boolean>();
+			let timer: Timer;
+			const abort = () => {
+				context.clearTimer(timer);
+				resolve(false);
+			};
+			timer = context.setTimeout(() => {
+				signal.removeEventListener('abort', abort);
+				resolve(true);
+			}, 100);
+			signal.addEventListener('abort', abort, { once: true });
+			const elapsed = await promise;
+			if (!elapsed || !current()) return false;
+		}
+		return false;
+	}
+	async function command(args: string, context: ExtensionContext, startup = false): Promise<void> {
+		const epoch = generation;
+		const signal = lifetime.signal;
+		const isCurrent = () => currentSession(context, epoch, signal);
 		if (!eligible(context)) return;
 		ctx = context;
 		try {
@@ -1529,8 +1565,9 @@ export default async function missionExtension(pi: ExtensionAPI) {
 					item.mission.phase !== 'complete',
 			);
 			if (bound) throw new Error(`Checkout is bound to ${bound.mission.source.id}`);
-			if (!parsed.force && !nativePlan(context))
-				throw new Error('Start through /plan /mission, or use --force outside plan mode');
+			if (!isCurrent()) return;
+			if (!parsed.force && !(await enterPlanning(context, startup))) return;
+			if (!isCurrent()) return;
 			const planned: Mission = {
 				version: 1,
 				id: missionId(source),
@@ -1559,6 +1596,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
 			await pi.setSessionName(`${displaySourceId(source)} ${source.title}`);
 			await render();
 			context.setTimeout(async () => {
+				if (!isCurrent() || pending !== planned) return;
 				try {
 					await pi.sendMessage(
 						{
@@ -1568,13 +1606,13 @@ export default async function missionExtension(pi: ExtensionAPI) {
 						},
 						{ triggerTurn: false },
 					);
-					pi.sendUserMessage(prompt, { attribution: 'agent' });
+					if (isCurrent() && pending === planned) pi.sendUserMessage(prompt, { attribution: 'agent' });
 				} catch (error) {
-					context.ui.notify(error instanceof Error ? error.message : String(error), 'error');
+					if (isCurrent()) context.ui.notify(error instanceof Error ? error.message : String(error), 'error');
 				}
 			}, 0);
 		} catch (error) {
-			context.ui.notify(error instanceof Error ? error.message : String(error), 'error');
+			if (isCurrent()) context.ui.notify(error instanceof Error ? error.message : String(error), 'error');
 		}
 	}
 	const scopesSchema = z.record(z.string(), z.array(z.string()).min(1));
@@ -2274,43 +2312,32 @@ export default async function missionExtension(pi: ExtensionAPI) {
 			},
 		});
 	}
-	pi.on('input', (event, context) => {
-		if (!eligible(context) || event.text.trim().split(/\s+/)[0] !== '/mission') return;
-		const args = event.text.trim().slice('/mission'.length);
-		const verb = args.trim().split(/\s+/)[0];
-		if (controls.includes(verb ?? '') || mission) return;
-		try {
-			if (!parseMissionInput(args).force && !nativePlan(context)) return { text: `/plan ${event.text}` };
-		} catch {
-			return;
-		}
-	});
 	// The ask tool opens its dialog before tool_execution_start handlers run, so the bridges must already wrap the UI.
-	// Older OMP takes a boolean from ui.approve(), so its approvals stay pane-only.
 	const bridgeDialogs = (context: ExtensionContext) => {
 		askBridge = installAskBridge(context.ui, () => {
 			void render();
 		});
-		if (approvalAnswersSupported(pi.pi?.VERSION))
-			approvalBridge = installApprovalBridge(context.ui, () => {
-				void render();
-			});
+		approvalBridge = installApprovalBridge(context.ui, () => {
+			void render();
+		});
 	};
 	pi.on('session_start', async (_event, context) => {
 		bridgeDialogs(context);
 		await restore(context);
 		const autostart = autostartMessage();
 		if (!autostart || mission || pending) return;
-		let tries = 0;
-		const attempt = async () => {
-			if (mission || pending || ctx !== context) return;
-			if (!nativePlan(context) && ++tries < 50) {
-				context.setTimeout(() => void attempt(), 100);
+		const epoch = generation;
+		const signal = lifetime.signal;
+		const sessionManager = context.sessionManager;
+		let timer: Timer;
+		const abort = () => context.clearTimer(timer);
+		timer = context.setTimeout(() => {
+			signal.removeEventListener('abort', abort);
+			if (!currentSession(context, epoch, signal) || context.sessionManager !== sessionManager || mission || pending)
 				return;
-			}
-			await command(autostart, context);
-		};
-		await attempt();
+			return command(autostart, context, true);
+		}, 0);
+		signal.addEventListener('abort', abort, { once: true });
 	});
 	pi.on('session_switch', async (_event, context) => {
 		bridgeDialogs(context);
@@ -2414,6 +2441,10 @@ export default async function missionExtension(pi: ExtensionAPI) {
 		ctx = context;
 		if (planReview?.reviewId === event.reviewId) planReview = undefined;
 		await publishStatus();
+	});
+	pi.on('mode_changed', async (_event, context) => {
+		if (!eligible(context) || !ctx || context.sessionManager !== ctx.sessionManager) return;
+		await render();
 	});
 	pi.on('tool_call', async (event, context) => {
 		const m = mission;

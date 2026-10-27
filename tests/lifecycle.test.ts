@@ -203,7 +203,6 @@ async function fixture(
 	const repeatedWave = Promise.withResolvers<void>();
 	const branch: unknown[] = [
 		...(host.otherCheckout ? [] : [{ type: 'custom', customType: 'mission:pointer', data: { path } }]),
-		...(host.plan ? [{ type: 'mode_change', mode: 'plan' }] : []),
 	];
 	// This fixture supplies only host services used by these operations. Storage,
 	// revision capture, graph parsing, and mission transitions are real.
@@ -211,6 +210,11 @@ async function fixture(
 		agent: { kind: 'main' },
 		cwd,
 		hasUI: false,
+		sessionModes: {
+			getState: () => ({
+				plan: { status: host.plan ? ('active' as const) : ('inactive' as const) },
+			}),
+		},
 		sessionManager: { getBranch: () => branch, getSessionName: () => undefined },
 		ui: {
 			notify: (message: string, level?: string) => {
