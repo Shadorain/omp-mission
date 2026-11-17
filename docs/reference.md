@@ -39,7 +39,7 @@ Saved-ticket lookup matches repository **and worktree path**, not just repositor
 | `--keep` | Leave worker tabs up after their beads close. |
 | `--` | Everything after it is a freeform description. |
 
-Typing `/mission <ticket>` enters native plan mode through OMP's session-mode API before creating a pending plan. This requires OMP 18.13.2 or newer in an interactive TUI; a busy, disabled or conflicting transition is reported without mission creation. No slash-command rewrite or automatic exit from another mode is used.
+Typing `/mission <ticket>` enters native plan mode through OMP's session-mode API before creating a pending plan. OMP 18.22.0 or newer is required; a busy, disabled or conflicting transition is reported without mission creation. No slash-command rewrite or automatic exit from another mode is used.
 
 ## Commands
 
@@ -86,6 +86,12 @@ Tab completes the next argument and lists the next-step command first. Autocompl
 
 `/mission clear` detaches a completed mission or discards an unstarted plan, including in plan mode. Saved mission history, beads, files and external worker panes stay untouched. The cleared mission is excluded from lookup in this session, including after resume; `/mission` can then create a fresh plan with a new run ID. Clearing an unfinished saved mission is refused. Plan approval, Pause gates and controller ownership still apply to the new run.
 
+OMP's `/clear` is different: it clears the conversation, not the saved mission. The extension cancels session-local dialogs and coordinator activity, preserves pending plans and mission history, and republishes the mission under resume hold. `/mission continue` is still required before mutations; clearing cannot approve a plan or a Pause gate.
+
+Quitting an interactive session with an unfinished mission asks for confirmation. Cancel keeps the session and controller ownership; confirming detaches without deleting the saved mission or its workers. Non-interactive shutdown does not open a terminal dialog.
+
+Mission links (`mission://<mission-id>/status`, `/plan`, and `/work/<bead-id>`) open only the current owned mission's read-only inspector. A stale mission, absent work item or unsupported route is refused; links cannot attach, approve, continue or execute a command.
+
 ### Check a delivered PR
 
 `/mission check` works on a completed mission with a pull request. See [lifecycle.md](lifecycle.md#check-a-delivered-pr) for what the pane does and the outcomes it records.
@@ -110,6 +116,8 @@ The header labels dependency-waiting beads as **waiting** with a neutral indicat
 | `fullscreen` | `ctrl+shift+f` | Open the inspector |
 | `mode` | `ctrl+shift+o` | Cycle the mode |
 
+Shortcut conflicts are diagnosed after OMP resolves its bindings, including reserved keys and another extension's winner. Change the configured chord or set it to `null`; the extension does not steal the key.
+
 While a mission is visible, its expand key takes precedence over OMP's model-picker shortcut; without a mission, OMP keeps its normal key handling. Change or disable keys in `mission.json` (see `keys` below).
 
 ## Configuration
@@ -126,9 +134,10 @@ Bare `/mission config` shows the path and every value, including shortcuts. If t
 /mission config workerRole task
 /mission config workerContext none
 /mission config autoDispatch on
+/mission config compactTranscript on
 ```
 
-`/mission config` sets `graph`, `frontend` (with `customCommand` for `custom`), `modelRole`, `workerRole`, `workerContext`, `reviewContext` and `autoDispatch`. Edit the file for `maxWorkers`, `reviewConcurrency`, `controls` and `keys`. The file must contain `"version": 1`.
+`/mission config` sets `graph`, `frontend` (with `customCommand` for `custom`), `modelRole`, `workerRole`, `workerContext`, `reviewContext`, `autoDispatch` and `compactTranscript`. Edit the file for `maxWorkers`, `reviewConcurrency`, `controls` and `keys`. The file must contain `"version": 1`.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -143,6 +152,7 @@ Bare `/mission config` shows the path and every value, including shortcuts. If t
 | `workerRole` | `task` | Model role for bead workers, passed as `--model` for every frontend. A role with no configured model, or `default`, leaves workers on the default model. The role resolves at launch, so a change applies to the next worker. |
 | `autoDispatch` | `false` | When on, ready waves in Auto and Force modes start without a model turn or per-wave tool approval. Pause mode, resume hold, plan mode, a blocker and lost ownership still stop it, and a failed attempt is handed to the coordinator. |
 | `controls` | `false` | Inspector action button. `/mission actions` and the other commands remain available either way. |
+| `compactTranscript` | `false` | Compact successful final `mission_control` and `mission_status` transcript cards. Expanding shows the full result; errors and partial results stay verbose. Display only: no state, ownership or approval changes. |
 | `keys` | see [Shortcuts](#shortcuts) | `expand`, `fullscreen`, `mode`. `null` turns one off. Enabled chords must be distinct. |
 
 ## Environment variables

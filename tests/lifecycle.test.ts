@@ -70,11 +70,15 @@ async function fixture(
 		otherCheckout?: boolean;
 		linearCheckout?: boolean;
 		archived?: boolean;
-		prBase?: string;
 		delivered?: boolean;
 		reviewRequested?: boolean;
 		legacyFingerprint?: boolean;
 		mergeConflict?: boolean;
+		prBase?: string;
+		hasUI?: boolean;
+		confirmShutdown?: boolean;
+		compactTranscript?: boolean;
+		conflict?: unknown;
 	} = {},
 ) {
 	const root = await mkdtemp(join(tmpdir(), 'mission-lifecycle-'));
@@ -196,7 +200,18 @@ async function fixture(
 			if (hits.length >= waiter.count) waiter.resolve(hits[waiter.count - 1]!.message);
 		}
 	};
-	const events = new Map<string, EventHandler>();
+	let transcriptPresenter: ((block: unknown) => unknown) | undefined;
+	let inspector: unknown;
+	const shortcutQueries: string[] = [];
+	const events = new Map<string, EventHandler[]>();
+	const dispatch = async (name: string, event: unknown, ctx: ExtensionContext) => {
+		let result: unknown;
+		for (const handler of events.get(name) ?? []) {
+			const value = await handler(event, ctx);
+			if (value !== undefined) result = value;
+		}
+		return result;
+	};
 	let active: string[] = [];
 	let ready = false;
 	let readyReads = 0;
@@ -209,7 +224,7 @@ async function fixture(
 	const context = {
 		agent: { kind: 'main' },
 		cwd,
-		hasUI: false,
+		hasUI: host.hasUI ?? false,
 		sessionModes: {
 			getState: () => ({
 				plan: { status: host.plan ? ('active' as const) : ('inactive' as const) },
@@ -223,6 +238,13 @@ async function fixture(
 				settleNoticeWaiters();
 			},
 			setWidget: () => {},
+			setStatus: () => {},
+			select: async () => undefined,
+			onTerminalInput: () => () => {},
+			custom: async (factory: (tui: unknown, theme: unknown, keys: unknown, done: () => void) => unknown) => {
+				inspector = factory({ terminal: { rows: 24 }, requestRender: () => {} }, {}, {}, () => {});
+			},
+			confirm: async () => host.confirmShutdown ?? false,
 		},
 		isIdle: () => host.idle ?? false,
 		hasPendingMessages: () => host.pending ?? false,
@@ -250,7 +272,15 @@ async function fixture(
 			completions = spec.getArgumentCompletions;
 		},
 		registerShortcut: () => {},
-		on: (name: string, handler: EventHandler) => events.set(name, handler),
+		getShortcutConflict: (chord: string) => {
+			shortcutQueries.push(chord);
+			return host.conflict as never;
+		},
+		registerTranscriptPresenter: (presenter: (block: unknown) => unknown) => {
+			transcriptPresenter = presenter;
+		},
+		registerLinkScheme: (_scheme: string) => {},
+		on: (name: string, handler: EventHandler) => events.set(name, [...(events.get(name) ?? []), handler]),
 		events: { on: () => {} },
 		getActiveTools: () => active,
 		setActiveTools: async (names: string[]) => {
@@ -300,6 +330,7 @@ async function fixture(
 			else if (command !== 'bd') throw new Error(`Unexpected command: ${command}`);
 			let rows: unknown[];
 			if (args.includes('show')) rows = [{ id: 'epic', issue_type: 'epic', status: 'open' }];
+			else if (args[0] === '--readonly' && args[1] === 'history' && args[2] === 'leaf') rows = [];
 			else if (args.includes('ready')) {
 				if (ready && ++readyReads === 3) repeatedWave.resolve();
 				rows = ready ? [{ id: 'leaf' }, { id: 'sibling' }] : [];
@@ -320,18 +351,24 @@ async function fixture(
 	const old = process.env.PI_CODING_AGENT_DIR;
 	try {
 		process.env.PI_CODING_AGENT_DIR = root;
-		if (host.autoDispatch)
-			await writeFile(join(root, 'mission.json'), JSON.stringify({ version: 1, autoDispatch: true }));
+		if (host.autoDispatch || host.compactTranscript)
+			await writeFile(
+				join(root, 'mission.json'),
+				JSON.stringify({
+					version: 1,
+					...(host.autoDispatch ? { autoDispatch: true } : {}),
+					...(host.compactTranscript ? { compactTranscript: true } : {}),
+				}),
+			);
 		await missionExtension(api);
 	} finally {
 		if (old === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = old;
 	}
-	const start = events.get('session_start');
-	const shutdown = events.get('session_shutdown');
 	const control = tools.get('mission_control');
-	if (!start || !shutdown || !control) throw new Error('Mission extension unavailable');
-	await start({}, context);
+	if (!events.has('session_start') || !events.has('session_shutdown') || !control)
+		throw new Error('Mission extension unavailable');
+	await dispatch('session_start', {}, context);
 	const execute = (params: Params) => control('test', params, undefined, undefined, context);
 	// Named assertion: the execute seam is typed unknown; the tool result shape is fixed by the extension.
 	const continued = host.resumed
@@ -342,6 +379,9 @@ async function fixture(
 		command: async (args: string) => {
 			await commandHandler!(args, context);
 		},
+		shortcutQueries,
+		present: (block: unknown) => transcriptPresenter?.(block),
+		inspector: () => inspector,
 		sent,
 		sentOptions,
 		notices,
@@ -368,8 +408,8 @@ async function fixture(
 			ready = true;
 		},
 		repeatedWave: repeatedWave.promise,
-		event: (name: string, event: unknown) => events.get(name)!(event, context),
-		restore: () => start({}, context),
+		event: (name: string, event: unknown) => dispatch(name, event, context),
+		restore: () => dispatch('session_start', {}, context),
 		status: async () => {
 			const result = (await tools.get('mission_status')!('status', {} as Params, undefined, undefined, context)) as {
 				content: Array<{ text: string }>;
@@ -378,7 +418,7 @@ async function fixture(
 		},
 		dispose: async () => {
 			try {
-				await shutdown({}, context);
+				await dispatch('session_shutdown', {}, context);
 			} finally {
 				await rm(root, { recursive: true, force: true });
 			}
@@ -1176,5 +1216,105 @@ test('merge_base needs a bound Git base and closed workers before it merges', as
 		);
 	} finally {
 		await mission.dispose();
+	}
+});
+test('session clear keeps the saved mission held in the same pane', async () => {
+	const mission = await fixture('local');
+	try {
+		await mission.event('session_clear', {});
+		expect((await mission.state()).phase).toBe('review');
+		expect(mission.notices.some(message => message.includes('Mission held after session clear'))).toBe(true);
+		expect((await mission.status()).resumeHold).toBe(true);
+	} finally {
+		await mission.dispose();
+	}
+});
+test('cancelling the native quit prompt retains mission ownership', async () => {
+	const mission = await fixture('local', true, { hasUI: true, resumed: true });
+	try {
+		const result = await mission.event('session_before_shutdown', { signal: new AbortController().signal });
+		expect(result).toEqual({ cancel: true });
+		await expect(mission.execute({ operation: 'continue' })).resolves.toBeDefined();
+	} finally {
+		await mission.dispose();
+	}
+});
+test('compact mission cards are opt-in display summaries and leave errors and partial calls native', async () => {
+	const mission = await fixture('local', true, { compactTranscript: true });
+	try {
+		expect(
+			mission.present({
+				type: 'toolCall',
+				toolName: 'mission_control',
+				args: { operation: 'continue' },
+				result: { content: [{ type: 'text', text: '{"phase":"review","resumeHold":true}' }] },
+			}),
+		).toEqual({
+			compact: { label: 'Mission continue', rows: ['Operation: continue', 'Phase: review', 'Held: resume required'] },
+		});
+		expect(
+			mission.present({
+				type: 'toolCall',
+				toolName: 'mission_control',
+				args: { operation: 'continue' },
+				isError: true,
+			}),
+		).toBeUndefined();
+		expect(
+			mission.present({
+				type: 'toolCall',
+				toolName: 'mission_status',
+				args: {},
+				isPartial: true,
+			}),
+		).toBeUndefined();
+		expect(mission.present({ type: 'toolCall', toolName: 'unrelated', args: {} })).toBeUndefined();
+	} finally {
+		await mission.dispose();
+	}
+});
+test('compact mission cards stay disabled by default', async () => {
+	const mission = await fixture('local');
+	try {
+		expect(
+			mission.present({ type: 'toolCall', toolName: 'mission_control', args: { operation: 'continue' } }),
+		).toBeUndefined();
+	} finally {
+		await mission.dispose();
+	}
+});
+
+test('mission links open only the current owned mission and select a present work item', async () => {
+	const mission = await fixture('beads', true, { hasUI: true });
+	try {
+		await mission.event('link_activate', { scheme: 'mission', url: 'mission://other/status' });
+		expect(mission.inspector()).toBeUndefined();
+		await mission.event('link_activate', { scheme: 'mission', url: 'mission://smoke/../../task.txt' });
+		expect(mission.inspector()).toBeUndefined();
+		await mission.event('link_activate', { scheme: 'mission', url: 'mission://smoke/work/missing' });
+		expect(mission.inspector()).toBeUndefined();
+		await mission.event('link_activate', { scheme: 'mission', url: 'mission://smoke/work/leaf' });
+		const inspector = mission.inspector();
+		expect(inspector && typeof inspector === 'object' && 'selectedId' in inspector && inspector.selectedId).toBe(
+			'leaf',
+		);
+	} finally {
+		await mission.dispose();
+	}
+});
+
+test('shortcut conflict diagnostics report reserved, keybinding, and extension winners', async () => {
+	for (const [conflict, winner] of [
+		[{ kind: 'reserved' }, 'reserved by OMP'],
+		[{ kind: 'keybinding', keybindings: ['core.help'] }, 'held by keybinding core.help'],
+		[{ kind: 'extension', extensionPath: '/plugins/other' }, 'held by extension /plugins/other'],
+	] as const) {
+		const mission = await fixture('local', true, { conflict });
+		try {
+			expect(mission.shortcutQueries).toContain('ctrl+shift+f');
+			expect(mission.notices.some(message => message.includes('ctrl+shift+f') && message.includes(winner))).toBe(true);
+		} finally {
+			await mission.dispose();
+		}
 	}
 });

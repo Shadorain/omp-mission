@@ -5,7 +5,7 @@ import { createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import type { ExtensionContext, PlanReviewChoice } from '@oh-my-pi/pi-coding-agent';
-import { parseBoardAnswers, type BoardAnswer } from './ask-bridge';
+import { parseBoardData, type AskForm } from './ask-bridge';
 import type { OpenApproval } from './approval-bridge';
 import {
 	deliverUrl,
@@ -283,42 +283,17 @@ export interface ContactStatus {
 	measurements?: Measurements | null;
 	usageEvidence?: UsageEvidence | null;
 	ctl: { socket: string; generation: number } | null;
-	/** The pane's open `ask` while hold is 'question': its tool call id and each question's choices, so the board can answer it. */
-	ask?: { id: string; questions: AskQuestion[] } | null;
+	/** The pane's open HTML form while hold is 'question', paired to its ask tool call id. */
+	ask?: { id: string; form: AskForm } | null;
 	/** Null until the pane's first coordinator turn starts or ends. */
 	coordinator?: CoordinatorActivity | null;
-	/** The pane's open tool-approval prompt while hold is 'question': an id for this prompt, what it would allow, and its choices. */
+	/** The pane's open tool-approval prompt while hold is 'question'. */
 	approval?: OpenApproval | null;
 	/** The mission's final report; null until it has verification or delivery evidence. */
 	report?: MissionReport | null;
 	updatedAt: string;
 	/** Identity of the publishing process; owned=false marks a read-only inspection pane. */
 	session?: { id: string; pid: number; processStart: string | null; terminal: string | null; owned: boolean };
-}
-
-/** One question of an open `ask` call, as the pane's dialog shows it: the options, then "Other". */
-export interface AskQuestion {
-	question: string;
-	options: string[];
-	recommended: number | null;
-	multi: boolean;
-}
-
-/** The `questions` argument of an `ask` tool call, reduced to what answering it needs. Malformed entries are dropped. */
-export function askQuestions(raw: unknown): AskQuestion[] {
-	if (!Array.isArray(raw)) return [];
-	return raw.filter(isRecord).flatMap(q => {
-		if (typeof q.question !== 'string' || !q.question.trim() || !Array.isArray(q.options)) return [];
-		const options = q.options.map(o =>
-			isRecord(o) && typeof o.label === 'string' ? o.label : typeof o === 'string' ? o : null,
-		);
-		if (options.some(o => o === null)) return [];
-		const recommended =
-			Number.isInteger(q.recommended) && (q.recommended as number) >= 0 && (q.recommended as number) < options.length
-				? (q.recommended as number)
-				: null;
-		return [{ question: q.question, options: options as string[], recommended, multi: q.multi === true }];
-	});
 }
 
 // Linux /proc start-time beats PID reuse; null on other platforms or an exited process.
@@ -722,7 +697,7 @@ export interface StatusInput {
 	planPath?: string;
 	planReview?: boolean;
 	question?: string;
-	ask?: { id: string; questions: AskQuestion[] };
+	ask?: { id: string; form: AskForm };
 	approval?: OpenApproval;
 	/** Publish identity: the board tests process liveness directly, independent of socket or freshness. */
 	session?: { id: string; owned: boolean };
@@ -918,10 +893,10 @@ export interface HolotableHooks {
 	review?(): ReviewStatus | null;
 	coordinator?(): CoordinatorActivity | undefined;
 	question(): string | undefined;
-	/** The open ask the board may answer: published only while its dialog is on screen. */
-	ask?(): { id: string; questions: AskQuestion[] } | undefined;
-	/** Settle the open ask dialog with the board's answers; returns why it cannot, or undefined. */
-	answerAsk?(answers: BoardAnswer[]): string | undefined;
+	/** The open ask form the board may answer, paired to its tool-call id. */
+	ask?(): { id: string; form: AskForm } | undefined;
+	/** Settle the open ask form with submitted values. */
+	answerAsk?(id: string, data: Record<string, string | number | string[]>): string | undefined;
 	/** The open tool approval the board may answer: published only while its prompt is on screen. */
 	approval?(): OpenApproval | undefined;
 	/** Answer the open approval `id` with one of its option labels; returns why it cannot, or undefined. */
@@ -1214,10 +1189,11 @@ export class HolotableBridge {
 		if (request.op === 'answer') {
 			const ask = this.hooks.ask?.();
 			if (!ask || args.id !== ask.id) return fail('stale', 'That question is no longer open in the pane');
-			const answers = parseBoardAnswers(args.answers);
-			if (!answers) return fail('bad-request', 'answer requires args.answers: [{option} | {options} | {text}]');
+			const data = parseBoardData(args.data);
+			if (!data)
+				return fail('bad-request', 'answer requires args.data: an object of string, number, or string-array values');
 			const refused = this.hooks.answerAsk
-				? this.hooks.answerAsk(answers)
+				? this.hooks.answerAsk(ask.id, data)
 				: 'This pane cannot be answered from outside';
 			return refused ? fail('rejected', refused) : { v: 1, ok: true, revision: revision ?? '' };
 		}
@@ -1299,6 +1275,15 @@ export class HolotableBridge {
 				if (mission || !pending) return fail('rejected', 'No pending plan is awaiting approval');
 				if (typeof args.message !== 'string' || args.message.length < 1 || args.message.length > 8000)
 					return fail('bad-request', 'plan-refine requires args.message of 1..8000 characters');
+				if (args.revision !== undefined && typeof args.revision !== 'string')
+					return fail('bad-request', 'args.revision must be a string');
+				if (args.revision !== undefined) {
+					const planPath = this.hooks.planPath();
+					const current = planPath ? await readFile(planPath, 'utf8').catch(() => undefined) : undefined;
+					if (planPath === undefined || current === undefined) return fail('no-plan', 'No pending plan file');
+					if (args.revision !== planRevision(current))
+						return fail('stale', 'The plan changed since this revision; read it again');
+				}
 				const review = this.hooks.planReview();
 				if (review) {
 					if (!review.resolve('refine', { feedback: args.message }))

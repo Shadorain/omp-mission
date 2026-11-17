@@ -42,7 +42,7 @@ Review comes from a separate session that did not write the code. The coordinato
 
 ## Requirements
 
-- OMP 18.13.2 or later; native plan-mode control and tool-approval answers use the current extension API.
+- OMP 18.22.0 or later; native plan-mode control, HTML-form questions and tool-approval answers use the current extension API.
 - Git, for anything beyond a local freeform task.
 - The `lin` CLI for Linear tickets, or [`gh`](https://cli.github.com/) for GitHub issues and pull-request delivery.
 - `bd` ([beads](https://github.com/steveyegge/beads)) for the `beads` graph.
@@ -231,3 +231,7 @@ Contributor rules are in [AGENTS.md](AGENTS.md).
 ## License
 
 [MIT](LICENSE)
+
+## OMP session integration
+
+Native HTML questions are answerable in the mission or Holotable; the first accepted answer closes both views. `/clear` preserves the saved mission under resume hold, and interactive quit warns before detaching unfinished work. Read-only mission links, shortcut-conflict diagnostics and opt-in compact transcript cards are described in [the reference](docs/reference.md).

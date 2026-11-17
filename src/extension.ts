@@ -87,7 +87,6 @@ import {
 	type GuardScope,
 } from './coordinator-guard';
 import {
-	askQuestions,
 	autostartMessage,
 	envBase,
 	envCheckout,
@@ -96,12 +95,12 @@ import {
 	gateTokenId,
 	HolotableBridge,
 	planRevision,
-	type AskQuestion,
 	type CoordinatorActivity,
 } from './holotable';
 import { installAskBridge, type AskBridge } from './ask-bridge';
 import { installApprovalBridge, type ApprovalBridge } from './approval-bridge';
 import { foreignDetail, foreignPaths, mergeBaseInto, mergeConflictPaths } from './mergecheck';
+import { parseMissionNavigation } from './navigation';
 
 const controls = [
 	'show',
@@ -144,6 +143,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
 			workerContext: 'project',
 			reviewContext: 'project',
 			autoDispatch: false,
+			compactTranscript: false,
 			keys: { expand: null, fullscreen: null, mode: null },
 		};
 	}
@@ -180,7 +180,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
 		if (coordinator?.state !== state) coordinator = { state, since: new Date().toISOString() };
 	};
 	let planReview: PlanReviewRequestedEvent | undefined;
-	const pendingQuestions = new Map<string, { text: string; questions: AskQuestion[] }>();
+	const pendingQuestions = new Map<string, { text: string; html: string }>();
 	let askBridge: AskBridge | undefined;
 	let approvalBridge: ApprovalBridge | undefined;
 	// An open tool approval blocks the pane like a question: a steering message would deny it, so other ops wait too.
@@ -191,19 +191,15 @@ export default async function missionExtension(pi: ExtensionAPI) {
 			undefined
 		);
 	};
-	// The oldest open ask is the one on screen. It is published, with id and choices, only while its dialog is open and
-	// matches it, so the board can settle it through the bridge instead of typing into the pane.
+	// Publish only the exact HTML form paired to one live ask tool call.
 	const ask = () => {
-		const first = [...pendingQuestions.entries()][0];
 		const open = askBridge?.open();
-		if (
-			!first ||
-			!open ||
-			first[1].questions.length !== open.length ||
-			open.some((q, i) => q.options.length !== first[1].questions[i]!.options.length)
-		)
-			return undefined;
-		return { id: first[0], questions: first[1].questions };
+		if (!open) return undefined;
+		const matches = [...pendingQuestions.entries()].filter(([, pending]) => pending.html === open.html);
+		if (matches.length !== 1) return undefined;
+		const [id] = matches[0]!;
+		if (!askBridge?.bind(id, open.html)) return undefined;
+		return { id, form: open.form };
 	};
 	let openedPlanRevision: string | undefined;
 	let openingPlanReview = false;
@@ -492,7 +488,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
 		}),
 		question,
 		ask,
-		answerAsk: answers => (askBridge ? askBridge.answer(answers) : 'This pane cannot be answered from outside'),
+		answerAsk: (id, data) => (askBridge ? askBridge.answer(id, data) : 'This pane cannot be answered from outside'),
 		approval: () => approvalBridge?.open(),
 		permit: (id, choice) =>
 			approvalBridge ? approvalBridge.permit(id, choice) : 'This pane cannot be answered from outside',
@@ -1335,21 +1331,28 @@ export default async function missionExtension(pi: ExtensionAPI) {
 			key === 'workerRole' ||
 			key === 'workerContext' ||
 			key === 'reviewContext' ||
-			key === 'autoDispatch'
+			key === 'autoDispatch' ||
+			key === 'compactTranscript'
 		) {
 			const words = rest.split(/\s+/);
 			const flags = ['on', 'off', 'true', 'false'];
-			if (words.length !== 2 || !value || (key === 'autoDispatch' && !flags.includes(value)))
+			if (
+				words.length !== 2 ||
+				!value ||
+				((key === 'autoDispatch' || key === 'compactTranscript') && !flags.includes(value))
+			)
 				throw new Error(
-					key === 'autoDispatch'
-						? 'Usage: /mission config autoDispatch on|off'
+					key === 'autoDispatch' || key === 'compactTranscript'
+						? `Usage: /mission config ${key} on|off`
 						: key === 'workerContext' || key === 'reviewContext'
 							? `Usage: /mission config ${key} project|all|none`
 							: `Usage: /mission config ${key} <role>  (default, task, smol, slow, ...)`,
 				);
 			const written = validateMissionConfig({
 				...config,
-				...(key === 'autoDispatch' ? { autoDispatch: value === 'on' || value === 'true' } : { [key]: value }),
+				...(key === 'autoDispatch' || key === 'compactTranscript'
+					? { [key]: value === 'on' || value === 'true' }
+					: { [key]: value }),
 			});
 			await writeMissionConfig(agentDir, written);
 			config = written;
@@ -1361,7 +1364,9 @@ export default async function missionExtension(pi: ExtensionAPI) {
 				configNotice(
 					where,
 					true,
-					key === 'autoDispatch' ? `autoDispatch ${config.autoDispatch ? 'on' : 'off'}` : `${key} ${config[key]}`,
+					key === 'autoDispatch' || key === 'compactTranscript'
+						? `${key} ${config[key] ? 'on' : 'off'}`
+						: `${key} ${config[key]}`,
 				),
 				'info',
 			);
@@ -2312,6 +2317,47 @@ export default async function missionExtension(pi: ExtensionAPI) {
 			},
 		});
 	}
+	pi.registerTranscriptPresenter(block => {
+		if (!config.compactTranscript || block.type !== 'toolCall' || block.isError || block.isPartial) return undefined;
+		if (block.toolName !== 'mission_control' && block.toolName !== 'mission_status') return undefined;
+		const args = isRecord(block.args) ? block.args : {};
+		const operationName = block.toolName === 'mission_status' ? 'status' : String(args.operation ?? 'control');
+		const rows = [`Operation: ${operationName}`];
+		const text = block.result?.content.find(
+			item => isRecord(item) && item.type === 'text' && typeof item.text === 'string',
+		);
+		if (text && isRecord(text) && typeof text.text === 'string') {
+			try {
+				const result: unknown = JSON.parse(text.text);
+				if (isRecord(result)) {
+					if (typeof result.phase === 'string') rows.push(`Phase: ${result.phase}`);
+					if (result.resumeHold === true) rows.push('Held: resume required');
+					if (isRecord(result.next) && typeof result.next.kind === 'string') rows.push(`Next: ${result.next.kind}`);
+					if (typeof result.pending === 'string') rows.push(`Plan: ${result.pending}`);
+				}
+			} catch {
+				return undefined;
+			}
+		}
+		return { compact: { label: `Mission ${operationName}`, rows } };
+	});
+	pi.registerLinkScheme('mission');
+	pi.on('link_activate', async (event, context) => {
+		if (event.scheme !== 'mission') return;
+		const target = parseMissionNavigation(event.url);
+		if (!target || !eligible(context) || !ownership || !mission || target.missionId !== mission.id) {
+			context.ui.notify('Mission link is invalid or does not target the mission owned by this pane.', 'warning');
+			return;
+		}
+		if (target.view === 'work' && !snapshot?.beads.some(bead => bead.id === target.beadId)) {
+			context.ui.notify('Mission link work item is not in the current mission graph.', 'warning');
+			return;
+		}
+		if (target.view === 'work') selected = target.beadId;
+		else selected = undefined;
+		history = undefined;
+		await inspect(context);
+	});
 	// The ask tool opens its dialog before tool_execution_start handlers run, so the bridges must already wrap the UI.
 	const bridgeDialogs = (context: ExtensionContext) => {
 		askBridge = installAskBridge(context.ui, () => {
@@ -2321,6 +2367,25 @@ export default async function missionExtension(pi: ExtensionAPI) {
 			void render();
 		});
 	};
+	const reportedShortcutConflicts = new Set<string>();
+	pi.on('session_start', async (_event, context) => {
+		for (const [name, chord] of Object.entries(config.keys)) {
+			if (name === 'expand' || !chord || reportedShortcutConflicts.has(chord)) continue;
+			const conflict = pi.getShortcutConflict(chord as KeyId);
+			if (!conflict) continue;
+			reportedShortcutConflicts.add(chord);
+			const winner =
+				conflict.kind === 'reserved'
+					? 'reserved by OMP'
+					: conflict.kind === 'keybinding'
+						? `held by keybinding ${conflict.keybindings.join(', ')}`
+						: `held by extension ${conflict.extensionPath}`;
+			context.ui.notify(
+				`Mission ${name} shortcut ${chord} conflicts: ${winner}; the existing binding wins.`,
+				'warning',
+			);
+		}
+	});
 	pi.on('session_start', async (_event, context) => {
 		bridgeDialogs(context);
 		await restore(context);
@@ -2344,6 +2409,56 @@ export default async function missionExtension(pi: ExtensionAPI) {
 		await restore(context);
 	});
 	pi.on('session_branch', async (_event, context) => restore(context));
+	pi.on('session_clear', async (_event, context) => {
+		if (!eligible(context)) return;
+		ctx = context;
+		generation++;
+		operationSignal = undefined;
+		pendingQuestions.clear();
+		providerHold = undefined;
+		coordinatorShells.clear();
+		lastWake = '';
+		guided = '';
+		planReview = undefined;
+		openedPlanRevision = undefined;
+		openingPlanReview = false;
+		if (timer) context.clearTimer(timer);
+		timer = undefined;
+		if (mission) {
+			resumeHold = true;
+			pi.appendEntry('mission:pointer', { path, ignoredPaths: [...ignoredPaths] });
+		}
+		await publishStatus();
+		await render();
+		startPolling(context);
+		if (mission || pending)
+			context.ui.notify(
+				'Mission held after session clear. No mission turn was started; use /mission to inspect or continue.',
+				'warning',
+			);
+	});
+	pi.on('session_before_shutdown', async (event, context) => {
+		if (!context.hasUI || event.signal.aborted) return;
+		const hasOwnedWork = !!ownership && (!!mission || !!pending);
+		const hasHeldPlan = !!pending || !!planReview;
+		const hasLiveWaits = pendingQuestions.size > 0 || !!askBridge?.open() || !!approvalBridge?.open();
+		if (!hasOwnedWork && !hasHeldPlan && !hasLiveWaits) return;
+		const cancel = new AbortController();
+		const abort = () => cancel.abort(event.signal.reason);
+		event.signal.addEventListener('abort', abort, { once: true });
+		try {
+			const confirmed = await context.ui.confirm(
+				'Close mission pane?',
+				'This pane owns active mission work or a pending approval. Closing it will stop its workers and release ownership.',
+				{ signal: cancel.signal },
+			);
+			if (event.signal.aborted) return { cancel: true };
+			if (!confirmed) return { cancel: true };
+			await detach();
+		} finally {
+			event.signal.removeEventListener('abort', abort);
+		}
+	});
 	pi.on('session_shutdown', async () => detach());
 	pi.on('auto_compaction_end', async (_event, context) => {
 		ctx = context;
@@ -2395,10 +2510,15 @@ export default async function missionExtension(pi: ExtensionAPI) {
 			current.reviews.length,
 		]);
 		const view = withGuide(action, true);
+		const itemId = action.ids?.[0];
+		const itemLink =
+			itemId && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(itemId)
+				? ` · [Work item](mission://${current.id}/work/${itemId})`
+				: '';
 		return {
 			message: {
 				customType: 'mission:started',
-				content: `${notes.join(' ')} Next: ${action.kind}. ${view?.guide ?? action.detail}`,
+				content: `${notes.join(' ')} Next: ${action.kind}. ${view?.guide ?? action.detail}\n\n[Mission status](mission://${current.id}/status) · [Plan](mission://${current.id}/plan)${itemLink}`,
 				display: false,
 			},
 		};
@@ -2534,18 +2654,8 @@ export default async function missionExtension(pi: ExtensionAPI) {
 		subagents = noteSubagentToolStart(subagents, event);
 		if (eligible(context) && event.toolName === 'ask' && (mission || pending)) {
 			const args = isRecord(event.args) ? event.args : {};
-			const prompts = Array.isArray(args.questions)
-				? args.questions
-						.filter(isRecord)
-						.map(value => value.question)
-						.filter((value): value is string => typeof value === 'string' && !!value.trim())
-				: [];
-			// The board answers by dialog position, so a partly parsed ask is not published at all.
-			const parsed = askQuestions(args.questions);
-			pendingQuestions.set(event.toolCallId, {
-				text: prompts.join(' · ') || 'A question needs your answer',
-				questions: parsed.length === prompts.length ? parsed : [],
-			});
+			if (typeof args.html === 'string')
+				pendingQuestions.set(event.toolCallId, { text: 'A form needs your answer', html: args.html });
 		}
 		await render();
 	});

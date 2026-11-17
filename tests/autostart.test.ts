@@ -50,6 +50,9 @@ async function session(options: { bd: boolean; body?: string }) {
 	const api = {
 		registerTool: () => {},
 		registerShortcut: () => {},
+		registerTranscriptPresenter: () => {},
+		registerLinkScheme: () => {},
+		getShortcutConflict: () => undefined,
 		registerCommand: (_name: string, spec: { handler: typeof command }) => {
 			command = spec.handler;
 		},

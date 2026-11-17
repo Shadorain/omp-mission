@@ -16,6 +16,7 @@ export const DEFAULT_MISSION_CONFIG: MissionConfig = {
 	workerContext: 'project',
 	reviewContext: 'project',
 	autoDispatch: false,
+	compactTranscript: false,
 	keys: { expand: 'ctrl+shift+m', fullscreen: 'ctrl+shift+f', mode: 'ctrl+shift+o' },
 };
 
@@ -107,6 +108,8 @@ export function validateMissionConfig(value: unknown, path = 'mission.json'): Mi
 	}
 	if (value.autoDispatch !== undefined && typeof value.autoDispatch !== 'boolean')
 		return fail('autoDispatch must be boolean');
+	if (value.compactTranscript !== undefined && typeof value.compactTranscript !== 'boolean')
+		return fail('compactTranscript must be boolean');
 	return {
 		version: 1,
 		controls: value.controls ?? false,
@@ -118,6 +121,7 @@ export function validateMissionConfig(value: unknown, path = 'mission.json'): Mi
 		workerRole: roles.workerRole,
 		...contexts,
 		autoDispatch: value.autoDispatch ?? false,
+		compactTranscript: value.compactTranscript ?? false,
 		...(customCommand ? { customCommand } : {}),
 		keys: normalized,
 	};
@@ -174,6 +178,7 @@ export function formatMissionConfig(config: MissionConfig, path: string, mission
 		`  workerContext: ${config.workerContext}`,
 		`  reviewContext: ${config.reviewContext}`,
 		`  autoDispatch: ${config.autoDispatch}`,
+		`  compactTranscript: ${config.compactTranscript}`,
 	];
 	let g = `  graph: ${config.graph}`;
 	if (missionGraph !== undefined && missionGraph !== config.graph) g += ` (active: ${missionGraph})`;

@@ -139,7 +139,15 @@ async function session(
 		path = missionPath(root, options.mission);
 		await saveMission(path, options.mission);
 	}
-	const events = new Map<string, Handler>();
+	const events = new Map<string, Handler[]>();
+	const dispatch = async (name: string, event: unknown, eventContext: ExtensionContext) => {
+		let result: unknown;
+		for (const handler of events.get(name) ?? []) {
+			const value = await handler(event, eventContext);
+			if (value !== undefined) result = value;
+		}
+		return result;
+	};
 	// Same-pid test sessions need distinct ids or publish suppression cannot tell panes apart.
 	const sessionTag = `test-session-${++sessionSeq}`;
 	const sent: string[] = [];
@@ -208,8 +216,11 @@ async function session(
 			},
 			setWidget: () => {},
 			// Like the pane's dialog: it settles only when answered locally or aborted.
-			askDialog: (_questions: unknown, options?: { signal?: AbortSignal }) =>
-				new Promise(resolve => options?.signal?.addEventListener('abort', () => resolve(undefined))),
+			formDialog: (_html: string, options?: { signal?: AbortSignal }) => {
+				const { promise, resolve } = Promise.withResolvers<undefined>();
+				options?.signal?.addEventListener('abort', () => resolve(undefined), { once: true });
+				return promise;
+			},
 			approve: (_prompt: unknown, options?: { signal?: AbortSignal }) =>
 				new Promise(resolve => options?.signal?.addEventListener('abort', () => resolve('deny'))),
 		},
@@ -233,10 +244,13 @@ async function session(
 		pi: { VERSION: '18.13.2' },
 		registerTool: () => {},
 		registerShortcut: () => {},
+		registerTranscriptPresenter: () => {},
+		registerLinkScheme: () => {},
+		getShortcutConflict: () => undefined,
 		registerCommand: (_name: string, spec: { handler: typeof command }) => {
 			command = spec.handler;
 		},
-		on: (name: string, handler: Handler) => events.set(name, handler),
+		on: (name: string, handler: Handler) => events.set(name, [...(events.get(name) ?? []), handler]),
 		events: { on: () => {} },
 		getActiveTools: () => active,
 		setActiveTools: async (names: string[]) => {
@@ -283,7 +297,7 @@ async function session(
 	setEnv('OMP_MISSION_AUTOSTART', options.autostart);
 	await options.beforeLoad?.(root);
 	await missionExtension(api);
-	await events.get('session_start')!({}, context);
+	await dispatch('session_start', {}, context);
 	const flush = async () => {
 		const callbacks: Promise<void>[] = [];
 		while (true) {
@@ -328,7 +342,7 @@ async function session(
 				| Mission
 				| undefined,
 		event: (name: string, event: unknown, eventContext: ExtensionContext = context) =>
-			events.get(name)!(event, eventContext),
+			dispatch(name, event, eventContext),
 		poll: () => poll?.(),
 		flush,
 		tickTimer,
@@ -521,11 +535,11 @@ test('pending questions replace plan approval until the matching tool finishes',
 		await run.event('tool_execution_start', {
 			toolName: 'ask',
 			toolCallId: 'question',
-			args: { questions: [{ question: 'Where should the parent hub live?' }] },
+			args: { html: '<form><label><input name="hub" value="here">Where should the parent hub live?</label></form>' },
 		});
 		const waiting = await statusOf(run, pending);
 		expect(waiting.hold).toBe('question');
-		expect(waiting.next).toContain('Where should the parent hub live?');
+		expect(waiting.next).toContain('A form needs your answer');
 		expect(waiting.actions).toEqual([]);
 		expect((await ctl(waiting.ctl!.socket, { v: 1, op: 'plan-approve', operator: true })).ok).toBe(false);
 		expect(approvals).toBe(0);
@@ -543,41 +557,29 @@ test('the board answers an open ask through the socket while every other op stil
 	try {
 		const pending = run.pending()!;
 		const args = {
-			questions: [
-				{
-					id: 'hub',
-					question: 'Where should the parent hub live?',
-					options: [{ label: 'Here' }, { label: 'There' }],
-					recommended: 1,
-				},
-			],
+			html: '<form><fieldset><legend>Where should the parent hub live?</legend><label><input type="radio" name="hub" value="here" checked>Here</label><label><input type="radio" name="hub" value="there">There</label></fieldset></form>',
 		};
 		await run.event('tool_execution_start', { toolName: 'ask', toolCallId: 'q1', args });
-		// The ask tool opens the dialog through the same UI object the extension wrapped.
-		const shown = run.context.ui.askDialog!(args.questions, {});
+		// The ask tool opens the form through the same UI object the extension wrapped.
+		const shown = run.context.ui.formDialog!(args.html, {});
 		for (let i = 0; i < 100 && !(await statusOf(run, pending)).ask; i++) await Bun.sleep(5);
 		const open = await statusOf(run, pending);
-		expect(open.ask).toEqual({
-			id: 'q1',
-			questions: [
-				{ question: 'Where should the parent hub live?', options: ['Here', 'There'], recommended: 1, multi: false },
-			],
-		});
+		expect(open.ask?.id).toBe('q1');
+		expect(open.ask?.form.fields).toHaveLength(1);
 		expect(open.actions).toEqual(['answer']);
 		const socket = open.ctl!.socket;
 		expect((await ctl(socket, { v: 1, op: 'plan-approve', operator: true })).error.code).toBe('question-waiting');
 		expect(
-			(await ctl(socket, { v: 1, op: 'answer', operator: true, args: { id: 'q0', answers: [{ option: 0 }] } })).error
-				.code,
+			(await ctl(socket, { v: 1, op: 'answer', operator: true, args: { id: 'q0', data: { hub: 'here' } } })).error.code,
 		).toBe('stale');
 		expect(
-			(await ctl(socket, { v: 1, op: 'answer', operator: true, args: { id: 'q1', answers: [{ option: 9 }] } })).error
+			(await ctl(socket, { v: 1, op: 'answer', operator: true, args: { id: 'q1', data: { hub: ['here'] } } })).error
 				.code,
 		).toBe('rejected');
 		expect(
-			await ctl(socket, { v: 1, op: 'answer', operator: true, args: { id: 'q1', answers: [{ option: 0 }] } }),
+			await ctl(socket, { v: 1, op: 'answer', operator: true, args: { id: 'q1', data: { hub: 'here' } } }),
 		).toMatchObject({ ok: true });
-		expect(await shown).toMatchObject({ kind: 'submit', results: [{ id: 'hub', selectedOptions: ['Here'] }] });
+		expect(await shown).toEqual({ data: { hub: 'here' } });
 	} finally {
 		await run.event('session_shutdown', {});
 	}
@@ -1536,6 +1538,51 @@ test('plan-edit writes atomically, bumps the revision, and enforces base and lim
 	await other.event('session_shutdown', {});
 });
 
+test('plan-refine sends current-revision comments into the session and rejects stale comments before side effects', async () => {
+	const run = await session({ plan: true, child: true });
+	await run.command('-- demo');
+	const mission = run.pending()!;
+	const socket = (await statusOf(run, mission)).ctl!.socket;
+	const plan = await writePlan(run, mission, 'Add rollback\nDeploy safely\n');
+	const revision = planRevision('Add rollback\nDeploy safely\n');
+	const sentBefore = run.sent.length;
+	expect(
+		await ctl(socket, {
+			v: 1,
+			op: 'plan-refine',
+			operator: true,
+			args: { message: 'Comment on plan lines 1-2. Operator comment: explain rollback.', revision: 'deadbeefdead' },
+		}),
+	).toMatchObject({ ok: false, error: { code: 'stale' } });
+	expect(run.sent.length).toBe(sentBefore);
+	expect(await Bun.file(plan).text()).toBe('Add rollback\nDeploy safely\n');
+	expect(
+		await ctl(socket, {
+			v: 1,
+			op: 'plan-refine',
+			operator: true,
+			args: { message: 'Comment on plan lines 1-2. Operator comment: explain rollback.', revision },
+		}),
+	).toMatchObject({ ok: true });
+	expect(run.sent.length).toBe(sentBefore + 1);
+	expect(run.sent.at(-1)).toContain('Comment on plan lines 1-2');
+	expect(run.sent.at(-1)).toContain('Operator comment: explain rollback.');
+	expect(await Bun.file(plan).text()).toBe('Add rollback\nDeploy safely\n');
+	const afterComment = await statusOf(run, mission);
+	expect(afterComment.hold).toBe('plan-approval');
+	expect((await ctl(socket, { v: 1, op: 'plan' })).plan).toEqual({
+		text: 'Add rollback\nDeploy safely\n',
+		path: plan,
+		revision,
+	});
+	expect(afterComment.actions).not.toContain('plan-approve');
+	expect(run.pending()).toBe(mission);
+	expect(
+		(await ctl(socket, { v: 1, op: 'plan-refine', operator: true, args: { message: 'x', revision: 42 } })).error.code,
+	).toBe('bad-request');
+	await run.event('session_shutdown', {});
+});
+
 test('plan-refine sends the message into the session and is rejected without a pending plan', async () => {
 	const run = await session({ plan: true, child: true });
 	await run.command('-- demo');
@@ -1738,6 +1785,9 @@ test('native local plan URL resolves to the file edited and approved by the boar
 		).ok,
 	).toBe(true);
 	expect(await Bun.file(file).text()).toBe('Edited native plan\n');
+	const afterSave = await statusOf(run, mission);
+	expect(afterSave.actions).toContain('plan-approve');
+	expect(afterSave.plan?.revision).toBe(planRevision('Edited native plan\n'));
 	expect(
 		(
 			await ctl(socket, {

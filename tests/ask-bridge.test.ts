@@ -1,69 +1,90 @@
 import { expect, test } from 'bun:test';
-import type {
-	ExtensionAskDialogQuestion,
-	ExtensionAskDialogResult,
-	ExtensionUIContext,
-} from '@oh-my-pi/pi-coding-agent';
-import { buildResult, installAskBridge } from '../src/ask-bridge';
+import type { ExtensionFormDialogResult, ExtensionUIContext } from '@oh-my-pi/pi-coding-agent';
+import { installAskBridge } from '../src/ask-bridge';
 
-const questions: ExtensionAskDialogQuestion[] = [
-	{
-		id: 'scope',
-		question: 'How far?',
-		options: [{ label: 'Status only' }, { label: 'Status + send' }],
-		recommended: 0,
-	},
-	{ id: 'tags', question: 'Which?', options: [{ label: 'a' }, { label: 'b' }, { label: 'c' }], multi: true },
-];
+const html = `<form>
+  <input type="hidden" name="token" value="secret">
+  <fieldset><legend>Options</legend>
+    <label><input type="radio" name="mode" value="fast" checked> Fast</label>
+    <label><input type="radio" name="mode" value="slow" disabled> Slow</label>
+    <label>Count <input type="number" name="count" min="0" max="4" value="0"></label>
+    <label><input type="checkbox" name="tags" value="a"> A</label>
+    <label><input type="checkbox" name="tags" value="b"> B</label>
+  </fieldset>
+</form>`;
 
-/** A pane dialog that only ever ends by abort, like a user who walked away. */
 function paneUi() {
 	const seen: { signal?: AbortSignal } = {};
 	const ui = {
-		askDialog: (_q: ExtensionAskDialogQuestion[], options?: { signal?: AbortSignal }) => {
+		formDialog: (_html: string, options?: { signal?: AbortSignal }) => {
 			seen.signal = options?.signal;
-			return new Promise<ExtensionAskDialogResult | undefined>(resolve =>
-				options?.signal?.addEventListener('abort', () => resolve(undefined)),
+			return new Promise<ExtensionFormDialogResult | undefined>(resolve =>
+				options?.signal?.addEventListener('abort', () => resolve(undefined), { once: true }),
 			);
 		},
 	} as unknown as ExtensionUIContext;
 	return { ui, seen };
 }
 
-test('a board answer settles the open dialog, closes the pane side and is what the ask tool receives', async () => {
+test('a matching board form submission wins and aborts the native pane form', async () => {
 	const { ui, seen } = paneUi();
 	let changes = 0;
-	const bridge = installAskBridge(ui, () => {
-		changes++;
-	});
-	expect(bridge.answer([{ option: 0 }, { options: [0] }])).toBe('No ask dialog is open in the pane');
-	const shown = ui.askDialog!(questions, {});
-	expect(bridge.open()).toBe(questions);
-	expect(bridge.answer([{ option: 5 }, { options: [0] }])).toBe('Question 1 has no option 5');
-	expect(bridge.answer([{ text: 'just status' }, { options: [2, 0] }])).toBeUndefined();
-	expect(await shown).toEqual({
-		kind: 'submit',
-		results: [
-			{
-				id: 'scope',
-				question: 'How far?',
-				options: ['Status only', 'Status + send'],
-				multi: false,
-				selectedOptions: [],
-				customInput: 'just status',
-			},
-			{ id: 'tags', question: 'Which?', options: ['a', 'b', 'c'], multi: true, selectedOptions: ['c', 'a'] },
-		],
-	});
+	const bridge = installAskBridge(ui, () => changes++);
+	const shown = ui.formDialog!(html, {});
+	const open = bridge.open();
+	expect(open?.html).toBe(html);
+	expect(open?.form.fields.map(field => field.name)).toEqual(['mode', 'count', 'tags']);
+	expect(bridge.bind('call-1', `${html} `)).toBe(false);
+	expect(bridge.bind('call-1', html)).toBe(true);
+	expect(bridge.answer('wrong-call', { mode: 'fast' })).toBeString();
+	expect(bridge.answer('call-1', { mode: 'fast', count: 0, tags: ['a'] })).toBeUndefined();
+	expect(await shown).toEqual({ data: { token: 'secret', mode: 'fast', count: 0, tags: ['a'] } });
 	expect(seen.signal?.aborted).toBe(true);
 	expect(bridge.open()).toBeUndefined();
 	expect(changes).toBe(2);
-	// Installing twice keeps one wrapper.
 	expect(installAskBridge(ui, () => {})).toBe(bridge);
 });
 
-test('answers that do not fit the questions are refused before anything settles', () => {
-	expect(buildResult(questions, [{ option: 0 }])).toBe('Answer all 2 questions');
-	expect(buildResult(questions, [{ options: [0] }, { options: [0] }])).toBe('Question 1 takes one option');
-	expect(buildResult(questions, [{ text: '  ' }, { options: [0] }])).toBe('Question 1 needs an option or some text');
+test('malformed, unknown, disabled, hidden, and invalid field values never settle the form', () => {
+	const { ui } = paneUi();
+	const bridge = installAskBridge(ui, () => {});
+	void ui.formDialog!(html, {});
+	expect(bridge.answer('call', { mode: 'fast' })).toBeString();
+	bridge.bind('call', html);
+	expect(bridge.answer('call', { mode: 'fast', count: 0, tags: [], unknown: 'x' })).toBeString();
+	expect(bridge.answer('call', { token: 'changed', mode: 'fast', count: 0, tags: [] })).toBeString();
+	expect(bridge.answer('call', { mode: 'slow', count: 0, tags: [] })).toBeString();
+	expect(bridge.answer('call', { mode: 'fast', count: 5, tags: [] })).toBeString();
+	expect(bridge.answer('call', { mode: 'fast', count: 'not a number', tags: [] })).toBeString();
+});
+
+test('only one pending tool call with identical HTML can bind to the live dialog', () => {
+	const { ui } = paneUi();
+	const bridge = installAskBridge(ui, () => {});
+	void ui.formDialog!(html, {});
+	expect(bridge.bind('call-1', html)).toBe(true);
+	expect(bridge.bind('call-2', html)).toBe(false);
+});
+
+test('clearing a checked default does not restore it, while hidden values remain immutable', async () => {
+	const { ui } = paneUi();
+	const bridge = installAskBridge(ui, () => {});
+	const form =
+		'<form><input type="hidden" name="revision" value="rev-1"><label><input type="checkbox" name="enabled" value="yes" checked>Enabled</label></form>';
+	const shown = ui.formDialog!(form, {});
+	expect(bridge.bind('unchecked', form)).toBe(true);
+	expect(bridge.answer('unchecked', {})).toBeUndefined();
+	expect(await shown).toEqual({ data: { revision: 'rev-1' } });
+});
+
+test('omitting a required control cannot silently accept its preselected default', async () => {
+	const { ui } = paneUi();
+	const bridge = installAskBridge(ui, () => {});
+	const form = '<form><label>Workers <input type="number" name="workers" value="2" required min="0"></label></form>';
+	const shown = ui.formDialog!(form, {});
+	bridge.bind('required', form);
+	expect(bridge.answer('required', {})).toBeString();
+	expect(bridge.open()).toBeDefined();
+	expect(bridge.answer('required', { workers: 0 })).toBeUndefined();
+	expect(await shown).toEqual({ data: { workers: 0 } });
 });

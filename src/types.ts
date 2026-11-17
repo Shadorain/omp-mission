@@ -238,6 +238,7 @@ export interface MissionConfig {
 	workerContext: ContextMode;
 	reviewContext: ContextMode;
 	autoDispatch: boolean;
+	compactTranscript: boolean;
 	customCommand?: string;
 	keys: { expand: string | null; fullscreen: string | null; mode: string | null };
 }
