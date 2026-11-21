@@ -196,6 +196,12 @@ describe('mission input and source resolution', () => {
 });
 
 describe('mission configuration', () => {
+	test('leaves mode cycling unbound unless explicitly configured', () => {
+		expect(validateMissionConfig({ version: 1 }).keys.mode).toBeNull();
+		expect(validateMissionConfig({ version: 1, keys: { expand: 'alt+g' } }).keys.mode).toBeNull();
+		expect(validateMissionConfig({ version: 1, keys: { mode: 'alt+o' } }).keys.mode).toBe('alt+o');
+	});
+
 	test('reports malformed mission configuration rather than falling back', async () => {
 		const root = await temp();
 		await writeFile(join(root, 'mission.json'), '{');

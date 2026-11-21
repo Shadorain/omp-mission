@@ -113,7 +113,7 @@ For a ticket, use its ID instead: `/mission CHR-142` (Linear) or `/mission owner
 | `pause` | Each wave, review and repair waits at a gate for `/mission approve` | When requested, then gated | `--pause` |
 | `force` | Run without asking | Requested automatically | `--force` (skips plan mode) |
 
-`/mission mode <auto|pause|force>` changes the mode; `/mission mode` alone or `ctrl+shift+o` cycles it. `--force --pause` skips plan mode but runs in Pause with review requested.
+`/mission mode <auto|pause|force>` changes the mode; `/mission mode` alone cycles it. Mode cycling has no default shortcut; set `keys.mode` in `mission.json` to opt in. `--force --pause` skips plan mode but runs in Pause with review requested.
 
 ## Commands
 
@@ -155,7 +155,7 @@ Settings live in `~/.omp/agent/mission.json`; `/mission config` shows them and s
 | `reviewContext` | `project` | The same for review sessions |
 | `autoDispatch` | `false` | Start ready waves in Auto and Force without a model turn |
 | `controls` | `false` | Show the inspector's action button |
-| `keys` | `ctrl+shift+m`, `ctrl+shift+f`, `ctrl+shift+o` | Expand, inspector, cycle mode |
+| `keys` | `ctrl+shift+m`, `ctrl+shift+f`, `null` | Expand, inspector, cycle mode (unbound) |
 
 Full descriptions, `customCommand`, and environment variables are in [docs/reference.md](docs/reference.md#configuration).
 

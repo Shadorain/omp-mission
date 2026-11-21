@@ -1312,6 +1312,7 @@ test('shortcut conflict diagnostics report reserved, keybinding, and extension w
 		const mission = await fixture('local', true, { conflict });
 		try {
 			expect(mission.shortcutQueries).toContain('ctrl+shift+f');
+			expect(mission.shortcutQueries).not.toContain('ctrl+shift+o');
 			expect(mission.notices.some(message => message.includes('ctrl+shift+f') && message.includes(winner))).toBe(true);
 		} finally {
 			await mission.dispose();

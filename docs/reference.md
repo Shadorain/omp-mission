@@ -114,7 +114,7 @@ The header labels dependency-waiting beads as **waiting** with a neutral indicat
 | --- | --- | --- |
 | `expand` | `ctrl+shift+m` | Expand the row |
 | `fullscreen` | `ctrl+shift+f` | Open the inspector |
-| `mode` | `ctrl+shift+o` | Cycle the mode |
+| `mode` | `null` (unbound) | Cycle the mode; set `keys.mode` in `mission.json` to opt in |
 
 Shortcut conflicts are diagnosed after OMP resolves its bindings, including reserved keys and another extension's winner. Change the configured chord or set it to `null`; the extension does not steal the key.
 

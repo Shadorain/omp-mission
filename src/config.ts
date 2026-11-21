@@ -17,7 +17,7 @@ export const DEFAULT_MISSION_CONFIG: MissionConfig = {
 	reviewContext: 'project',
 	autoDispatch: false,
 	compactTranscript: false,
-	keys: { expand: 'ctrl+shift+m', fullscreen: 'ctrl+shift+f', mode: 'ctrl+shift+o' },
+	keys: { expand: 'ctrl+shift+m', fullscreen: 'ctrl+shift+f', mode: null },
 };
 
 const FRONTENDS = new Set<Frontend>(['none', 'orca', 'herdr', 'custom', 'subagent']);
