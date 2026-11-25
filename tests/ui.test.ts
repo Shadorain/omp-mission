@@ -1,20 +1,12 @@
 import { describe, expect, test } from 'bun:test';
-import { visibleWidth } from '@oh-my-pi/pi-tui';
-import type { KeybindingsManager, Theme } from '@oh-my-pi/pi-coding-agent';
+import { visibleWidth } from '@oh-my-pi/pi-tui/text/width';
+import type { Theme } from '@oh-my-pi/pi-coding-agent';
+import { KeybindingsManager } from '@oh-my-pi/pi-coding-agent/config/keybindings/keybindings';
 import { displayBeads, MissionInspector, MissionWidget } from '../src/ui.ts';
 import type { Bead, Mission, Projection, Snapshot } from '../src/types.ts';
 
-const theme = { fg: (_tone: string, text: string) => text } as Theme;
-const keys = {
-	matches(data: string, action: string) {
-		return (
-			(action === 'tui.select.up' && data === 'up') ||
-			(action === 'tui.select.down' && data === 'down') ||
-			(action === 'tui.select.confirm' && data === 'enter') ||
-			(action === 'tui.select.cancel' && data === 'escape')
-		);
-	},
-} as KeybindingsManager;
+const theme = { fg: (_tone: string, text: string) => text, symbols: { symbol: () => '' } } as unknown as Theme;
+const keys = KeybindingsManager.inMemory();
 
 function bead(id: string, children: string[] = [], parent?: string): Bead {
 	return {
@@ -229,7 +221,7 @@ describe('mission UI', () => {
 			theme,
 			keys,
 		);
-		inspector.handleInput('down');
+		inspector.handleInput('\x1b[B');
 		expect(inspector.render(50).join('\n')).toMatch(/❯\s+ready\/open a /);
 		current = projection([
 			bead('root', ['a', 'b', 'c']),
@@ -258,7 +250,7 @@ describe('mission UI', () => {
 			theme,
 			keys,
 		);
-		inspector.handleInput('enter');
+		inspector.handleInput('\r');
 		expect(inspector.render(60).join('\n')).not.toContain('child');
 		inspector.handleInput('a');
 		expect(actionCount).toBe(1);

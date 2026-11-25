@@ -45,17 +45,25 @@ test('a matching board form submission wins and aborts the native pane form', as
 	expect(installAskBridge(ui, () => {})).toBe(bridge);
 });
 
-test('malformed, unknown, disabled, hidden, and invalid field values never settle the form', () => {
+test('malformed, unknown, disabled, and hidden values are rejected while native field constraints are advisory', async () => {
 	const { ui } = paneUi();
 	const bridge = installAskBridge(ui, () => {});
-	void ui.formDialog!(html, {});
-	expect(bridge.answer('call', { mode: 'fast' })).toBeString();
+	const shown = ui.formDialog!(html, {});
 	bridge.bind('call', html);
 	expect(bridge.answer('call', { mode: 'fast', count: 0, tags: [], unknown: 'x' })).toBeString();
 	expect(bridge.answer('call', { token: 'changed', mode: 'fast', count: 0, tags: [] })).toBeString();
 	expect(bridge.answer('call', { mode: 'slow', count: 0, tags: [] })).toBeString();
-	expect(bridge.answer('call', { mode: 'fast', count: 5, tags: [] })).toBeString();
-	expect(bridge.answer('call', { mode: 'fast', count: 'not a number', tags: [] })).toBeString();
+	expect(bridge.answer('call', { mode: 'fast', count: 5, tags: [] })).toBeUndefined();
+	expect(await shown).toEqual({ data: { token: 'secret', mode: 'fast', count: 5, tags: [] } });
+});
+
+test('invalid numeric text is preserved like a native form answer', async () => {
+	const { ui } = paneUi();
+	const bridge = installAskBridge(ui, () => {});
+	const shown = ui.formDialog!('<form><input type="number" name="count" min="0"></form>', {});
+	bridge.bind('call', '<form><input type="number" name="count" min="0"></form>');
+	expect(bridge.answer('call', { count: 'not a number' })).toBeUndefined();
+	expect(await shown).toEqual({ data: { count: 'not a number' } });
 });
 
 test('only one pending tool call with identical HTML can bind to the live dialog', () => {
@@ -77,14 +85,27 @@ test('clearing a checked default does not restore it, while hidden values remain
 	expect(await shown).toEqual({ data: { revision: 'rev-1' } });
 });
 
-test('omitting a required control cannot silently accept its preselected default', async () => {
+test('omitting a required control follows native submission semantics', async () => {
 	const { ui } = paneUi();
 	const bridge = installAskBridge(ui, () => {});
 	const form = '<form><label>Workers <input type="number" name="workers" value="2" required min="0"></label></form>';
 	const shown = ui.formDialog!(form, {});
 	bridge.bind('required', form);
-	expect(bridge.answer('required', {})).toBeString();
-	expect(bridge.open()).toBeDefined();
-	expect(bridge.answer('required', { workers: 0 })).toBeUndefined();
-	expect(await shown).toEqual({ data: { workers: 0 } });
+	expect(bridge.answer('required', {})).toBeUndefined();
+	expect(await shown).toEqual({ data: {} });
+});
+
+test('an RPC inherited form getter can be answered without a writable setter', async () => {
+	const { ui, seen } = paneUi();
+	const rpcUi = Object.create({
+		get formDialog() {
+			return ui.formDialog;
+		},
+	}) as ExtensionUIContext;
+	const bridge = installAskBridge(rpcUi, () => {});
+	const shown = rpcUi.formDialog!(html);
+	expect(bridge.bind('rpc-call', html)).toBe(true);
+	expect(bridge.answer('rpc-call', { mode: 'fast', count: 5 })).toBeUndefined();
+	expect(await shown).toEqual({ data: { token: 'secret', mode: 'fast', count: 5 } });
+	expect(seen.signal?.aborted).toBe(true);
 });

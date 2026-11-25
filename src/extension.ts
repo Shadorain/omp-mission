@@ -1,11 +1,9 @@
 import { readFile, realpath } from 'node:fs/promises';
 import { isAbsolute, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
-import { matchesKey } from '@oh-my-pi/pi-tui';
-import { z } from '@oh-my-pi/pi-coding-agent';
+import { canonicalKeyId, z } from '@oh-my-pi/pi-coding-agent';
 import { resolveLocalUrlToPath } from '@oh-my-pi/pi-coding-agent/internal-urls/local-protocol';
-import type { ExtensionAPI, ExtensionContext, PlanReviewRequestedEvent } from '@oh-my-pi/pi-coding-agent';
-import type { KeyId } from '@oh-my-pi/pi-tui';
+import type { ExtensionAPI, ExtensionContext, KeyId, PlanReviewRequestedEvent } from '@oh-my-pi/pi-coding-agent';
 import type { Action, Evidence, Mission, MissionConfig, Mode, Projection, Run, Snapshot, SubagentRow } from './types';
 import {
 	configNotice,
@@ -169,7 +167,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
 	let timer: Timer | undefined;
 	let overlayAbort: AbortController | undefined;
 	let operation = false;
-	let terminalInputDispose: (() => void) | undefined;
+	let composerKeyDispose: (() => void) | undefined;
 	let subagents: SubagentRow[] = [];
 	let lifetime = new AbortController();
 	let operationSignal: AbortSignal | undefined;
@@ -558,25 +556,27 @@ export default async function missionExtension(pi: ExtensionAPI) {
 				`PR base ${base} differs from bound base ${m.workspace.base}; retarget the PR or explicitly bind its intended base`,
 			);
 	}
-	function bindTerminalInput(context: ExtensionContext) {
-		terminalInputDispose?.();
-		terminalInputDispose = undefined;
-		if (!context.hasUI) return;
-		terminalInputDispose = context.ui.onTerminalInput(data => {
-			if (!projection() || overlayAbort) return;
-			if (config.keys.expand && matchesKey(data, config.keys.expand as KeyId)) {
-				expanded = !expanded;
-				void render().catch(error =>
-					context.ui.notify(error instanceof Error ? error.message : String(error), 'error'),
-				);
-				return { consume: true };
+	function bindComposerKeys(context: ExtensionContext) {
+		composerKeyDispose?.();
+		composerKeyDispose = undefined;
+		if (!context.hasUI || !context.ui.composer) return;
+		composerKeyDispose = context.ui.composer.addKeyHandler(key => {
+			if (key.kind === 'release' || !projection() || overlayAbort) return false;
+			if (config.keys.expand && key.id === canonicalKeyId(config.keys.expand)) {
+				if (key.kind === 'press') {
+					expanded = !expanded;
+					void render().catch(error =>
+						context.ui.notify(error instanceof Error ? error.message : String(error), 'error'),
+					);
+				}
+				return true;
 			}
-			if (!expanded) return;
-			const direction = matchesKey(data, 'alt+up') ? -1 : matchesKey(data, 'alt+down') ? 1 : 0;
-			if (!direction) return;
+			if (!expanded) return false;
+			const direction = key.id === 'alt+up' ? -1 : key.id === 'alt+down' ? 1 : 0;
+			if (!direction) return false;
 			outlineOffset = Math.max(0, Math.min(Math.max(0, (snapshot?.beads.length ?? 1) - 1), outlineOffset + direction));
 			void render();
-			return { consume: true };
+			return true;
 		});
 	}
 	async function render() {
@@ -596,7 +596,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
 				...(enabled ? ['mission_status', 'mission_control'] : []),
 			]);
 		if (ctx !== context || generation !== epoch) return;
-		bindTerminalInput(context);
+		bindComposerKeys(context);
 		if (!context.hasUI) return;
 		if (!projection() || overlayAbort) {
 			context.ui.setWidget('mission', undefined);
@@ -604,10 +604,10 @@ export default async function missionExtension(pi: ExtensionAPI) {
 		}
 		context.ui.setWidget(
 			'mission',
-			(tui, theme) =>
+			(ui, theme) =>
 				createMissionWidget(
 					() => projection()!,
-					() => tui.terminal.rows,
+					() => ui.size().rows,
 					theme,
 				),
 			{ placement: 'aboveEditor' },
@@ -675,8 +675,8 @@ export default async function missionExtension(pi: ExtensionAPI) {
 		coordinatorShells.clear();
 		lifetime.abort();
 		lifetime = new AbortController();
-		terminalInputDispose?.();
-		terminalInputDispose = undefined;
+		composerKeyDispose?.();
+		composerKeyDispose = undefined;
 		overlayAbort?.abort();
 		overlayAbort = undefined;
 		if (timer && ctx) ctx.clearTimer(timer);
@@ -1109,7 +1109,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
 		await render();
 		try {
 			await context.ui.custom<void>(
-				(tui, theme, keys, done) =>
+				(ui, theme, keys, done) =>
 					createMissionInspector(
 						() => archivedView ?? projection()!,
 						{
@@ -1127,12 +1127,11 @@ export default async function missionExtension(pi: ExtensionAPI) {
 										: undefined;
 								if (archivedView) archivedView.history = events;
 								else history = events;
-								tui.requestRender();
+								ui.requestRender();
 							},
 							actions: !archivedView && config.controls ? () => actions(context) : undefined,
 						},
-						() => tui.terminal.rows,
-					)(tui, theme, keys),
+					)(ui, theme, keys),
 				{ signal: abort.signal },
 			);
 		} finally {
@@ -1423,7 +1422,7 @@ export default async function missionExtension(pi: ExtensionAPI) {
 		if (!current()) return false;
 		const modes = context.sessionModes;
 		if (nativePlan(context)) return true;
-		if (!modes) throw new Error('Native plan mode control requires OMP 18.13.2 in an interactive TUI');
+		if (!modes) throw new Error('Native plan mode control requires OMP 19.2.1 in an interactive TUI');
 		for (let attempt = 0; attempt < (startup ? 50 : 1); attempt++) {
 			if (!current()) return false;
 			const result = await modes.set({ mode: 'plan', action: 'enter' });

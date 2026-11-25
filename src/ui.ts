@@ -1,6 +1,7 @@
-import type { Component, TUI } from '@oh-my-pi/pi-tui';
-import { replaceTabs, truncateToWidth, wrapTextWithAnsi, visibleWidth } from '@oh-my-pi/pi-tui';
-import type { KeybindingsManager, Theme, ThemeColor } from '@oh-my-pi/pi-coding-agent';
+import { replaceTabs, truncate, visibleWidth, wrap } from '@oh-my-pi/pi-tui/text/width';
+import { decodeKey } from '@oh-my-pi/pi-tui/driver/input/keys';
+import type { KeyEvent } from '@oh-my-pi/pi-tui/events';
+import type { ExtensionUiHost, KeybindingsManager, Theme } from '@oh-my-pi/pi-coding-agent';
 import {
 	phases,
 	type Bead,
@@ -14,6 +15,7 @@ import {
 } from './types.ts';
 import { displayPhase, effectiveGraph } from './controller.ts';
 import { displaySourceId } from './sources.ts';
+type ThemeColor = Parameters<Theme['fg']>[0];
 
 export interface MissionInspectorCallbacks {
 	close(): void;
@@ -27,12 +29,11 @@ const phaseStatus = (mission: Mission, phase: Phase) => {
 	const evidence = mission.evidence[phase];
 	return evidence?.outcome ?? (displayPhase(mission) === phase ? 'active' : 'pending');
 };
-const clip = (value: string, width: number) => truncateToWidth(replaceTabs(value), Math.max(1, width));
+const clip = (value: string, width: number) => truncate(replaceTabs(value), Math.max(1, width));
 const paint = (theme: Theme, tone: ThemeColor, value: string) => theme.fg(tone, value);
 
-function glyph(theme: Theme, key: Parameters<Theme['symbol']>[0], fallback: string): string {
-	if (!('symbol' in theme) || typeof theme.symbol !== 'function') return fallback;
-	return theme.symbol(key) || fallback;
+function glyph(theme: Theme, key: Parameters<Theme['symbols']['symbol']>[0], fallback: string): string {
+	return theme.symbols.symbol(key) || fallback;
 }
 
 function dot(theme: Theme): string {
@@ -345,7 +346,7 @@ function eventRows(projection: Projection): string[] {
 	);
 }
 
-export class MissionInspector implements Component {
+export class MissionInspector {
 	private selectedId?: string;
 	private collapsed = new Set<string>();
 	private view: MissionView = 'outline';
@@ -358,6 +359,7 @@ export class MissionInspector implements Component {
 		private readonly getTerminalRows: () => number,
 		private readonly theme: Theme,
 		private readonly keybindings: KeybindingsManager,
+		private readonly requestRender?: () => void,
 	) {
 		const projection = getProjection();
 		this.selectedId = projection.selected ?? displayBeads(projection)[0]?.id;
@@ -452,20 +454,26 @@ export class MissionInspector implements Component {
 	}
 	invalidate(): void {}
 	handleInput(data: string): void {
-		if (this.keybindings.matches(data, 'tui.select.cancel') || data === 'q') {
+		const key = decodeKey(data, { kitty: true, backspaceIsCtrl: false });
+		if (!key || key.kind === 'release') return;
+		this.handleKey(key);
+		this.requestRender?.();
+	}
+	private handleKey(key: KeyEvent): void {
+		if (this.keybindings.matches(key, 'tui.select.cancel') || key.id === 'q') {
 			this.callbacks.close();
 			return;
 		}
-		if (data === '\t') {
+		if (key.id === 'tab') {
 			this.view = this.view === 'outline' ? 'history' : this.view === 'history' ? 'evidence' : 'outline';
 			this.scroll = 0;
 			return;
 		}
-		if (data === 'a' && this.callbacks.actions) {
+		if (key.id === 'a' && this.callbacks.actions) {
 			void this.callbacks.actions();
 			return;
 		}
-		if (this.keybindings.matches(data, 'tui.select.up') || data === 'k') {
+		if (this.keybindings.matches(key, 'tui.select.up') || key.id === 'k') {
 			if (this.view !== 'outline') {
 				this.scroll = Math.max(0, this.scroll - 1);
 				return;
@@ -476,7 +484,7 @@ export class MissionInspector implements Component {
 			this.clampScroll(1);
 			return;
 		}
-		if (this.keybindings.matches(data, 'tui.select.down') || data === 'j') {
+		if (this.keybindings.matches(key, 'tui.select.down') || key.id === 'j') {
 			if (this.view !== 'outline') {
 				const count = this.bodyCount;
 				this.scroll = Math.min(Math.max(0, count - 1), this.scroll + 1);
@@ -489,7 +497,7 @@ export class MissionInspector implements Component {
 			return;
 		}
 		if (
-			(this.keybindings.matches(data, 'tui.select.confirm') || data === '\r' || data === '\n') &&
+			this.keybindings.matches(key, 'tui.select.confirm') &&
 			this.view === 'outline'
 		) {
 			const bead = this.rows()[this.selectedIndex()]?.bead;
@@ -510,15 +518,12 @@ export function createMissionWidget(
 	return new MissionWidget(getProjection, getTerminalRows, theme);
 }
 
-export function createMissionInspector(
-	getProjection: () => Projection,
-	callbacks: MissionInspectorCallbacks,
-	getTerminalRows: () => number,
-) {
-	return (_tui: TUI, theme: Theme, keybindings: KeybindingsManager) =>
-		new MissionInspector(getProjection, callbacks, getTerminalRows, theme, keybindings);
+export function createMissionInspector(getProjection: () => Projection, callbacks: MissionInspectorCallbacks) {
+	return (ui: ExtensionUiHost, theme: Theme, keybindings: KeybindingsManager) =>
+		new MissionInspector(getProjection, callbacks, () => ui.size().rows, theme, keybindings, () => ui.requestRender());
 }
 
 export function wrapMissionText(text: string, width: number): string[] {
-	return wrapTextWithAnsi(replaceTabs(text), Math.max(1, width));
+	return wrap(replaceTabs(text), Math.max(1, width));
 }
+

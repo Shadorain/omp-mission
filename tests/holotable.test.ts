@@ -241,7 +241,7 @@ async function session(
 		},
 	} as unknown as ExtensionContext;
 	const api = {
-		pi: { VERSION: '18.13.2' },
+		pi: { VERSION: '19.2.1' },
 		registerTool: () => {},
 		registerShortcut: () => {},
 		registerTranscriptPresenter: () => {},
@@ -1272,7 +1272,7 @@ test('autostart enters native plan mode; structured refusal creates no mission',
 	await absent.command('-- board demo');
 	expect(absent.pending()).toBeUndefined();
 	expect(absent.sent).toHaveLength(0);
-	expect(absent.notices.some(n => n.includes('Native plan mode control requires OMP 18.13.2'))).toBe(true);
+	expect(absent.notices.some(n => n.includes('Native plan mode control requires OMP 19.2.1'))).toBe(true);
 	await absent.event('session_shutdown', {});
 	await planned.event('session_shutdown', {});
 	await refused.event('session_shutdown', {});

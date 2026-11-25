@@ -1,8 +1,8 @@
 import { expect, test } from 'bun:test';
 import { createMissionWidget, createMissionInspector, MissionInspector } from '../src/ui';
 import type { Projection, Mission, Snapshot, Bead, AuditEvent } from '../src/types';
-import type { Theme, KeybindingsManager } from '@oh-my-pi/pi-coding-agent';
-import type { TUI } from '@oh-my-pi/pi-tui';
+import type { ExtensionUiHost, Theme } from '@oh-my-pi/pi-coding-agent';
+import { KeybindingsManager } from '@oh-my-pi/pi-coding-agent/config/keybindings/keybindings';
 
 const hostileTitle =
 	'Huge title \u001b[31mANSI\u001b[0m 🌟\u200D🔥 \u0065\u0301 cjk: 你好世界 ' + 'very_long_'.repeat(50);
@@ -12,12 +12,10 @@ const mockTheme = {
 	fg: (tone: string, value: string) => `\u001b[38;5;12m${value}\u001b[0m`,
 	bg: (tone: string, value: string) => value,
 	bold: (value: string) => value,
+	symbols: { symbol: () => '' },
 } as unknown as Theme;
 
-const mockKeybindings = {
-	matches: (data: string, name: string) => false,
-	describe: (name: string) => name,
-} as unknown as KeybindingsManager;
+const mockKeybindings = KeybindingsManager.inMemory();
 
 function buildHostileMission(beadCount: number): Projection {
 	const mission: Mission = {
@@ -143,12 +141,9 @@ test('MissionInspector interactions and bounds', () => {
 	};
 
 	const createInspector = (h: number) => {
-		const factory = createMissionInspector(
-			() => proj,
-			callbacks,
-			() => h,
-		);
-		return factory({} as unknown as TUI, mockTheme, mockKeybindings);
+		const factory = createMissionInspector(() => proj, callbacks);
+		const ui = { size: () => ({ columns: 80, rows: h }), requestRender() {} } as ExtensionUiHost;
+		return factory(ui, mockTheme, mockKeybindings);
 	};
 
 	const inspector = createInspector(40);

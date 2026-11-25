@@ -42,7 +42,7 @@ Review comes from a separate session that did not write the code. The coordinato
 
 ## Requirements
 
-- OMP 18.22.0 or later; native plan-mode control, HTML-form questions and tool-approval answers use the current extension API.
+- OMP 19.2.1 or later; native plan-mode control, HTML-form questions and tool-approval answers use the current extension API.
 - Git, for anything beyond a local freeform task.
 - The `lin` CLI for Linear tickets, or [`gh`](https://cli.github.com/) for GitHub issues and pull-request delivery.
 - `bd` ([beads](https://github.com/steveyegge/beads)) for the `beads` graph.

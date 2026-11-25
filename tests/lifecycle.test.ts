@@ -240,9 +240,9 @@ async function fixture(
 			setWidget: () => {},
 			setStatus: () => {},
 			select: async () => undefined,
-			onTerminalInput: () => () => {},
-			custom: async (factory: (tui: unknown, theme: unknown, keys: unknown, done: () => void) => unknown) => {
-				inspector = factory({ terminal: { rows: 24 }, requestRender: () => {} }, {}, {}, () => {});
+			composer: { addKeyHandler: () => () => {} },
+			custom: async (factory: (ui: unknown, theme: unknown, keys: unknown, done: () => void) => unknown) => {
+				inspector = factory({ size: () => ({ columns: 80, rows: 24 }), requestRender: () => {} }, {}, {}, () => {});
 			},
 			confirm: async () => host.confirmShutdown ?? false,
 		},

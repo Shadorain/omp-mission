@@ -1,12 +1,15 @@
 import type { ExtensionFormDialogResult, ExtensionUIContext } from '@oh-my-pi/pi-coding-agent';
 import {
-	fieldError,
 	isArrayChoice,
 	textValue,
 	type HtmlFormData,
 	type HtmlFormValue,
-} from '@oh-my-pi/pi-tui/html-form/data';
-import { parseHtmlForm, type ChoiceField, type HtmlForm } from '@oh-my-pi/pi-tui/html-form/parse';
+} from '@oh-my-pi/pi-coding-agent/tools/html-form/data';
+import {
+	parseHtmlForm,
+	type ChoiceField,
+	type HtmlForm,
+} from '@oh-my-pi/pi-coding-agent/tools/html-form/parse';
 
 export type AskForm = HtmlForm;
 export function parseBoardData(raw: unknown): Record<string, string | number | string[]> | undefined {
@@ -71,7 +74,7 @@ export function installAskBridge(ui: ExtensionUIContext, onChange: () => void): 
 		},
 	};
 	if (original) {
-		ui.formDialog = (html, options) => {
+		const formDialog: NonNullable<ExtensionUIContext['formDialog']> = (html, options) => {
 			const local = new AbortController();
 			const signal = options?.signal ? AbortSignal.any([options.signal, local.signal]) : local.signal;
 			const remote = Promise.withResolvers<ExtensionFormDialogResult>();
@@ -94,6 +97,8 @@ export function installAskBridge(ui: ExtensionUIContext, onChange: () => void): 
 				onChange();
 			});
 		};
+		// RPC exposes an inherited getter without a setter.
+		Object.defineProperty(ui, 'formDialog', { value: formDialog, writable: true, configurable: true, enumerable: true });
 	}
 	target[WRAPPED] = bridge;
 	return bridge;
@@ -174,10 +179,6 @@ function validatedData(form: HtmlForm, submitted: Record<string, string | number
 			data[name] = value as HtmlFormValue;
 		}
 	}
-	for (const field of form.fields) {
-		const error = fieldError(field, data[field.name]);
-		if (error) return `${field.name}: ${error}`;
-	}
 	return data;
 }
 
@@ -187,10 +188,13 @@ function validateChoice(field: ChoiceField, value: string | number | string[]): 
 	if (values.some(item => typeof item !== 'string')) return `Invalid choice for ${field.name}`;
 	const selected = values as string[];
 	if (new Set(selected).size !== selected.length) return `Duplicate choice for ${field.name}`;
+	let otherCount = 0;
 	for (const item of selected) {
 		const option = field.options.find(candidate => candidate.value === item);
 		if (option?.disabled) return `Disabled choice for ${field.name}`;
-		if (!option && !field.other) return `Unknown choice for ${field.name}`;
+		if (!option) {
+			if (!field.other || ++otherCount > 1) return `Unknown choice for ${field.name}`;
+		}
 	}
 	return undefined;
 }
